@@ -22,7 +22,7 @@ terraform.tfvars
 *.auto.tfvars.json
 
 # Saved plan files
-   tfplan
-   *.tfplan
+tfplan
+*.tfplan
 
 # Note: .terraform.lock.hcl IS intentionally committed (pins provider versions)
