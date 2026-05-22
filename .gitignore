@@ -1,0 +1,97 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service-account*.json
+credentials*.json
+
+# IDEs and editors
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Type checkers and linters
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+
+# Logs
+*.log
+logs/
+
+# dbt (will matter later)
+target/
+dbt_packages/
+logs/
+
+# Local data and scratch
+/data/
+/tmp/
+/scratch/
+*.parquet
+*.csv
+*.json.gz
+
+# OS / misc
+Thumbs.db
+desktop.ini
