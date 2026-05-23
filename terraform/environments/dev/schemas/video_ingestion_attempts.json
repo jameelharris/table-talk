@@ -1,0 +1,39 @@
+[
+  {
+    "name": "source_url",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "The URL that was attempted. Required on every attempt regardless of outcome (since failed attempts may not have extracted a video_id)."
+  },
+  {
+    "name": "attempted_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "defaultValueExpression": "CURRENT_TIMESTAMP()",
+    "description": "Timestamp when this attempt was recorded. Auto-populated on insert via DEFAULT. Orders attempts; use MAX(attempted_at) for the most recent attempt of a given source_url."
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Outcome of this attempt: 'complete' | 'failed'. No in-flight states; every row represents a terminated attempt. NOT enforced as an enum by BigQuery — validation lives in application code."
+  },
+  {
+    "name": "video_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "YouTube video ID, populated on successful attempts. NULL on failures (yt-dlp may not have gotten this far). Foreign key to videos.video_id when populated."
+  },
+  {
+    "name": "status_message",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Free-form error or status detail. Typically populated on failure to capture the error reason. NULL on success."
+  },
+  {
+    "name": "duration_ms",
+    "type": "INT64",
+    "mode": "NULLABLE",
+    "description": "How long the attempt took, in milliseconds, from start of the worker's processing to terminal outcome. Useful for observability — slow successes and fast failures are different signals."
+  }
+]

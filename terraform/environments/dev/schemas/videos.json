@@ -1,0 +1,45 @@
+[
+  {
+    "name": "video_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "YouTube video ID extracted from source_url (e.g., 'abc123XYZ'). The de facto primary key of this table. Foreign key target for downstream tables (clips, hands, etc.)."
+  },
+  {
+    "name": "source_url",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Canonical YouTube URL for this video. Used to dedupe against the corpus manifest (YAML)."
+  },
+  {
+    "name": "title",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Video title fetched from yt-dlp at ingestion time."
+  },
+  {
+    "name": "duration_seconds",
+    "type": "INT64",
+    "mode": "REQUIRED",
+    "description": "Video length in seconds, from yt-dlp."
+  },
+  {
+    "name": "gcs_path",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "GCS URI where the MP4 is stored (e.g., 'gs://bucket/abc123XYZ.mp4')."
+  },
+  {
+    "name": "file_size_bytes",
+    "type": "INT64",
+    "mode": "REQUIRED",
+    "description": "Size in bytes of the uploaded video file in GCS."
+  },
+  {
+    "name": "ingested_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "defaultValueExpression": "CURRENT_TIMESTAMP()",
+    "description": "Timestamp when this row was written (i.e., when the video was successfully ingested). Auto-populated on insert via DEFAULT."
+  }
+]
