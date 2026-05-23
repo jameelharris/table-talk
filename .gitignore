@@ -32,7 +32,9 @@ MANIFEST
 venv/
 env/
 ENV/
-.python-version
+
+# uv
+.uv-cache/
 
 # Environment variables and secrets
 .env
