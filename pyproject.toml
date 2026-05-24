@@ -29,6 +29,7 @@ packages = ["src/table_talk"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = "-m 'not integration'"
 markers = [
   "integration: tests that hit real GC resources; require ADC auth",
 ]
