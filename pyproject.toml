@@ -35,6 +35,9 @@ markers = [
   "integration: tests that hit real GC resources; require ADC auth",
 ]
 
+[project.scripts]
+tt = "table_talk.cli:main"
+
 [tool.ruff]
 target-version = "py313"
 line-length = 100
