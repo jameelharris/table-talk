@@ -1,3 +1,7 @@
+# Schema source of truth: terraform/environments/dev/schemas/videos.json
+# The VideoRow dataclass below must be kept in sync with that file.
+# Drift is caught at integration-test time (see tests/test_videos_writer.py).
+
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
