@@ -13,10 +13,10 @@ from pathlib import Path
 from google.cloud import bigquery, storage
 
 from .manifest import ManifestError, extract_video_id, load_manifest
-from .video_ingestion_attempts_writer import AttemptRow, write_attempt_row
+from .video_ingestion_attempts_writer import VideoIngestionAttemptsRow, write_attempt_row
 from .videos_fetcher import TerminalFetchError, TransientFetchError, fetch_video
 from .videos_uploader import UploadError, upload_video
-from .videos_writer import VideoRow, VideosWriteError, write_video_row
+from .videos_writer import VideosRow, VideosWriteError, write_video_row
 
 
 class Decision(StrEnum):
@@ -88,7 +88,7 @@ def process_url(
         video_id = extract_video_id(url)
     except ManifestError as exc:
         write_attempt_row(
-            AttemptRow(
+            VideoIngestionAttemptsRow(
                 source_url=url,
                 status="failed_terminal",
                 status_message=f"manifest_error: {exc}",
@@ -112,7 +112,7 @@ def process_url(
             fetch_result = fetch_video(url, download_dir=tmpdir_path)
         except TerminalFetchError as exc:
             write_attempt_row(
-                AttemptRow(
+                VideoIngestionAttemptsRow(
                     source_url=url,
                     status="failed_terminal",
                     status_message=str(exc),
@@ -125,7 +125,7 @@ def process_url(
             return
         except TransientFetchError as exc:
             write_attempt_row(
-                AttemptRow(
+                VideoIngestionAttemptsRow(
                     source_url=url,
                     status="failed_transient_predownload",
                     status_message=str(exc),
@@ -146,7 +146,7 @@ def process_url(
             )
         except UploadError as exc:
             write_attempt_row(
-                AttemptRow(
+                VideoIngestionAttemptsRow(
                     source_url=url,
                     status="failed_transient_predownload",
                     status_message=f"gcs_upload_failed: {exc}",
@@ -161,7 +161,7 @@ def process_url(
 
         try:
             write_video_row(
-                VideoRow(
+                VideosRow(
                     video_id=fetch_result.video_id,
                     source_url=url,
                     title=fetch_result.title,
@@ -175,7 +175,7 @@ def process_url(
             )
         except VideosWriteError as exc:
             write_attempt_row(
-                AttemptRow(
+                VideoIngestionAttemptsRow(
                     source_url=url,
                     status="failed_transient_postdownload",
                     status_message=f"bq_write_failed: {exc}",
@@ -189,7 +189,7 @@ def process_url(
             return
 
         write_attempt_row(
-            AttemptRow(
+            VideoIngestionAttemptsRow(
                 source_url=url,
                 status="complete",
                 video_id=fetch_result.video_id,

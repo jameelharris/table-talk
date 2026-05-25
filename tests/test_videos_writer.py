@@ -7,11 +7,11 @@ import pytest
 from google.cloud import bigquery
 from google.cloud import exceptions as gcloud_exceptions
 
-from table_talk.videos_writer import VideoRow, VideosWriteError, write_video_row
+from table_talk.videos_writer import VideosRow, VideosWriteError, write_video_row
 
 
-def _sample_row() -> VideoRow:
-    return VideoRow(
+def _sample_row() -> VideosRow:
+    return VideosRow(
         video_id="dQw4w9WgXcQ",
         source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         title="Test Video",
@@ -90,7 +90,7 @@ def test_write_video_row_integration():
     project = "table-talk-497020"
     dataset = "table_talk_dev"
     video_id = f"test_{uuid.uuid4().hex[:8]}"
-    row = VideoRow(
+    row = VideosRow(
         video_id=video_id,
         source_url=f"https://www.youtube.com/watch?v={video_id}",
         title="Integration Test Video",

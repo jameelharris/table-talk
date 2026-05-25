@@ -8,15 +8,15 @@ from google.cloud import exceptions as gcloud_exceptions
 
 from table_talk.video_ingestion_attempts_writer import (
     VALID_STATUSES,
-    AttemptRow,
     AttemptsWriteError,
+    VideoIngestionAttemptsRow,
     write_attempt_row,
 )
 
 
-def _sample_row(**kwargs) -> AttemptRow:
+def _sample_row(**kwargs) -> VideoIngestionAttemptsRow:
     defaults = dict(source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ", status="complete")
-    return AttemptRow(**{**defaults, **kwargs})
+    return VideoIngestionAttemptsRow(**{**defaults, **kwargs})
 
 
 def _mock_client(job_errors=None):
@@ -127,7 +127,7 @@ def test_write_attempt_row_integration():
     project = "table-talk-497020"
     dataset = "table_talk_dev"
     source_url = f"https://test.example.com/{uuid.uuid4().hex[:8]}"
-    row = AttemptRow(
+    row = VideoIngestionAttemptsRow(
         source_url=source_url,
         status="failed_transient_predownload",
         video_id=None,
