@@ -63,3 +63,15 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## Project Conventions
+
+These conventions reflect the current state of the project and should be respected when adding new code or modifying existing code.
+
+- **Schemas are the source of truth.** BigQuery table schemas live at `schemas/*.json` at the repo root. Python dataclasses are generated from them via `scripts/gen_schemas.py` and land in `src/table_talk/_generated/`. Generated files are committed and never edited by hand. After changing a schema, regenerate before committing.
+
+- **BQ writes use DML INSERT with parameterized queries.** Not load jobs. This is so BigQuery applies column DEFAULTs server-side. The codegen omits any column with `defaultValueExpression` set, since BQ supplies those values.
+
+- **Integration tests are opt-in.** `uv run pytest` excludes them by default (via `addopts` in `pyproject.toml`). Run them explicitly with `uv run pytest -m integration`. Integration tests hit real GCP dev resources and must clean up in `try/finally`.
+
+- **Primitives are stateless and ignorant of orchestration.** Fetcher, uploader, and writers each take inputs and produce outputs (or raise classified exceptions). They do not consult BigQuery for context, do not decide retry policy, and do not know about other primitives. The orchestrator (`src/table_talk/ingest.py`) composes them.
