@@ -1,5 +1,4 @@
 import uuid
-from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -24,7 +23,7 @@ def _mock_client(job_errors=None):
     mock_job = MagicMock()
     mock_job.errors = job_errors
     mock_client = MagicMock()
-    mock_client.load_table_from_json.return_value = mock_job
+    mock_client.query.return_value = mock_job
     return mock_client, mock_job
 
 
@@ -37,17 +36,16 @@ def test_happy_path_minimal():
 
     write_attempt_row(row, project="proj", dataset="ds", client=mock_client)
 
-    mock_client.load_table_from_json.assert_called_once()
-    (row_dicts, table_ref), _ = mock_client.load_table_from_json.call_args
-    assert table_ref == "proj.ds.video_ingestion_attempts"
-    assert len(row_dicts) == 1
-    sent = row_dicts[0]
-    assert sent == {**asdict(row), "attempted_at": sent["attempted_at"]}
-    assert "attempted_at" in sent
-    datetime.fromisoformat(sent["attempted_at"])
-    assert sent["video_id"] is None
-    assert sent["status_message"] is None
-    assert sent["duration_ms"] is None
+    mock_client.query.assert_called_once()
+    args, kwargs = mock_client.query.call_args
+    query_str = args[0]
+    job_config = kwargs["job_config"]
+    assert query_str.startswith("INSERT INTO")
+    assert "proj.ds.video_ingestion_attempts" in query_str
+    param_names = {p.name for p in job_config.query_parameters}
+    # None-valued fields are omitted (Option B)
+    assert param_names == {"source_url", "status"}
+    assert "attempted_at" not in param_names
     mock_job.result.assert_called_once()
 
 
@@ -61,12 +59,10 @@ def test_happy_path_full():
 
     write_attempt_row(row, project="proj", dataset="ds", client=mock_client)
 
-    mock_client.load_table_from_json.assert_called_once()
-    (row_dicts, _), _ = mock_client.load_table_from_json.call_args
-    sent = row_dicts[0]
-    assert sent["video_id"] == "dQw4w9WgXcQ"
-    assert sent["status_message"] == "all good"
-    assert sent["duration_ms"] == 5000
+    mock_client.query.assert_called_once()
+    _, kwargs = mock_client.query.call_args
+    param_names = {p.name for p in kwargs["job_config"].query_parameters}
+    assert param_names == {"source_url", "status", "video_id", "status_message", "duration_ms"}
 
 
 def test_invalid_status_raises_before_bq_call():
@@ -79,14 +75,14 @@ def test_invalid_status_raises_before_bq_call():
             dataset="ds",
             client=mock_client,
         )
-    mock_client.load_table_from_json.assert_not_called()
+    mock_client.query.assert_not_called()
 
 
 @pytest.mark.parametrize("status", sorted(VALID_STATUSES))
 def test_all_valid_statuses_accepted(status):
     mock_client, _ = _mock_client()
     write_attempt_row(_sample_row(status=status), project="proj", dataset="ds", client=mock_client)
-    mock_client.load_table_from_json.assert_called_once()
+    mock_client.query.assert_called_once()
 
 
 def test_job_errors_raises():
@@ -99,7 +95,7 @@ def test_job_errors_raises():
 def test_google_cloud_error_raises():
     mock_client = MagicMock()
     err = gcloud_exceptions.GoogleCloudError("network error")
-    mock_client.load_table_from_json.side_effect = err
+    mock_client.query.side_effect = err
 
     with pytest.raises(AttemptsWriteError, match="network error"):
         write_attempt_row(_sample_row(), project="proj", dataset="ds", client=mock_client)

@@ -25,7 +25,7 @@ def _mock_client(job_errors=None):
     mock_job = MagicMock()
     mock_job.errors = job_errors
     mock_client = MagicMock()
-    mock_client.load_table_from_json.return_value = mock_job
+    mock_client.query.return_value = mock_job
     return mock_client, mock_job
 
 
@@ -38,14 +38,15 @@ def test_happy_path():
 
     write_video_row(row, project="proj", dataset="ds", client=mock_client)
 
-    mock_client.load_table_from_json.assert_called_once()
-    (row_dicts, table_ref), _ = mock_client.load_table_from_json.call_args
-    assert table_ref == "proj.ds.videos"
-    assert len(row_dicts) == 1
-    sent = row_dicts[0]
-    assert sent == {**asdict(row), "ingested_at": sent["ingested_at"]}
-    assert "ingested_at" in sent
-    datetime.fromisoformat(sent["ingested_at"])  # must be a valid ISO-8601 string
+    mock_client.query.assert_called_once()
+    args, kwargs = mock_client.query.call_args
+    query_str = args[0]
+    job_config = kwargs["job_config"]
+    assert query_str.startswith("INSERT INTO")
+    assert "proj.ds.videos" in query_str
+    param_names = {p.name for p in job_config.query_parameters}
+    assert param_names == set(asdict(row).keys())
+    assert "ingested_at" not in param_names
     mock_job.result.assert_called_once()
 
 
@@ -59,7 +60,7 @@ def test_job_errors_raises():
 def test_google_cloud_error_raises():
     mock_client = MagicMock()
     err = gcloud_exceptions.GoogleCloudError("network error")
-    mock_client.load_table_from_json.side_effect = err
+    mock_client.query.side_effect = err
 
     with pytest.raises(VideosWriteError, match="network error"):
         write_video_row(_sample_row(), project="proj", dataset="ds", client=mock_client)
