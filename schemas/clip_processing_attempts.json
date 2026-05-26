@@ -1,0 +1,27 @@
+[
+  {
+    "name": "clip_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Clip being processed. Foreign key to clip_manifest.clip_id."
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Outcome of this attempt: 'complete' | 'failed_transient' | 'failed_permanent'. No in-flight states. NOT enforced as an enum by BigQuery — validation lives in application code."
+  },
+  {
+    "name": "status_message",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Free-form error or status detail. Typically populated on failure to capture the error reason. NULL on success."
+  },
+  {
+    "name": "attempted_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "defaultValueExpression": "CURRENT_TIMESTAMP()",
+    "description": "Timestamp when this attempt was recorded. Auto-populated on insert via DEFAULT."
+  }
+]

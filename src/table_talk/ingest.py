@@ -137,6 +137,21 @@ def process_url(
             )
             return
 
+        if fetch_result.duration_seconds <= 0:
+            write_attempt_row(
+                VideoIngestionAttemptsRow(
+                    source_url=url,
+                    status="failed_terminal",
+                    status_message="invalid_duration: video reports duration <= 0",
+                    video_id=fetch_result.video_id,
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                ),
+                project=project,
+                dataset=dataset,
+                client=bq_client,
+            )
+            return
+
         try:
             upload_result = upload_video(
                 fetch_result.local_path,
@@ -223,4 +238,5 @@ def process_manifest(
             )
         except Exception as exc:
             print(f"Unexpected error processing {entry.source_url}: {exc}")
+
     print(f"Processed {len(entries)} URLs.")

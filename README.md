@@ -20,6 +20,17 @@ A conversational analytics agent over a BigQuery poker dataset. Source data is i
 | dbt models | Not started | TBD |
 | Conversational agent | Not started | TBD |
 
+## CLI usage
+
+The typical ingestion flow is two commands:
+
+```
+tt ingest --manifest corpus/videos.yaml --project <project> --dataset <dataset> --bucket <bucket>
+tt materialize-clips --project <project> --dataset <dataset>
+```
+
+`tt ingest` ingests videos from the manifest into the `videos` table and GCS. `tt materialize-clips` creates `clip_manifest` rows for any videos that don't have them yet. To materialize clips for a single video, pass `--video-id <id>`.
+
 ## Getting started
 
 This project is under active development and not yet usable end-to-end. See `terraform/README.md` for infrastructure setup.

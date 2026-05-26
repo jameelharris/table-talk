@@ -75,3 +75,15 @@ These conventions reflect the current state of the project and should be respect
 - **Integration tests are opt-in.** `uv run pytest` excludes them by default (via `addopts` in `pyproject.toml`). Run them explicitly with `uv run pytest -m integration`. Integration tests hit real GCP dev resources and must clean up in `try/finally`.
 
 - **Primitives are stateless and ignorant of orchestration.** Fetcher, uploader, and writers each take inputs and produce outputs (or raise classified exceptions). They do not consult BigQuery for context, do not decide retry policy, and do not know about other primitives. The orchestrator (`src/table_talk/ingest.py`) composes them.
+
+## Integration test scoping
+
+Integration tests must operate only on data they create. This has two implications:
+
+**For tests:** an integration test must not invoke a function whose scope exceeds the test's owned data. Tests insert test rows (using uuid-based IDs), call functions limited to those IDs, assert outcomes, and clean up only those IDs.
+
+**For functions:** any function that scans for "all X matching some condition" must accept a scope-limiting parameter (e.g. `only_X_ids: list[str] | None = None`) so that integration tests can constrain the function's blast radius. Production callers leave the parameter as default (`None`) to operate on the full set; tests provide the IDs they own.
+
+Functions that take a specific identifier as an argument (a video_id, a row, a URL) naturally scope to that identifier and don't need additional scope-limiting parameters.
+
+The principle is enforced by code review — there is no automated check.

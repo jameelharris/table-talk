@@ -285,6 +285,40 @@ def test_process_url_write_video_row_error():
     assert attempt_row.video_id == VIDEO_ID
 
 
+def test_process_url_invalid_duration():
+    fetch_result = FetchResult(
+        local_path=Path("/fake/dQw4w9WgXcQ.mp4"),
+        video_id=VIDEO_ID,
+        title="Test Video",
+        duration_seconds=0,
+    )
+
+    with (
+        patch("table_talk.ingest.extract_video_id", return_value=VIDEO_ID),
+        patch("table_talk.ingest.reconcile_url", return_value=Decision.INGEST),
+        patch("table_talk.ingest.fetch_video", return_value=fetch_result),
+        patch("table_talk.ingest.upload_video") as mock_upload,
+        patch("table_talk.ingest.write_video_row") as mock_write_video,
+        patch("table_talk.ingest.write_attempt_row") as mock_write_attempt,
+    ):
+        process_url(
+            URL,
+            project=PROJECT,
+            dataset=DATASET,
+            bucket=BUCKET,
+            bq_client=MagicMock(),
+            storage_client=MagicMock(),
+        )
+
+    mock_upload.assert_not_called()
+    mock_write_video.assert_not_called()
+    mock_write_attempt.assert_called_once()
+    attempt_row = mock_write_attempt.call_args[0][0]
+    assert attempt_row.status == "failed_terminal"
+    assert "invalid_duration" in attempt_row.status_message
+    assert attempt_row.video_id == VIDEO_ID
+
+
 def test_process_url_manifest_error():
     exc = ManifestError("Cannot extract video ID")
 

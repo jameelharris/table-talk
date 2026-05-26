@@ -63,3 +63,35 @@ module "video_ingestion_attempts_table" {
   }
   deletion_protection = true
 }
+
+module "clip_manifest_table" {
+  source = "../../modules/bigquery_table"
+
+  dataset_id  = module.bigquery_dataset.dataset_id
+  table_id    = "clip_manifest"
+  project     = var.project_id
+  schema      = file("${path.module}/../../../schemas/clip_manifest.json")
+  description = "Inventory of all clips derived from ingested videos. One row per clip, immutable after write. Foreign key target for clip_processing_attempts and downstream extraction tables."
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "clip_inventory"
+  }
+  deletion_protection = true
+}
+
+module "clip_processing_attempts_table" {
+  source = "../../modules/bigquery_table"
+
+  dataset_id  = module.bigquery_dataset.dataset_id
+  table_id    = "clip_processing_attempts"
+  project     = var.project_id
+  schema      = file("${path.module}/../../../schemas/clip_processing_attempts.json")
+  description = "Append-only audit log of every clip processing attempt. One row per attempt. Absence of rows for a clip_id means the clip is unprocessed. Joins to clip_manifest via clip_id."
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "clip_processing_audit"
+  }
+  deletion_protection = true
+}
