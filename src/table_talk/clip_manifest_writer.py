@@ -25,24 +25,32 @@ def _bq_param_type(value: object) -> str:
     raise ClipManifestWriteError(f"Unsupported parameter type: {type(value).__name__}")
 
 
-def write_clip_manifest_row(
-    row: ClipManifestRow,
+def write_clip_manifest_rows(
+    rows: list[ClipManifestRow],
     *,
     project: str,
     dataset: str,
     client: bigquery.Client | None = None,
 ) -> None:
+    if not rows:
+        return
     if client is None:
         client = bigquery.Client(project=project)
-    row_dict = asdict(row)
-    columns = list(row_dict.keys())
+
+    first_dict = asdict(rows[0])
+    columns = list(first_dict.keys())
     column_list = ", ".join(columns)
-    placeholders = ", ".join(f"@{c}" for c in columns)
-    query = f"INSERT INTO `{project}.{dataset}.clip_manifest` ({column_list}) VALUES ({placeholders})"
-    query_parameters = [
-        bigquery.ScalarQueryParameter(c, _bq_param_type(v), v)
-        for c, v in row_dict.items()
-    ]
+
+    value_tuples = []
+    query_parameters = []
+    for i, row in enumerate(rows):
+        row_dict = asdict(row)
+        placeholders = ", ".join(f"@{c}_{i}" for c in columns)
+        value_tuples.append(f"({placeholders})")
+        for c, v in row_dict.items():
+            query_parameters.append(bigquery.ScalarQueryParameter(f"{c}_{i}", _bq_param_type(v), v))
+
+    query = f"INSERT INTO `{project}.{dataset}.clip_manifest` ({column_list}) VALUES {', '.join(value_tuples)}"
     job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)
     try:
         job = client.query(query, job_config=job_config)

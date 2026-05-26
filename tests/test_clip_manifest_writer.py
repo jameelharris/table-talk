@@ -7,7 +7,7 @@ import pytest
 from google.cloud import bigquery
 from google.cloud import exceptions as gcloud_exceptions
 
-from table_talk.clip_manifest_writer import ClipManifestRow, ClipManifestWriteError, write_clip_manifest_row
+from table_talk.clip_manifest_writer import ClipManifestRow, ClipManifestWriteError, write_clip_manifest_rows
 
 
 def _sample_row() -> ClipManifestRow:
@@ -34,7 +34,7 @@ def test_happy_path():
     mock_client, mock_job = _mock_client()
     row = _sample_row()
 
-    write_clip_manifest_row(row, project="proj", dataset="ds", client=mock_client)
+    write_clip_manifest_rows([row], project="proj", dataset="ds", client=mock_client)
 
     mock_client.query.assert_called_once()
     args, kwargs = mock_client.query.call_args
@@ -43,16 +43,44 @@ def test_happy_path():
     assert query_str.startswith("INSERT INTO")
     assert "proj.ds.clip_manifest" in query_str
     param_names = {p.name for p in job_config.query_parameters}
-    assert param_names == set(asdict(row).keys())
-    assert "materialized_at" not in param_names
+    expected = {f"{c}_0" for c in asdict(row).keys()}
+    assert param_names == expected
+    assert not any("materialized_at" in n for n in param_names)
     mock_job.result.assert_called_once()
+
+
+def test_n_rows_single_query():
+    mock_client, _ = _mock_client()
+    rows = [
+        ClipManifestRow(clip_id=f"vid_001_{i:03d}", video_id="vid_001", clip_start_time=i * 240, clip_end_time=(i + 1) * 240)
+        for i in range(3)
+    ]
+
+    write_clip_manifest_rows(rows, project="proj", dataset="ds", client=mock_client)
+
+    mock_client.query.assert_called_once()
+    args, kwargs = mock_client.query.call_args
+    query_str = args[0]
+    assert query_str.startswith("INSERT INTO")
+    assert "clip_manifest" in query_str
+    params = kwargs["job_config"].query_parameters
+    col_count = len(asdict(rows[0]))
+    assert len(params) == 3 * col_count
+
+
+def test_empty_list_is_noop():
+    mock_client, _ = _mock_client()
+
+    write_clip_manifest_rows([], project="proj", dataset="ds", client=mock_client)
+
+    mock_client.query.assert_not_called()
 
 
 def test_job_errors_raises():
     mock_client, _ = _mock_client(job_errors=[{"message": "bad schema"}])
 
     with pytest.raises(ClipManifestWriteError, match="bad schema"):
-        write_clip_manifest_row(_sample_row(), project="proj", dataset="ds", client=mock_client)
+        write_clip_manifest_rows([_sample_row()], project="proj", dataset="ds", client=mock_client)
 
 
 def test_google_cloud_error_raises():
@@ -61,14 +89,14 @@ def test_google_cloud_error_raises():
     mock_client.query.side_effect = err
 
     with pytest.raises(ClipManifestWriteError, match="network error"):
-        write_clip_manifest_row(_sample_row(), project="proj", dataset="ds", client=mock_client)
+        write_clip_manifest_rows([_sample_row()], project="proj", dataset="ds", client=mock_client)
 
 
 def test_client_none_instantiates_with_project():
     mock_client, _ = _mock_client()
 
     with patch("table_talk.clip_manifest_writer.bigquery.Client", return_value=mock_client) as mock_cls:
-        write_clip_manifest_row(_sample_row(), project="myproj", dataset="ds")
+        write_clip_manifest_rows([_sample_row()], project="myproj", dataset="ds")
         mock_cls.assert_called_once_with(project="myproj")
 
 
@@ -76,7 +104,7 @@ def test_client_provided_not_instantiated():
     mock_client, _ = _mock_client()
 
     with patch("table_talk.clip_manifest_writer.bigquery.Client") as mock_cls:
-        write_clip_manifest_row(_sample_row(), project="proj", dataset="ds", client=mock_client)
+        write_clip_manifest_rows([_sample_row()], project="proj", dataset="ds", client=mock_client)
         mock_cls.assert_not_called()
 
 
@@ -84,7 +112,7 @@ def test_client_provided_not_instantiated():
 
 
 @pytest.mark.integration
-def test_write_clip_manifest_row_integration():
+def test_write_clip_manifest_rows_integration():
     project = "table-talk-497020"
     dataset = "table_talk_dev"
     video_id = f"test_{uuid.uuid4().hex[:8]}"
@@ -100,7 +128,7 @@ def test_write_clip_manifest_row_integration():
     table_ref = f"{project}.{dataset}.clip_manifest"
 
     try:
-        write_clip_manifest_row(row, project=project, dataset=dataset, client=client)
+        write_clip_manifest_rows([row], project=project, dataset=dataset, client=client)
 
         query = f"SELECT * FROM `{table_ref}` WHERE clip_id = @clip_id"
         job_config = bigquery.QueryJobConfig(

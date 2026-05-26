@@ -31,11 +31,12 @@ def _video_row(duration_seconds):
 def test_240s_aligned_video():
     bq = _mock_bq([_video_row(480)], [])  # videos query, clip_manifest check
 
-    with patch("table_talk.clip_materialization.write_clip_manifest_row") as mock_write:
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
 
-    assert mock_write.call_count == 2
-    rows = [c[0][0] for c in mock_write.call_args_list]
+    mock_write.assert_called_once()
+    rows = mock_write.call_args[0][0]
+    assert len(rows) == 2
     assert rows[0] == ClipManifestRow(clip_id=f"{VIDEO_ID}_001", video_id=VIDEO_ID, clip_start_time=0, clip_end_time=240)
     assert rows[1] == ClipManifestRow(clip_id=f"{VIDEO_ID}_002", video_id=VIDEO_ID, clip_start_time=240, clip_end_time=480)
 
@@ -43,11 +44,12 @@ def test_240s_aligned_video():
 def test_non_aligned_video():
     bq = _mock_bq([_video_row(300)], [])
 
-    with patch("table_talk.clip_materialization.write_clip_manifest_row") as mock_write:
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
 
-    assert mock_write.call_count == 2
-    rows = [c[0][0] for c in mock_write.call_args_list]
+    mock_write.assert_called_once()
+    rows = mock_write.call_args[0][0]
+    assert len(rows) == 2
     assert rows[0].clip_start_time == 0 and rows[0].clip_end_time == 240
     assert rows[1].clip_start_time == 240 and rows[1].clip_end_time == 300
 
@@ -55,23 +57,25 @@ def test_non_aligned_video():
 def test_video_shorter_than_240s():
     bq = _mock_bq([_video_row(60)], [])
 
-    with patch("table_talk.clip_materialization.write_clip_manifest_row") as mock_write:
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
 
-    assert mock_write.call_count == 1
-    row = mock_write.call_args[0][0]
-    assert row.clip_start_time == 0 and row.clip_end_time == 60
+    mock_write.assert_called_once()
+    rows = mock_write.call_args[0][0]
+    assert len(rows) == 1
+    assert rows[0].clip_start_time == 0 and rows[0].clip_end_time == 60
 
 
 def test_long_video_ordinals():
     # 10 clips: 9 full 240s windows + 1 remainder
     bq = _mock_bq([_video_row(2161)], [])
 
-    with patch("table_talk.clip_materialization.write_clip_manifest_row") as mock_write:
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
 
-    assert mock_write.call_count == 10
-    rows = [c[0][0] for c in mock_write.call_args_list]
+    mock_write.assert_called_once()
+    rows = mock_write.call_args[0][0]
+    assert len(rows) == 10
     assert rows[0].clip_id == f"{VIDEO_ID}_001"
     assert rows[8].clip_id == f"{VIDEO_ID}_009"
     assert rows[9].clip_id == f"{VIDEO_ID}_010"
@@ -80,7 +84,7 @@ def test_long_video_ordinals():
 def test_zero_duration_raises():
     bq = _mock_bq([_video_row(0)], [])
 
-    with patch("table_talk.clip_materialization.write_clip_manifest_row") as mock_write:
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         with pytest.raises(MaterializeError):
             materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
 
@@ -90,7 +94,7 @@ def test_zero_duration_raises():
 def test_negative_duration_raises():
     bq = _mock_bq([_video_row(-1)], [])
 
-    with patch("table_talk.clip_materialization.write_clip_manifest_row") as mock_write:
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         with pytest.raises(MaterializeError):
             materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
 
@@ -100,7 +104,7 @@ def test_negative_duration_raises():
 def test_video_not_in_videos_table_raises():
     bq = _mock_bq([])  # empty result — video not found
 
-    with patch("table_talk.clip_materialization.write_clip_manifest_row") as mock_write:
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         with pytest.raises(MaterializeError, match="not found"):
             materialize_clips("unknown_id", project=PROJECT, dataset=DATASET, bq_client=bq)
 
@@ -111,7 +115,7 @@ def test_idempotence():
     existing_clip = MagicMock()
     bq = _mock_bq([_video_row(480)], [existing_clip])  # clip_manifest already has rows
 
-    with patch("table_talk.clip_materialization.write_clip_manifest_row") as mock_write:
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
 
     mock_write.assert_not_called()
@@ -120,10 +124,11 @@ def test_idempotence():
 def test_clip_id_format():
     bq = _mock_bq([_video_row(300)], [])
 
-    with patch("table_talk.clip_materialization.write_clip_manifest_row") as mock_write:
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
 
-    rows = [c[0][0] for c in mock_write.call_args_list]
+    mock_write.assert_called_once()
+    rows = mock_write.call_args[0][0]
     assert rows[0].clip_id == f"{VIDEO_ID}_001"
     assert rows[1].clip_id == f"{VIDEO_ID}_002"
 

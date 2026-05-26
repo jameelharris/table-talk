@@ -1,7 +1,7 @@
 from google.cloud import bigquery
 
 from ._generated.clip_manifest_row import ClipManifestRow
-from .clip_manifest_writer import write_clip_manifest_row
+from .clip_manifest_writer import write_clip_manifest_rows
 
 _CLIP_WINDOW_SECONDS = 240
 
@@ -45,24 +45,24 @@ def materialize_clips(
     if existing:
         return
 
+    rows = []
     ordinal = 1
     start = 0
     while start < duration_seconds:
         end = min(ordinal * _CLIP_WINDOW_SECONDS, duration_seconds)
         clip_id = f"{video_id}_{ordinal:03d}"
-        write_clip_manifest_row(
+        rows.append(
             ClipManifestRow(
                 clip_id=clip_id,
                 video_id=video_id,
                 clip_start_time=start,
                 clip_end_time=end,
-            ),
-            project=project,
-            dataset=dataset,
-            client=bq_client,
+            )
         )
         start = end
         ordinal += 1
+
+    write_clip_manifest_rows(rows, project=project, dataset=dataset, client=bq_client)
 
 
 def materialize_clips_for_pending_videos(
