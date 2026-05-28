@@ -37,15 +37,15 @@ class StubLLMClient:
 
 
 class GeminiLLMClient:
-    """Live Gemini client via google-genai SDK."""
+    """Live Gemini client via google-genai SDK, routed through Vertex AI."""
 
     def __init__(
         self,
-        api_key: str | None = None,
+        project: str,
+        location: str = "us-central1",
         model: str = "gemini-2.5-flash",
     ) -> None:
-        # api_key=None → SDK reads GOOGLE_API_KEY / GEMINI_API_KEY from environment
-        self._client = genai.Client(api_key=api_key)
+        self._client = genai.Client(vertexai=True, project=project, location=location)
         self._model = model
 
     def complete(

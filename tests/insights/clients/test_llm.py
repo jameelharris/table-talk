@@ -27,11 +27,11 @@ def test_stub_key_error_message_includes_prompts():
 
 def test_gemini_instantiates_without_live_call():
     # Verifies the constructor stores state without making any network request.
-    client = GeminiLLMClient(api_key="dummy-key-not-used")
+    client = GeminiLLMClient(project="dummy-project-not-used")
     assert client is not None
     assert client._model == "gemini-2.5-flash"
 
 
 def test_gemini_accepts_custom_model():
-    client = GeminiLLMClient(api_key="dummy", model="gemini-2.0-flash")
+    client = GeminiLLMClient(project="dummy-project-not-used", model="gemini-2.0-flash")
     assert client._model == "gemini-2.0-flash"

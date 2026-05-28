@@ -1,8 +1,11 @@
 """
 Integration test for the full Insights Factory pipeline with real Gemini calls.
 
-Costs a few cents per run. Requires GOOGLE_API_KEY or GEMINI_API_KEY in the
-environment. Skipped by default (marked @pytest.mark.integration).
+Costs a few cents per run. Auth is ADC-based (Vertex AI) — requires:
+  gcloud auth application-default login
+  GOOGLE_CLOUD_PROJECT set to a billed GCP project
+
+Skipped by default (marked @pytest.mark.integration).
 
 Run with: uv run pytest -m integration tests/insights/test_orchestration_integration.py -v
 """
@@ -13,9 +16,11 @@ import pytest
 
 @pytest.mark.integration
 def test_real_gemini_end_to_end() -> None:
-    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        pytest.skip("GOOGLE_API_KEY or GEMINI_API_KEY not set in environment")
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if not project:
+        pytest.skip(
+            "GOOGLE_CLOUD_PROJECT not set; requires ADC auth and a billed GCP project."
+        )
 
     from table_talk.insights.agents.analyst import Analyst
     from table_talk.insights.agents.researcher import Researcher
@@ -25,7 +30,7 @@ def test_real_gemini_end_to_end() -> None:
     from table_talk.insights.contracts import AnalysisMethod
     from table_talk.insights.coordinator import Coordinator
 
-    llm = GeminiLLMClient(api_key=api_key)
+    llm = GeminiLLMClient(project=project)
     bq = FakeBigQueryClient()
 
     coordinator = Coordinator(
