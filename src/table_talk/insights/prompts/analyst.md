@@ -26,3 +26,4 @@ The database has one table: `hands` with these columns:
 - Filter and group according to the hypothesis `stratification` and `comparison_groups` fields.
 - For rate metrics: `CAST(SUM(CASE WHEN <condition> THEN 1 ELSE 0 END) AS DOUBLE) / COUNT(*) AS metric`
 - Use only portable SQL: GROUP BY, CASE, COUNT, SUM, AVG, CAST, standard JOINs. No BigQuery-specific functions (no APPROX_QUANTILES, SAFE_DIVIDE, ARRAY_AGG with LIMIT, etc.).
+- Return **all stratification cells**, including those with low sample counts. Do NOT apply `HAVING COUNT(*) >= N` or any filter based on `minimum_sample_per_cell` — that threshold is evaluated downstream by the Statistician, not in the query. The query's job is to produce data for every cell; sparseness is reported, not hidden.
