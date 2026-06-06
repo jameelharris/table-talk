@@ -56,9 +56,7 @@ For multi-step tasks, state a brief plan:
 1. [Step] → verify: [check]
 2. [Step] → verify: [check]
 3. [Step] → verify: [check]
-```
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
 ---
 
@@ -66,17 +64,87 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## Project Conventions
 
-These conventions reflect the current state of the project and should be respected when adding new code or modifying existing code.
+These conventions govern the structure and design of code in this project. They are project-specific rules that new code must follow, distinct from the general coding discipline in sections 1-4. ARCHITECTURE.md describes the phases where these conventions are applied; this section is the authoritative source for the rules themselves.
 
-- **Schemas are the source of truth.** BigQuery table schemas live at `schemas/*.json` at the repo root. Python dataclasses are generated from them via `scripts/gen_schemas.py` and land in `src/table_talk/_generated/`. Generated files are committed and never edited by hand. After changing a schema, regenerate before committing.
+### Schemas are the source of truth
 
-- **BQ writes use DML INSERT with parameterized queries.** Not load jobs. This is so BigQuery applies column DEFAULTs server-side. The codegen omits any column with `defaultValueExpression` set, since BQ supplies those values.
+BigQuery table schemas live at `schemas/*.json` at the repo root. Python dataclasses are generated from them via `scripts/gen_schemas.py` and land in `src/table_talk/_generated/`. Generated files are committed and never edited by hand. After changing a schema, regenerate before committing.
 
-- **Integration tests are opt-in.** `uv run pytest` excludes them by default (via `addopts` in `pyproject.toml`). Run them explicitly with `uv run pytest -m integration`. Integration tests hit real GCP dev resources and must clean up in `try/finally`.
+### BQ writes use DML INSERT with parameterized queries
 
-- **Primitives are stateless and ignorant of orchestration.** Fetcher, uploader, and writers each take inputs and produce outputs (or raise classified exceptions). They do not consult BigQuery for context, do not decide retry policy, and do not know about other primitives. The orchestrator (`src/table_talk/ingest.py`) composes them.
+Not load jobs. This is so BigQuery applies column DEFAULTs server-side. The codegen omits any column with `defaultValueExpression` set, since BQ supplies those values.
 
-## Integration test scoping
+### Two-table pattern (inventory + state machine)
+
+Each major entity has two tables:
+
+- An **inventory table** — immutable per row, captures "this thing exists." Written once at entity creation.
+- A **state machine table** — insert-only, captures "this is what happened during an attempt to process this thing." One row per attempt. Server-defaulted `attempted_at` timestamp.
+
+The current state of an entity is derived: latest row in the attempts table (by `attempted_at`) for that entity. No in-flight states are stored; rows are only written after attempts conclude.
+
+Never UPDATE state machine rows; insert new rows instead.
+
+### Writers are hand-written per table
+
+Each table has its own writer module, no shared base class. Follow the template of `videos_writer.py` for simple cases or `video_ingestion_attemptster.py` for cases with status validation. Some duplication across writers is accepted for consistency.
+
+### Batch DML for high-cardinality writes
+
+When one operator action produces many rows for a single entity (like `clip_manifest`'s many-clips-per-video), the writer accepts a list and produces one atomic DML INSERT. For single-row-per-event writes (`videos`, `video_ingestion_attempts`, `clip_processing_attempts`), writers stay single-row.
+
+The atomicity unit is the logical group that belongs together. A video's clips all land in one DML statement so partial-state idempotence failures cannot happen.
+
+### Primitives are stateless and ignorant of orchestration
+
+Fetcher, uploader, and writers each take inputs and produce outputs (or raise classified exceptions). They do not consult BigQuery for context, do not decide retry policy, and do not know about other primitives. Orchestrators compose them.
+
+### CLI commands map to logical groups
+
+Each `tt` subcommand does one logical group's work. Cross-group composition is via command sequence, not bundled commands. Each phase that needs operator-invoked work gets its own subcommand.
+
+### INT64 seconds for video-offset times
+
+All time offsets within a video (clip start/end, hand start within clip, etc.) are stored as INT64 seconds. Not floats, not milliseconds, not durations.
+
+### Idempotence and self-healing
+
+Processing functions must be idempotent on their inputs. Re-running a command should be safe and should naturally fill in any missing work. Idempotence checks derive from the attempts tables: "does any attempt with status='complete' exist for this entity?"
+
+### Integration tests are opt-in
+
+`uv run pytest` excludes them by default (via `addopts` in `pyproject.toml`). Run them explicitly with `uv run pytest -m integration`. Integration tests hit real GCP dev resources and must clean up in `try/finally`.
+
+### Testing scope
+
+Test files are scoped to a single phase. No test file imports from another phase's test files. Cross-phase composition is verified at the CLI seam by an operator running commands, not by automated tests that span multiple phases.
+
+Within each phase, every production file has a corresponding test file containing both unit tests (most) and integration tests (some, marked `@pytest.mark.integration`). The phase's overall correctness emerges from the union of integration tests across its files, not from any single phase-level test.
+
+**Cross-phase setup via production writers.** When a phase's integration tests require state from earlier phases (e.g., Phase 3 tests need a `videos` row and a `clip_manifest` row to exist), they call earlier phases' production writers as setup utilities — not earlier phases' orchestrators.
+
+For example, a Phase 3 integration test would:
+
+```
+# Setup via production writers from Phase 1 and Phase 2
+write_video_row(VideosRow(...))
+write_clip_manifest_rows([ClipManifestRow(...)])
+
+# Exercise Phase 3
+phase3_function(clip_id, ...)
+
+# Assert Phase 3 outputs
+...
+
+# Cleanup in reverse dependency order
+DELETE FROM hand_setups WHER...
+DELETE FROM clip_manifest WHERE ...
+DELETE FROM videos WHERE ...
+```
+
+Writers are stateless functions with well-defined contracts and their own tests. Reusing them as setup utilities is clean. Reusing orchestrators (`process_url`, `materialize_clips_for_pending_videos`) would couple the test to too much behavior and would slow tests down with unnecessary work (e.g., real YouTube downloads).
+
+### Integration test scoping
 
 Integration tests must operate only on data they create. This has two implications:
 
