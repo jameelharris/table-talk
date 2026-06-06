@@ -178,6 +178,35 @@ Each table has a writer module following a template (`videos_writer.py` for simp
 
 When one operator action produces many rows for a single entity (like `clip_manifest`'s many-clips-per-video), the writer accepts a list and produces one atomic DML INSERT. For single-row-per-event writes (`videos`, `video_ingestion_attempts`, `clip_processing_attempts`), writers stay single-row.
 
+### Testing scope
+
+Test files are scoped to a single phase. No test file imports from another phase's test files. Cross-phase composition is verified at the CLI seam by an operator running commands, not by automated tests that span multiple phases.
+
+Within each phase, every production file has a corresponding test file containing both unit tests (most) and integration tests (some, marked `@pytest.mark.integration`). The phase's overall correctness emerges from the union of integration tests across its files, not from any single phase-level test.
+
+**Cross-phase setup via production writers.** When a phase's integration tests require state from earlier phases (e.g., Phase 3 tests need a `videos` row and a `clip_manifest` row to exist), they call earlier phases' production writers as setup utilities — not earlier phases' orchestrators.
+
+For example, a Phase 3 integration test would:
+
+```
+# Setup via production writers from Phase 1 and Phase 2
+write_video_row(VideosRow(...))
+write_clip_manifest_rows([ClipManifestRow(...)])
+
+# Exercise Phase 3
+phase3_function(clip_id, ...)
+
+# Assert Phase 3 outputs
+...
+
+# Cleanup in reverse dependency order
+DELETE FROM hand_setups WHERE ...
+DELETE FROM clip_manifest WHERE ...
+DELETE FROM videos WHERE ...
+```
+
+Writers are stateless functions with well-defined contracts and their own tests. Reusing them as setup utilities is clean. Reusing orchestrators (`process_url`, `materialize_clips_for_pending_videos`) would couple the test to too much behavior and would slow tests down with unnecessary work (e.g., real YouTube downloads).
+
 ### Integration test scoping
 
 Functions that operate on "all matching X" must accept a scope-limiting parameter (e.g., `only_X_ids: list[str] | None = None`) so integration tests can constrain their blast radius to test-owned data. Production callers leave the parameter as None.
