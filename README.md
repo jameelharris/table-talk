@@ -1,12 +1,16 @@
 # table-talk
 
-A conversational analytics agent over a BigQuery poker dataset. Source data is ingested from final-table poker video replays via a video-to-JSON pipeline.
+**Description**
+MVP-1: An AI-enabled batch processing pipeline that converts final-table poker video replays on YouTube to a dataset of structured poker hands.
+MVP-2: A multi-agent workflow for deriving insights from the dataset.
 
-**Status**: in progress. Migrating from a Colab prototype to a structured Python project with IaC, dbt, and an agentic interface.
+**MVP-1 Status**: In progress. Feasibility testing completed in Colab. Migrating from Colab prototype to a structured Python project with IaC, using Terraform.
+
+**MVP-2 Status**: Scaffolding for agent-to-agent communication unit-tested and integration tested. 
 
 ## System Design
 
-Table Talk runs entirely on GCP. A scheduler kicks off the **Downloader**, which pulls poker broadcasts into storage; an Eventarc trigger then fires the **Video Clipper** to break each broadcast into hand-level clips; finally an **AI Data Transformation** step (Dataform + Gemini/BQML) decodes those clips into structured hand details.
+Table Talk runs entirely on GCP. A scheduler kicks off the **Downloader**, which pulls poker broadcasts into storage; an Eventarc trigger then fires the **Video Clipper** to break each broadcast into hand-level clips; finally an **AI Data Transformation** step (Python + Gemini on Vertex AI) decodes those clips into structured hand details.
 
 ```mermaid
 flowchart LR
