@@ -4,6 +4,41 @@ A conversational analytics agent over a BigQuery poker dataset. Source data is i
 
 **Status**: in progress. Migrating from a Colab prototype to a structured Python project with IaC, dbt, and an agentic interface.
 
+## System Design
+
+Table Talk runs entirely on GCP. A scheduler kicks off the **Downloader**, which pulls poker broadcasts into storage; an Eventarc trigger then fires the **Video Clipper** to break each broadcast into hand-level clips; finally an **AI Data Transformation** step (Dataform + Gemini/BQML) decodes those clips into structured hand details.
+
+```mermaid
+flowchart LR
+    Admin([System Admin])
+
+    subgraph GCP["Table Talk — GCP"]
+        direction LR
+        DT[Downloader Trigger<br/><i>Cloud Scheduler</i>]
+        DL[Downloader<br/><i>Cloud Run</i>]
+        VCT[Video Clipper Trigger<br/><i>Eventarc</i>]
+        VC[Video Clipper<br/><i>Cloud Run</i>]
+        AI[AI Data Transformation<br/><i>Dataform + Gemini</i>]
+
+        PBR[(Poker Broadcast Registry<br/><i>BigQuery</i>)]
+        VA[(Video Assets<br/><i>Cloud Storage</i>)]
+        CA[(Clip Assets<br/><i>Cloud Storage</i>)]
+        CR[(Clip Registry<br/><i>BigQuery</i>)]
+        HH[(Hand History<br/><i>BigQuery</i>)]
+    end
+
+  Admin -->|uploads video URLs| PBR
+    DT -->|starts every 30 min| DL
+    DL -->|updates / queries asset status| PBR
+    DL -->|sends data to| VA
+    VCT -->|listens for new assets| VA
+    VCT -->|starts| VC
+    VC -->|queries clip status / adds row| CR
+    VC -->|sends data to| CA
+    AI -->|queries| CR
+    AI -->|sends data to| HH
+```
+
 ## Data Model
 
 The schema captures poker hand histories extracted from recorded broadcasts. A `Video` is segmented into `Clips`, each clip holds 1-N `Hands`, and each hand decomposes into per-street state (`Hands_Streets`), per-player state (`Hands_Positions`), and the individual `Actions` taken. The `*_LU` tables are lookups for streets, seat positions, and action types.
@@ -78,13 +113,6 @@ erDiagram
         char action_name
     }
 ```
-
-## Long-term architecture
-
-1. **Ingestion**: `yt-dlp` downloads poker broadcasts; videos cached in GCS
-2. **Extraction**: Gemini (via Vertex AI) extracts hand records as JSON
-3. **Validation & shredding**: dbt validates JSON structure and shreds into a BigQuery star schema
-4. **Analytics**: a conversational agent queries BigQuery via natural language
 
 ## Documentation
 
