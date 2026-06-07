@@ -1,8 +1,8 @@
 # table-talk
 
 **Description**
-MVP-1: An AI-enabled batch processing pipeline that converts final-table poker video replays on YouTube to a dataset of structured poker hands.
-MVP-2: A multi-agent workflow for deriving insights from the dataset.
+- MVP-1: An AI-enabled batch processing pipeline that converts final-table poker video replays on YouTube to a dataset of structured poker hands.
+- MVP-2: A multi-agent workflow for deriving insights from the dataset.
 
 **MVP-1 Status**: In progress. Feasibility testing completed in Colab. Migrating from Colab prototype to a structured Python project with IaC, using Terraform.
 
