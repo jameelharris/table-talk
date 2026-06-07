@@ -6,7 +6,7 @@ A conversational analytics agent over a BigQuery poker dataset. Source data is i
 
 ## Data Model
 
-The schema captures poker hand histories extracted from recorded broadcasts. A `Video` is segmented into `Clips`, each clip holds one `Hand`, and each hand decomposes into per-street state (`Hands_Streets`), per-player state (`Hands_Positions`), and the individual `Actions` taken. The `*_LU` tables are lookups for streets, seat positions, and action types.
+The schema captures poker hand histories extracted from recorded broadcasts. A `Video` is segmented into `Clips`, each clip holds 1-N `Hands`, and each hand decomposes into per-street state (`Hands_Streets`), per-player state (`Hands_Positions`), and the individual `Actions` taken. The `*_LU` tables are lookups for streets, seat positions, and action types.
 
 ```mermaid
 %%{init: {"layout": "elk"}}%%
