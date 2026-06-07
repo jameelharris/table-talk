@@ -121,4 +121,4 @@ erDiagram
 
 ## Getting started
 
-This project is under active development and not yet usable end-to-end. See `terrm/README.md` for infrastructure setup.
+This project is under active development and not yet usable end-to-end. See `terraform/README.md` for infrastructure setup.
