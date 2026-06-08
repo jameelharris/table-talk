@@ -27,7 +27,7 @@ Downloads a video from YouTube via yt-dlp, uploads it to GCS, writes metadata to
 
 - `cli.py` — `tt ingest` subcommand
 - `ingest.py` — orchestration: `process_url`, `process_manifest`, `reconcile_url`
-- `maAML manifest loader (`load_manifest`) and `extract_video_id`
+- `videos.YAML manifest loader (`load_manifest`) and `extract_video_id`
 - `videos_fetcher.py` — yt-dlp wrapper, error classification
 - `videos_uploader.py` — GCS upload wrapper
 - `videos_writer.py` — `videos` table writes
