@@ -62,13 +62,13 @@ The schema captures poker hand histories extracted from recorded broadcasts. A `
 ```mermaid
 %%{init: {"layout": "elk"}}%%
 erDiagram
-    VIDEOS           ||--o{ CLIPS           : "has"
+    VIDEOS           ||--o{ CLIPS           : "contains"
     CLIPS            ||--o{ HANDS           : "contains"
-    HANDS            ||--o{ HANDS_STREETS   : "played over"
+    HANDS            ||--o{ HANDS_STREETS   : "contains"
     STREETS_LU       ||--o{ HANDS_STREETS   : "classifies"
-    HANDS            ||--o{ HANDS_POSITIONS : "seats"
+    HANDS            ||--o{ HANDS_POSITIONS : "contains"
     POSITIONS_LU     ||--o{ HANDS_POSITIONS : "classifies"
-    HANDS_STREETS    ||--o{ ACTIONS         : "occurs on"
+    HANDS_STREETS    ||--o{ ACTIONS         : "contains"
     HANDS_POSITIONS  ||--o{ ACTIONS         : "performs"
     ACTIONS_LU       ||--o{ ACTIONS         : "classifies"
 
