@@ -6,7 +6,7 @@ Reaching a final table in a large field poker tournament is a rare opportunity t
 
 ## Motivation
 
-KalipokerTV is a YouTube channel that posts final table replays of PokerStars' online tournaments. This channel democratizes access to tournament replays that are normally only available to tournament entrants. KalipokerTV has uploaded ~150 NL final table replay videos in 2026 so far. Assuming an average video length of 1hr and an average hand duration of 1 minute, the estimated total hands played is ~18K hands. This easily translates to 100K+ observable actions across a variety of situational dimensions - a dataset of immense analytical value due to the population tendency and trend analysis it enables. The challenge is reliably converting the raw video into structured hands. 
+KalipokerTV is a YouTube channel that posts final table replays of PokerStars' online tournaments. This channel democratizes access to tournament replays that are normally only available to tournament entrants. KalipokerTV has uploaded ~150 NL final table replay videos in 2026 so far. Assuming an average video length of 1hr and an average hand duration of 1 minute, the estimated total hands played is ~18K hands. 18K hands roughly breaks down into 100K+ observable actions. Such a dataset enables trend analysis and population tendency insights for a variety of final table scenarios. Leveraging this analytical capability is one of several ways to prepare for final tables, when the stakes are highest. 
 
 ## Description
 
