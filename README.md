@@ -11,13 +11,12 @@ KalipokerTV is a YouTube channel that posts final table replays of PokerStars' o
 ## Description
 
 - MVP-1: An AI-enabled batch processing pipeline that converts final-table poker video replays on YouTube to a dataset of structured poker hands.
-  - Status: In progress. 
-    - Feasibility testing completed in Colab. 
-    - Migrating from Colab prototype to a structured Python project with IaC, using Terraform.
-
+    - Status: In progress. 
+        - Feasibility testing completed in Colab. 
+        - Migrating from Colab prototype to a structured Python project with IaC, using Terraform.
 - MVP-2: A multi-agent workflow that mines the MVP-1 dataset for population tendency and trend analysis. 
-  - Status: Paused. 
-    - Scaffolding for agent-to-agent communication unit-tested and integration tested (likely to move to a standalone repo).
+    - Status: Paused. 
+        - Scaffolding for agent-to-agent communication unit-tested and integration tested (likely to move to a standalone repo).
 
 ## System Design
 
