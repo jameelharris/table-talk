@@ -15,6 +15,7 @@ TYPE_MAP = {
     "FLOAT64": "float",
     "BOOL": "bool",
     "BYTES": "bytes",
+    "JSON": "dict[str, Any]",
 }
 
 
@@ -60,6 +61,9 @@ def generate_dataclass(schema_path: Path) -> str:
         elif mode == "NULLABLE":
             nullable_fields.append((name, py_type))
 
+    all_fields = required_fields + nullable_fields
+    needs_any = any("Any" in py_type for _, py_type in all_fields)
+
     lines = [
         f"# AUTO-GENERATED FROM schemas/{schema_path.name} BY scripts/gen_schemas.py",
         "# DO NOT EDIT BY HAND. Run `uv run python scripts/gen_schemas.py` to regenerate.",
@@ -67,6 +71,10 @@ def generate_dataclass(schema_path: Path) -> str:
         "from __future__ import annotations",
         "",
         "from dataclasses import dataclass",
+    ]
+    if needs_any:
+        lines.append("from typing import Any")
+    lines += [
         "",
         "",
         "@dataclass(frozen=True)",
