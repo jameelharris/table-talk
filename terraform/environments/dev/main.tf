@@ -95,3 +95,32 @@ module "clip_processing_attempts_table" {
   }
   deletion_protection = true
 }
+
+module "hand_setups_bucket" {
+  source = "../../modules/gcs_bucket"
+
+  name               = "${var.project_id}-hand-setups-${var.environment}"
+  location           = var.region
+  project            = var.project_id
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "hand_setups"
+  }
+}
+
+module "hand_setups_table" {
+  source = "../../modules/bigquery_table"
+
+  dataset_id  = module.bigquery_dataset.dataset_id
+  table_id    = "hand_setups"
+  project     = var.project_id
+  schema      = file("${path.module}/../../../schemas/hand_setups.json")
+  description = "Inventory of detected hand setups, one row per setup identified in a clip."
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "hand_setup_inventory"
+  }
+  deletion_protection = true
+}
