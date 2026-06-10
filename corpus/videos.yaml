@@ -1,4 +1,4 @@
 # Source of truth for what should be in the corpus.
 # Each entry is a YouTube URL (one per line). The ingestion job reconciles
 # this list against BigQuery to determine what to download.
-- https://youtu.be/Y6cq2xi0xdE?si=-24QrUubJWD39CIJ
+- https://youtu.be/MPBLfM4mwfE?si=Yy1bW2cyoWPZ907N
