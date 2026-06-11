@@ -23,6 +23,7 @@ from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
 from .gemini_caller import GeminiPermanentError, call_gemini_for_clip, call_gemini_for_frame
 from .hand_setups_writer import write_hand_setups
+from .seat_enrichment import add_seat_numbers, normalize_heads_up
 from .videos_downloader import download_video
 
 
@@ -184,6 +185,8 @@ async def process_clip(
                     "pot_size_bb": inner.get("pot_size_bb"),
                     "players": inner.get("players", []),
                 }
+                add_seat_numbers(hand_setup_state)
+                normalize_heads_up(hand_setup_state)
                 rows.append(
                     HandSetupsRow(
                         hand_setup_id=hand_setup_id,

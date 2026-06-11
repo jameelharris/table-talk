@@ -341,6 +341,53 @@ def test_process_clip_gemini_frame_error_no_inserts_no_uploads():
 
 
 # ---------------------------------------------------------------------------
+# process_clip — seat enrichment applied before writing HandSetupsRow
+# ---------------------------------------------------------------------------
+
+
+def test_process_clip_seat_enrichment_applied():
+    """Players reaching HandSetupsRow must have seat_number and be sorted."""
+    player_info_multi = {
+        "hand_setup": {
+            "total_seat_count": 6,
+            "pot_size_bb": 1.5,
+            "players": [
+                {"seat_position_label": "UTG", "stack_size": 50.0},
+                {"seat_position_label": "BB", "stack_size": 100.0},
+            ],
+        }
+    }
+
+    with (
+        patch("table_talk.hand_setup_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_ONE_SETUP),
+        patch("table_talk.hand_setup_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch("table_talk.hand_setup_processing.call_gemini_for_frame", return_value=player_info_multi),
+        patch("table_talk.hand_setup_processing.upload_frame"),
+        patch("table_talk.hand_setup_processing.write_hand_setups") as mock_write_setups,
+        patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row"),
+    ):
+        _run(process_clip(
+            _CLIP, "/tmp/video.mp4", "proj", "ds",
+            "hand-setups-bucket", "videos-bucket",
+            "identify prompt", "extract prompt",
+        ))
+
+    rows_arg = mock_write_setups.call_args[0][0]
+    players = rows_arg[0].hand_setup_state["players"]
+
+    # Every player with a known label has a non-None seat_number
+    assert all(p["seat_number"] is not None for p in players)
+
+    # Players are sorted ascending by seat_number
+    seat_numbers = [p["seat_number"] for p in players]
+    assert seat_numbers == sorted(seat_numbers)
+
+    # BB (seat 1) sorts before UTG (seat 9)
+    assert players[0]["seat_position_label"] == "BB"
+    assert players[1]["seat_position_label"] == "UTG"
+
+
+# ---------------------------------------------------------------------------
 # process_pending_clips — dispatch logic
 # ---------------------------------------------------------------------------
 
