@@ -103,7 +103,37 @@ def test_json_parameter_type_and_value():
     params = {p.name: p for p in kwargs["job_config"].query_parameters}
     json_param = params["hand_setup_state_0"]
     assert json_param.type_ == "JSON"
-    assert json_param.value == json.dumps(state)
+    assert json_param.to_api_repr()["parameterValue"]["value"] == json.dumps(state)
+
+
+def test_no_double_encoding_of_hand_setup_state():
+    mock_client, _ = _mock_client()
+    state = {
+        "hand_setup_time_seconds": 332,
+        "total_seat_count": 6,
+        "pot_size_bb": 1.5,
+        "players": [{"seat_position_label": "BB", "stack_size": 100.0}],
+    }
+    row = HandSetupsRow(
+        hand_setup_id="vid_001_001",
+        clip_id="vid_001",
+        video_id="vid",
+        hand_setup_time_seconds=332,
+        frame_gcs_path="gs://bucket/frame.jpg",
+        hand_setup_state=state,
+    )
+
+    write_hand_setups([row], project_id="proj", dataset="ds", client=mock_client)
+
+    _, kwargs = mock_client.query.call_args
+    params = {p.name: p for p in kwargs["job_config"].query_parameters}
+    p = params["hand_setup_state_0"]
+
+    assert p.type_ == "JSON"
+    # to_api_repr() reveals what BigQuery actually receives — exactly one layer of encoding.
+    api_value = p.to_api_repr()["parameterValue"]["value"]
+    assert api_value == json.dumps(state)
+    assert api_value != json.dumps(json.dumps(state))
 
 
 def test_job_errors_raises():

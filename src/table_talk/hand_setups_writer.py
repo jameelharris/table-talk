@@ -5,7 +5,6 @@
 # DEFAULTs server-side. The detected_at column is populated
 # by BQ via CURRENT_TIMESTAMP() per the schema's defaultValueExpression.
 
-import json
 from dataclasses import asdict
 
 from google.cloud import bigquery
@@ -52,7 +51,7 @@ def write_hand_setups(
         placeholders = ", ".join(f"@{c}_{i}" for c in columns)
         value_tuples.append(f"({placeholders})")
         for c, v in row_dict.items():
-            bq_value = json.dumps(v) if isinstance(v, dict) else v
+            bq_value = v
             query_parameters.append(
                 bigquery.ScalarQueryParameter(f"{c}_{i}", _bq_param_type(v), bq_value)
             )
