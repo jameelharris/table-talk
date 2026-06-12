@@ -27,7 +27,7 @@ Downloads a video from YouTube via yt-dlp, uploads it to GCS, writes metadata to
 
 - `cli.py` — `tt ingest` subcommand
 - `ingest.py` — orchestration: `process_url`, `process_manifest`, `reconcile_url`
-- `manifest.py` — manifest_manifest`) and `extract_video_id`
+- `manifest.py` — YAML manifest loader (`load_manifest`) and `extract_video_id`
 - `videos_fetcher.py` — yt-dlp wrapper, error classification
 - `videos_uploader.py` — GCS upload wrapper
 - `videos_writer.py` — `videos` table writes
@@ -59,7 +59,7 @@ Per-URL failures are caught and recorded in `video_ingestion_attempts` with a st
 
 - `complete` → skip on next run
 - `failed_transient_predownload` → retry on next run
-- `failedownload` → retry on next run
+- `failed_transient_postdownload` → retry on next run
 - `failed_terminal` → skip on next run (no retry)
 
 Status classification happens in `videos_fetcher.classify_error` based on the yt-dlp exception type and message.
@@ -90,7 +90,7 @@ tt materialize-clips --project P --dataset D
 tt materialize-clips --project P --dataset D --video-id VIDEO_ID
 ```
 
-Without `--video-id`: materializes for all videos in `videos` that havifest` rows.
+Without `--video-id`: materializes for all videos in `videos` that have no `clip_manifest` rows.
 With `--video-id`: materializes only for the specified video; errors if the video isn't in `videos`.
 
 ### Failure handling
@@ -101,7 +101,7 @@ This is intentionally simpler than Phase 1's per-URL attempt tracking. Materiali
 
 ## Phase 3: Hand setup identification
 
-Picks up pending clips from `clip_manifest`, downloads the source video to a per-video local tempfile, calls Gemini 2.5 Pro on each clip to identify hand setup moments, extracts a frame at each moment via ffmpeg, calls Gemini Pro on each frame to extract player info, enriches with deterministic seat metadata, d writes `hand_setups` rows + frame JPEGs to GCS. All work per clip is atomic — either all hand_setups rows for a clip land or none do. Defines hand setup moments only; per-hand action sequences are a later phase.
+Picks up pending clips from `clip_manifest`, downloads the source video to a per-video local tempfile, calls Gemini 2.5 Pro on each clip to identify hand setup moments, extracts a frame at each moment via ffmpeg, calls Gemini Pro on each frame to extract player info, enriches with deterministic seat metadata, and writes `hand_setups` rows + frame JPEGs to GCS. All work per clip is atomic — either all hand_setups rows for a clip land or none do. Defines hand setup moments only; per-hand action sequences are a later phase.
 
 ### Production files
 
@@ -111,7 +111,7 @@ Picks up pending clips from `clip_manifest`, downloads the source video to a per
 - `frame_extractor.py` — ffmpeg subprocess wrapper; sharpness/saturation filters match the notebook's image-quality settings
 - `frame_uploader.py` — GCS frame upload
 - `gemini_caller.py` — Vertex AI Gemini Pro caller (clip-mode video + frame-mode image), with truncated exponential backoff retry on `ResourceExhausted` (429): 5 attempts, full jitter, delays capped at 60s
-- `hand_setu— `hand_setups` table writes (batched DML, JSON column passed as `dict` directly to `ScalarQueryParameter(type="JSON")` — single-encoded)
+- `hand_setups_writer.py` — `hand_setups` table writes (batched DML, JSON column passed as `dict` directly to `ScalarQueryParameter(type="JSON")` — single-encoded)
 - `seat_enrichment.py` — deterministic `SEAT_NUMBER_MAP` (BB=1, SB=2, BTN=3, CO=4, HJ=5, LJ=6, UTG+2=7, UTG+1=8, UTG=9); `add_seat_numbers` injects + sorts players; `normalize_heads_up` rewrites SB→BTN when `total_seat_count == 2`
 - `clip_processing_attempts_writer.py` — `clip_processing_attempts` state machine writes
 
@@ -127,7 +127,7 @@ Picks up pending clips from `clip_manifest`, downloads the source video to a per
 
 ### BQ tables
 
-- `hand_setups` — one row per detected hand setup, scoped to clip; `hand_setup_state` is a JSON column with `total_seat_count`, `pot_s `players` (each enriched with `seat_number`)
+- `hand_setups` — one row per detected hand setup, scoped to clip; `hand_setup_state` is a JSON column with `total_seat_count`, `pot_size`, `players` (each enriched with `seat_number`)
 - `clip_processing_attempts` — insert-only state machine, one row per processing attempt
 
 ### GCS
@@ -153,7 +153,7 @@ Classification:
 - Vertex 429 after retry exhaustion → `failed_transient` (most 429s never surface — they're absorbed silently by backoff)
 - Other network / GCS / BQ errors → `failed_transient`
 - Malformed JSON from LLM → `failed_permanent`
-- LLM-returned timestamp outside `[clip_start_time, cliiled_permanent` (hallucination guard)
+- LLM-returned timestamp outside `[clip_start_time, clip_end_time]` → `failed_permanent` (hallucination guard)
 - LLM safety blocks → `failed_permanent`
 
 Atomicity: within a clip, all per-hand-setup work (frame extraction, frame upload, frame-level Gemini call) happens before any BQ writes. The batch INSERT of all `hand_setups` rows and the `clip_processing_attempts` row both land in the same flow; if anything fails mid-clip, zero `hand_setups` rows persist for that clip.
@@ -172,7 +172,7 @@ Atomicity: within a clip, all per-hand-setup work (frame extraction, frame uploa
 
 ### Operational hardening
 
-- GCS Data Access audit logs are enabled at the project level for `storage.googleapis.com` (ADMIN_READ + DATA_READ + DATA_WRITE) so object-level operations are traceable in Cloud Logging. Voll under the 50 GiB/month free tier for current workload.
+- GCS Data Access audit logs are enabled at the project level for `storage.googleapis.com` (ADMIN_READ + DATA_READ + DATA_WRITE) so object-level operations are traceable in Cloud Logging. Well under the 50 GiB/month free tier for current workload.
 - All GCS buckets have versioning + 7-day soft delete enabled; deletes are recoverable via `gcloud storage restore`.
 - Integration tests must operate only on data they create (synthetic IDs, UUID-scoped paths). Any test that touches production-derived identifiers is treated as a bug.
 
@@ -183,10 +183,10 @@ Not blocking any current phase, but accumulated as the project has grown:
 - **CLI config defaults** — every command currently requires `--project --dataset --bucket`. Env var defaults (`TT_PROJECT`, etc.) would reduce friction.
 - **`status_message` description typo** in `schemas/clip_processing_attempts.json` ("reason.NULL" missing a space).
 - **CLI-layer testing gap** — `tt` commands have no automated tests. Deferred until something forces it.
-- **`_bq_param_type` narrowness** — most writers handle only `str` and `int`. `hand_setups_writer` extended this to `dict` (JSON). Latent issue for any FLOAT64 / BOOL / BYTES column added later in otheers.
+- **`_bq_param_type` narrowness** — most writers handle only `str` and `int`. `hand_setups_writer` extended this to `dict` (JSON). Latent issue for any FLOAT64 / BOOL / BYTES column added later in other writers.
 - **Hand-level deletion cascade tooling** — needed when downstream hand tables land.
 - **`download_video` NotFound classification** — currently raises into `failed_transient` (loops forever). Should be `failed_permanent` for true 404s, since retry can't conjure the file back into existence.
 - **CLI silent no-op on unknown `--video-id`** — if the filter matches zero pending clips, the command exits cleanly with `clips_processed: 0`. Should warn the operator that the filter matched nothing (typo? already complete?).
 - **`status_message` truncation** in `clip_processing_attempts` writes — current 500-char limit can cut off ffmpeg / Gemini error details before the useful diagnostic content. Either raise the limit or extract the relevant tail.
-- **Orphan frame cleanup on permanently-failed clips** — frames are uploaded before the batch INSERT; on permanent failure, the GCS frames persist without corresponding `hand_setups` rows. Self-healing on transient retry (deterministic paths); manual cleanupr permanent failures.
+- **Orphan frame cleanup on permanently-failed clips** — frames are uploaded before the batch INSERT; on permanent failure, the GCS frames persist without corresponding `hand_setups` rows. Self-healing on transient retry (deterministic paths); manual cleanup on permanent failures.
 - **Integration test soft-delete cleanup** — synthetic `test_p3_*` fixtures accumulate in soft-delete after each integration run. Test `finally` block deletes the live version, but the noncurrent/soft-deleted copy lingers for 7 days. Cleanup could also purge from soft delete.
