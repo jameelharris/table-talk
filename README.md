@@ -10,7 +10,7 @@ KalipokerTV is a YouTube channel that posts final table replays of PokerStars' o
 
 ## Description
 
-- MVP-1: An ETL pipeline with AI-enabled transformation, converting final-table poker video replays on YouTube to a dataset of structured poker hands.
+- MVP-1: An ETL pipeline with AI-enabled data extraction, converting final-table poker video replays on YouTube to a dataset of structured poker hands.
     - Status: In progress. 
         - Feasibility testing completed in Colab. 
         - ~$0.15 compute cost per hand record 
