@@ -1,3 +1,4 @@
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -413,28 +414,39 @@ def test_process_url_integration():
     from google.cloud import bigquery as bq_module
     from google.cloud import storage as gcs
 
-    from table_talk.manifest import extract_video_id, load_manifest
-
     project = "table-talk-497020"
     dataset = "table_talk_dev"
     bucket_name = "table-talk-497020-videos-dev"
 
-    manifest = load_manifest(Path("corpus/videos.yaml"))
-    url = manifest[0].source_url
-    video_id = extract_video_id(url)
+    # UUID-scoped video_id: must be exactly 11 chars (upload_video enforces this).
+    # Using a synthetic URL so the test never touches real YouTube and never
+    # operates on production GCS objects it didn't create.
+    video_id = f"t{uuid.uuid4().hex[:10]}"  # 1 + 10 = 11 chars
+    url = f"https://youtu.be/{video_id}"
 
     bq_client = bq_module.Client(project=project)
     storage_client = gcs.Client()
 
-    try:
-        process_url(
-            url,
-            project=project,
-            dataset=dataset,
-            bucket=bucket_name,
-            bq_client=bq_client,
-            storage_client=storage_client,
+    def _fake_fetch(src_url, *, download_dir):
+        local = Path(download_dir) / f"{video_id}.mp4"
+        local.write_bytes(b"fake integration test video")
+        return FetchResult(
+            local_path=local,
+            video_id=video_id,
+            title="Integration Test Video",
+            duration_seconds=60,
         )
+
+    try:
+        with patch("table_talk.ingest.fetch_video", side_effect=_fake_fetch):
+            process_url(
+                url,
+                project=project,
+                dataset=dataset,
+                bucket=bucket_name,
+                bq_client=bq_client,
+                storage_client=storage_client,
+            )
 
         videos_rows = list(
             bq_client.query(

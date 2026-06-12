@@ -149,4 +149,5 @@ def test_upload_video_integration(tmp_path):
         assert result2.already_existed is True
         assert result2.size_bytes == len(content)
     finally:
-        cleanup_blob.delete()
+        if cleanup_blob.exists():
+            cleanup_blob.delete()
