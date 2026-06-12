@@ -3,11 +3,18 @@
 # Error classification mirrors google.api_core.exceptions HTTP semantics.
 
 import json
+import random
 import re
+import time
 
 import google.api_core.exceptions as api_exc
 from google import genai
 from google.genai import types
+
+_RETRY_MAX_ATTEMPTS = 5
+_RETRY_BASE_DELAY_SECONDS = 5.0
+_RETRY_MAX_DELAY_SECONDS = 60.0
+_RETRY_MULTIPLIER = 2.0
 
 
 class GeminiTransientError(Exception):
@@ -33,6 +40,23 @@ _PERMANENT_EXC = (
     api_exc.NotFound,
     api_exc.InvalidArgument,
 )
+
+
+def _call_with_retry(fn):
+    """Call fn() with truncated exponential backoff + full jitter on HTTP 429."""
+    for attempt in range(_RETRY_MAX_ATTEMPTS):
+        try:
+            return fn()
+        except api_exc.ResourceExhausted:
+            if attempt == _RETRY_MAX_ATTEMPTS - 1:
+                raise GeminiTransientError(
+                    "rate limited by Vertex AI (429); retries exhausted"
+                )
+            cap_delay = min(
+                _RETRY_BASE_DELAY_SECONDS * (_RETRY_MULTIPLIER ** (attempt + 1)),
+                _RETRY_MAX_DELAY_SECONDS,
+            )
+            time.sleep(random.uniform(0, cap_delay))
 
 
 def _parse_and_validate(response) -> dict:
@@ -77,11 +101,15 @@ def call_gemini_for_clip(
     request_contents = types.Content(role="user", parts=[part1, part2])
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-pro",
-            config=types.GenerateContentConfig(system_instruction=prompt),
-            contents=request_contents,
+        response = _call_with_retry(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-pro",
+                config=types.GenerateContentConfig(system_instruction=prompt),
+                contents=request_contents,
+            )
         )
+    except GeminiTransientError:
+        raise
     except _TRANSIENT_EXC as exc:
         raise GeminiTransientError(str(exc)) from exc
     except _PERMANENT_EXC as exc:
@@ -104,14 +132,18 @@ def call_gemini_for_frame(
     request_contents = types.Content(role="user", parts=[part1, part2])
 
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-pro",
-            config=types.GenerateContentConfig(
-                system_instruction=prompt,
-                media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
-            ),
-            contents=request_contents,
+        response = _call_with_retry(
+            lambda: client.models.generate_content(
+                model="gemini-2.5-pro",
+                config=types.GenerateContentConfig(
+                    system_instruction=prompt,
+                    media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+                ),
+                contents=request_contents,
+            )
         )
+    except GeminiTransientError:
+        raise
     except _TRANSIENT_EXC as exc:
         raise GeminiTransientError(str(exc)) from exc
     except _PERMANENT_EXC as exc:

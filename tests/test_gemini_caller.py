@@ -1,7 +1,7 @@
 import os
 import subprocess
 import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import google.api_core.exceptions as api_exc
 import pytest
@@ -10,6 +10,7 @@ from google.genai import types
 from table_talk.gemini_caller import (
     GeminiPermanentError,
     GeminiTransientError,
+    _RETRY_MAX_ATTEMPTS,
     call_gemini_for_clip,
     call_gemini_for_frame,
 )
@@ -141,8 +142,9 @@ def test_transient_exceptions(exc):
     mock_client_inst.models.generate_content.side_effect = exc
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
-        with pytest.raises(GeminiTransientError):
-            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+        with patch("table_talk.gemini_caller.time.sleep"):
+            with pytest.raises(GeminiTransientError):
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
 
 
 @pytest.mark.parametrize("exc", [
@@ -198,6 +200,102 @@ def test_malformed_json_raises():
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with pytest.raises(GeminiPermanentError, match="malformed JSON"):
             call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+
+
+# --- retry / backoff tests ---
+
+
+def test_retry_success_on_first_try():
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
+            result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+
+    assert result == {"ok": True}
+    mock_sleep.assert_not_called()
+    mock_client_inst.models.generate_content.assert_called_once()
+
+
+@pytest.mark.parametrize("n_failures", [1, 2, 3])
+def test_retry_success_after_n_429s(n_failures):
+    good_response = _make_response('{"ok": true}')
+    side_effects = [api_exc.ResourceExhausted("rate limited")] * n_failures + [good_response]
+
+    mock_client_inst = MagicMock()
+    mock_client_inst.models.generate_content.side_effect = side_effects
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
+            result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+
+    assert result == {"ok": True}
+    assert mock_sleep.call_count == n_failures
+    assert mock_client_inst.models.generate_content.call_count == n_failures + 1
+
+
+def test_retry_exhaustion_raises_transient_with_message():
+    mock_client_inst = MagicMock()
+    mock_client_inst.models.generate_content.side_effect = api_exc.ResourceExhausted("rate limited")
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep"):
+            with pytest.raises(GeminiTransientError, match="retries exhausted"):
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+
+    assert mock_client_inst.models.generate_content.call_count == _RETRY_MAX_ATTEMPTS
+
+
+def test_retry_non_429_transient_not_retried():
+    mock_client_inst = MagicMock()
+    mock_client_inst.models.generate_content.side_effect = api_exc.ServiceUnavailable("unavailable")
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
+            with pytest.raises(GeminiTransientError):
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+
+    mock_sleep.assert_not_called()
+    mock_client_inst.models.generate_content.assert_called_once()
+
+
+def test_retry_permanent_error_not_retried():
+    mock_client_inst = MagicMock()
+    mock_client_inst.models.generate_content.side_effect = api_exc.PermissionDenied("forbidden")
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
+            with pytest.raises(GeminiPermanentError):
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+
+    mock_sleep.assert_not_called()
+    mock_client_inst.models.generate_content.assert_called_once()
+
+
+def test_retry_backoff_timing():
+    # 4 failures then success; capture actual sleep values and verify ranges.
+    good_response = _make_response('{"ok": true}')
+    side_effects = [api_exc.ResourceExhausted("rate limited")] * 4 + [good_response]
+
+    mock_client_inst = MagicMock()
+    mock_client_inst.models.generate_content.side_effect = side_effects
+
+    sleep_calls = []
+
+    def capture_sleep(duration):
+        sleep_calls.append(duration)
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep", side_effect=capture_sleep):
+            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+
+    assert len(sleep_calls) == 4
+    # attempt=0 → [0, 10], attempt=1 → [0, 20], attempt=2 → [0, 40], attempt=3 → [0, 60]
+    expected_maxes = [10.0, 20.0, 40.0, 60.0]
+    for i, (duration, max_delay) in enumerate(zip(sleep_calls, expected_maxes)):
+        assert 0.0 <= duration <= max_delay, (
+            f"sleep {i}: expected [0, {max_delay}], got {duration}"
+        )
 
 
 # --- integration test ---
