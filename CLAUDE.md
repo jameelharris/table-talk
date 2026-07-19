@@ -68,7 +68,30 @@ These conventions govern the structure and design of code in this project. They 
 
 ### Schemas are the source of truth
 
-BigQuery table schemas live at `schemas/*.json` at the repo root. Python dataclasses are generated from them via `scripts/gen_schemas.py` and land in `src/table_talk/_generated/`. Generated files are committed and never edited by hand. After changing a schema, regenerate before committing.
+BigQuery table schemas live at `schemas/*.json` at the repo root. Python dataclasses are generated from them via `scripts/gen_schemas.py` and land in `src/table_talk/_generated/`. Generated files are committed and never edited by hand. After changing a schema, regenerate before committing. The same JSON also drives Terraform table creation — see "Infrastructure is Terraform-managed."
+
+### Infrastructure is Terraform-managed
+
+All GCP resources are provisioned via Terraform. Nothing is created by hand
+(`gcloud`, `bq mk`, console) or by application code (`CREATE TABLE IF NOT EXISTS`,
+bucket auto-create on first write). Three modules cover current needs:
+`modules/gcs_bucket`, `modules/bigquery_dataset`, `modules/bigquery_table`.
+
+BigQuery table modules read their schema directly from the repo's schema files
+(`schema = file(".../schemas/<table>.json")`). This means `schemas/*.json` has two
+consumers: `scripts/gen_schemas.py` (produces dataclasses) and Terraform (creates
+the table). Both must stay in sync with the JSON.
+
+Consequences:
+
+- Adding a table = add `schemas/<table>.json`, run codegen, add a
+  `bigquery_table` module block, apply.
+- Changing a schema = regenerate *and* re-apply. Codegen alone leaves the
+  deployed table stale.
+- Adding a bucket = add a `gcs_bucket` module block. Bucket defaults
+  (versioning, soft delete) live in the module; don't pass them per-call.
+- A phase's infrastructure lands as its own focused PR, consistent with the
+  commit conventions above.
 
 ### BQ writes use DML INSERT with parameterized queries
 
