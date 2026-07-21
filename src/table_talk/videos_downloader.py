@@ -1,8 +1,13 @@
 # GCS downloader for ingested video files.
 # Parses and validates gs://... URIs before downloading.
-# GCS exceptions propagate to the caller without wrapping.
+# NotFound (404) is re-raised as DownloadPermanentError; other GCS exceptions propagate unwrapped.
 
+import google.api_core.exceptions as api_exc
 from google.cloud import storage
+
+
+class DownloadPermanentError(Exception):
+    """Raised when a GCS video object does not exist (404). Retrying will not help."""
 
 
 def download_video(
@@ -27,4 +32,9 @@ def download_video(
         client = storage.Client(project=project_id)
     bucket_obj = client.bucket(bucket_name)
     blob = bucket_obj.blob(object_path)
-    blob.download_to_filename(local_path)
+    try:
+        blob.download_to_filename(local_path)
+    except api_exc.NotFound as exc:
+        raise DownloadPermanentError(
+            f"Video object not found: {video_gcs_uri}"
+        ) from exc

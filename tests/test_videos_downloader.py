@@ -1,9 +1,10 @@
 import uuid
 from unittest.mock import MagicMock, patch
 
+import google.api_core.exceptions as api_exc
 import pytest
 
-from table_talk.videos_downloader import download_video
+from table_talk.videos_downloader import DownloadPermanentError, download_video
 
 
 def _mock_gcs_client():
@@ -65,6 +66,22 @@ def test_client_provided_not_instantiated(tmp_path):
     with patch("table_talk.videos_downloader.storage.Client") as mock_cls:
         download_video("gs://bucket/video.mp4", output, "proj", client=mock_client)
         mock_cls.assert_not_called()
+
+
+def test_not_found_raises_download_permanent_error(tmp_path):
+    mock_client, mock_blob = _mock_gcs_client()
+    mock_blob.download_to_filename.side_effect = api_exc.NotFound("object missing")
+    output = str(tmp_path / "video.mp4")
+    with pytest.raises(DownloadPermanentError):
+        download_video("gs://bucket/missing.mp4", output, "proj", client=mock_client)
+
+
+def test_transient_gcs_error_propagates_unwrapped(tmp_path):
+    mock_client, mock_blob = _mock_gcs_client()
+    mock_blob.download_to_filename.side_effect = api_exc.ServiceUnavailable("503")
+    output = str(tmp_path / "video.mp4")
+    with pytest.raises(api_exc.ServiceUnavailable):
+        download_video("gs://bucket/video.mp4", output, "proj", client=mock_client)
 
 
 # --- integration test ---

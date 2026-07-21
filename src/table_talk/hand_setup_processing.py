@@ -24,7 +24,7 @@ from .frame_uploader import upload_frame
 from .gemini_caller import GeminiPermanentError, call_gemini_for_clip, call_gemini_for_frame
 from .hand_setups_writer import write_hand_setups
 from .seat_enrichment import add_seat_numbers, normalize_heads_up
-from .videos_downloader import download_video
+from .videos_downloader import DownloadPermanentError, download_video
 
 
 def _parse_timestamp(s: str) -> int:
@@ -277,6 +277,21 @@ async def process_pending_clips(
                     local_video_path,
                     project_id,
                 )
+            except DownloadPermanentError as exc:
+                print(f"Video {video_id} not found in GCS (permanent): {exc}", file=sys.stderr)
+                for clip in video_clips:
+                    write_clip_processing_attempt_row(
+                        ClipProcessingAttemptsRow(
+                            clip_id=clip.clip_id,
+                            status="failed_permanent",
+                            status_message=f"video_download_not_found: {str(exc)[:400]}",
+                        ),
+                        project=project_id,
+                        dataset=dataset,
+                    )
+                    stats["clips_processed"] += 1
+                    stats["clips_failed_permanent"] += 1
+                continue
             except Exception as exc:
                 print(f"Failed to download video {video_id}: {exc}", file=sys.stderr)
                 for clip in video_clips:

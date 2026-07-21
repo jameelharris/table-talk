@@ -10,6 +10,7 @@ from google.cloud import bigquery
 
 from table_talk.frame_extractor import FrameExtractionError
 from table_talk.gemini_caller import GeminiPermanentError, GeminiTransientError
+from table_talk.videos_downloader import DownloadPermanentError
 from table_talk.hand_setup_processing import (
     _find_pending_clips,
     _parse_timestamp,
@@ -460,6 +461,30 @@ def test_process_pending_clips_download_failure_marks_clips_failed():
     attempt_row = mock_attempt.call_args[0][0]
     assert attempt_row.status == "failed_transient"
     assert "video_download_failed" in attempt_row.status_message
+
+
+def test_process_pending_clips_download_not_found_marks_clips_permanent():
+    clips = [
+        ClipManifestRow("vid_a_001", "vid_a", 0, 240),
+        ClipManifestRow("vid_a_002", "vid_a", 240, 480),
+    ]
+    with (
+        patch("table_talk.hand_setup_processing._find_pending_clips", return_value=clips),
+        patch("table_talk.hand_setup_processing.download_video",
+              side_effect=DownloadPermanentError("gone")),
+        patch("table_talk.hand_setup_processing.process_clip", new_callable=AsyncMock) as mock_process,
+        patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
+    ):
+        stats = _run(process_pending_clips("proj", "ds", "vb", "hb", "ip", "ep"))
+
+    mock_process.assert_not_called()
+    assert stats["clips_processed"] == 2
+    assert stats["clips_failed_permanent"] == 2
+    assert mock_attempt.call_count == 2
+    for c in mock_attempt.call_args_list:
+        row = c.args[0]
+        assert row.status == "failed_permanent"
+        assert "video_download_not_found" in row.status_message
 
 
 # ---------------------------------------------------------------------------
