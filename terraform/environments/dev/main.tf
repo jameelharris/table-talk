@@ -99,9 +99,9 @@ module "clip_processing_attempts_table" {
 module "hand_setups_bucket" {
   source = "../../modules/gcs_bucket"
 
-  name               = "${var.project_id}-hand-setups-${var.environment}"
-  location           = var.region
-  project            = var.project_id
+  name     = "${var.project_id}-hand-setups-${var.environment}"
+  location = var.region
+  project  = var.project_id
   labels = {
     environment = var.environment
     managed_by  = "terraform"
@@ -121,6 +121,51 @@ module "hand_setups_table" {
     environment = var.environment
     managed_by  = "terraform"
     purpose     = "hand_setup_inventory"
+  }
+  deletion_protection = true
+}
+
+module "hand_starts_bucket" {
+  source = "../../modules/gcs_bucket"
+
+  name     = "${var.project_id}-hand-starts-${var.environment}"
+  location = var.region
+  project  = var.project_id
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "hand_starts"
+  }
+}
+
+module "hand_starts_table" {
+  source = "../../modules/bigquery_table"
+
+  dataset_id  = module.bigquery_dataset.dataset_id
+  table_id    = "hand_starts"
+  project     = var.project_id
+  schema      = file("${path.module}/../../../schemas/hand_starts.json")
+  description = "Phase 4 stage table: first voluntary action (FVA), second action timestamp, hole cards, and verification frames per hand setup."
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "hand_start_stage"
+  }
+  deletion_protection = true
+}
+
+module "hand_setup_processing_attempts_table" {
+  source = "../../modules/bigquery_table"
+
+  dataset_id  = module.bigquery_dataset.dataset_id
+  table_id    = "hand_setup_processing_attempts"
+  project     = var.project_id
+  schema      = file("${path.module}/../../../schemas/hand_setup_processing_attempts.json")
+  description = "Append-only audit log of every hand start processing attempt. One row per attempt. Absence of rows for a hand_setup_id means it is unprocessed. Joins to hand_setups via hand_setup_id."
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "hand_setup_processing_audit"
   }
   deletion_protection = true
 }
