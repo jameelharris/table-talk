@@ -1,0 +1,33 @@
+[
+  {
+    "name": "attempt_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique identifier for this processing attempt. Primary key."
+  },
+  {
+    "name": "hand_setup_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "hand_setups.hand_setup_id being processed. Foreign key to hand_setups.hand_setup_id."
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Outcome of this attempt: 'complete' | 'complete_skipped' | 'failed_transient' | 'failed_permanent'. 'complete_skipped' means a precondition check failed and no LLM calls were made; no hand_starts row is written for this status. No in-flight states. NOT enforced as an enum by BigQuery — validation lives in application code."
+  },
+  {
+    "name": "status_message",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Free-form error, skip-reason, or status detail. Typically populated on failure or skip to capture the reason. NULL on success."
+  },
+  {
+    "name": "attempted_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "defaultValueExpression": "CURRENT_TIMESTAMP()",
+    "description": "Timestamp when this attempt was recorded. Auto-populated on insert via DEFAULT."
+  }
+]

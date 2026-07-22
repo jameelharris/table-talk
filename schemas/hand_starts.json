@@ -1,0 +1,63 @@
+[
+  {
+    "name": "hand_start_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique identifier for this hand start row, formatted as {hand_setup_id}_001. Primary key."
+  },
+  {
+    "name": "hand_setup_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Parent hand setup identifier. Foreign key to hand_setups.hand_setup_id."
+  },
+  {
+    "name": "clip_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Denormalized parent clip identifier. Equals hand_setups.clip_id for this hand setup; stored to avoid joins on common queries."
+  },
+  {
+    "name": "video_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Denormalized parent video identifier. Equals hand_setups.video_id for this hand setup; stored to avoid joins on common queries."
+  },
+  {
+    "name": "fva_time_seconds",
+    "type": "INT64",
+    "mode": "REQUIRED",
+    "description": "Offset from start of source video (not from start of clip) of the first voluntary action (FVA), in whole seconds."
+  },
+  {
+    "name": "second_action_time_seconds",
+    "type": "INT64",
+    "mode": "REQUIRED",
+    "description": "Offset from start of source video of the second action following the FVA, in whole seconds."
+  },
+  {
+    "name": "hand_start_state",
+    "type": "JSON",
+    "mode": "REQUIRED",
+    "description": "Observed state at hand start. Structure: {hand_setup: {...same shape as hand_setups.hand_setup_state}, fva: {seat_position_label: string, seat_number: int, action_type: string, bet_amount: number|null}}. Outer wrapper from raw LLM response is stripped before storage."
+  },
+  {
+    "name": "fva_frame_gcs_path",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Full gs://... URI to the high-resolution frame extracted at fva_time_seconds."
+  },
+  {
+    "name": "verify_frame_gcs_paths",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Full gs://... URIs to frames extracted shortly after second_action_time_seconds, used to visually verify the detected FVA/second-action timing."
+  },
+  {
+    "name": "detected_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "defaultValueExpression": "CURRENT_TIMESTAMP()",
+    "description": "Timestamp when this hand start row was written. Auto-populated on insert via DEFAULT."
+  }
+]

@@ -39,14 +39,6 @@ def generate_dataclass(schema_path: Path) -> str:
         bq_type = col["type"]
         mode = col["mode"]
 
-        if mode == "REPEATED":
-            print(
-                f"Error: {schema_path.name}: column '{name}' has mode REPEATED,"
-                " which is not supported.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
         if bq_type not in TYPE_MAP:
             print(
                 f"Error: {schema_path.name}: column '{name}' has unsupported type '{bq_type}'.",
@@ -56,7 +48,9 @@ def generate_dataclass(schema_path: Path) -> str:
 
         py_type = TYPE_MAP[bq_type]
 
-        if mode == "REQUIRED":
+        if mode == "REPEATED":
+            required_fields.append((name, f"list[{py_type}]"))
+        elif mode == "REQUIRED":
             required_fields.append((name, py_type))
         elif mode == "NULLABLE":
             nullable_fields.append((name, py_type))
