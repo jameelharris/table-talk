@@ -11,18 +11,11 @@ from google.cloud import bigquery
 from google.cloud import exceptions as gcloud_exceptions
 
 from ._generated.clip_manifest_row import ClipManifestRow
+from .bq_utils import bq_param_type
 
 
 class ClipManifestWriteError(Exception):
     pass
-
-
-def _bq_param_type(value: object) -> str:
-    if isinstance(value, str):
-        return "STRING"
-    if isinstance(value, int):
-        return "INT64"
-    raise ClipManifestWriteError(f"Unsupported parameter type: {type(value).__name__}")
 
 
 def write_clip_manifest_rows(
@@ -48,7 +41,7 @@ def write_clip_manifest_rows(
         placeholders = ", ".join(f"@{c}_{i}" for c in columns)
         value_tuples.append(f"({placeholders})")
         for c, v in row_dict.items():
-            query_parameters.append(bigquery.ScalarQueryParameter(f"{c}_{i}", _bq_param_type(v), v))
+            query_parameters.append(bigquery.ScalarQueryParameter(f"{c}_{i}", bq_param_type(v), v))
 
     query = f"INSERT INTO `{project}.{dataset}.clip_manifest` ({column_list}) VALUES {', '.join(value_tuples)}"
     job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)

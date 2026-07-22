@@ -11,18 +11,11 @@ from google.cloud import bigquery
 from google.cloud import exceptions as gcloud_exceptions
 
 from ._generated.videos_row import VideosRow
+from .bq_utils import bq_param_type
 
 
 class VideosWriteError(Exception):
     pass
-
-
-def _bq_param_type(value: object) -> str:
-    if isinstance(value, str):
-        return "STRING"
-    if isinstance(value, int):
-        return "INT64"
-    raise VideosWriteError(f"Unsupported parameter type: {type(value).__name__}")
 
 
 def write_video_row(
@@ -40,7 +33,7 @@ def write_video_row(
     placeholders = ", ".join(f"@{c}" for c in columns)
     query = f"INSERT INTO `{project}.{dataset}.videos` ({column_list}) VALUES ({placeholders})"
     query_parameters = [
-        bigquery.ScalarQueryParameter(c, _bq_param_type(v), v)
+        bigquery.ScalarQueryParameter(c, bq_param_type(v), v)
         for c, v in row_dict.items()
     ]
     job_config = bigquery.QueryJobConfig(query_parameters=query_parameters)

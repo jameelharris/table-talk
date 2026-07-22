@@ -11,20 +11,11 @@ from google.cloud import bigquery
 from google.cloud import exceptions as gcloud_exceptions
 
 from ._generated.hand_setups_row import HandSetupsRow
+from .bq_utils import bq_param_type
 
 
 class HandSetupsWriteError(Exception):
     pass
-
-
-def _bq_param_type(value: object) -> str:
-    if isinstance(value, str):
-        return "STRING"
-    if isinstance(value, int):
-        return "INT64"
-    if isinstance(value, dict):
-        return "JSON"
-    raise HandSetupsWriteError(f"Unsupported parameter type: {type(value).__name__}")
 
 
 def write_hand_setups(
@@ -53,7 +44,7 @@ def write_hand_setups(
         for c, v in row_dict.items():
             bq_value = v
             query_parameters.append(
-                bigquery.ScalarQueryParameter(f"{c}_{i}", _bq_param_type(v), bq_value)
+                bigquery.ScalarQueryParameter(f"{c}_{i}", bq_param_type(v), bq_value)
             )
 
     query = (
