@@ -13,11 +13,11 @@ class FrameExtractionError(Exception):
 
 def extract_frame(
     video_uri: str,
-    timestamp_seconds: int,
+    timestamp_seconds: float | int,
     output_path: str,
 ) -> None:
-    hours = timestamp_seconds // 3600
-    minutes = (timestamp_seconds % 3600) // 60
+    hours = int(timestamp_seconds // 3600)
+    minutes = int((timestamp_seconds % 3600) // 60)
     secs = timestamp_seconds % 60
     timestamp_str = f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
 

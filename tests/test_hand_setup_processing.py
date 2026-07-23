@@ -13,7 +13,6 @@ from table_talk.gemini_caller import GeminiPermanentError, GeminiTransientError
 from table_talk.videos_downloader import DownloadPermanentError
 from table_talk.hand_setup_processing import (
     _find_pending_clips,
-    _parse_timestamp,
     process_clip,
     process_pending_clips,
 )
@@ -61,36 +60,6 @@ def _fake_extract_frame(video_uri, ts, output_path):
 
 def _run(coro):
     return asyncio.run(coro)
-
-
-# ---------------------------------------------------------------------------
-# _parse_timestamp
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("s,expected", [
-    ("05:32", 332),
-    ("00:00", 0),
-    ("59:59", 3599),
-    ("01:00:00", 3600),
-    ("02:30:45", 9045),
-    ("23:59:59", 86399),
-])
-def test_parse_timestamp_valid(s, expected):
-    assert _parse_timestamp(s) == expected
-
-
-@pytest.mark.parametrize("s", [
-    "",
-    "5:32:10:00",
-    "05",
-    "5.5",
-    "5:abc",
-    "-5:32",
-])
-def test_parse_timestamp_invalid(s):
-    with pytest.raises(ValueError):
-        _parse_timestamp(s)
 
 
 # ---------------------------------------------------------------------------

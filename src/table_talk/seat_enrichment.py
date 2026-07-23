@@ -11,11 +11,19 @@ def add_seat_numbers(hand_setup_state: dict) -> dict:
     return hand_setup_state
 
 
-def normalize_heads_up(hand_setup_state: dict) -> dict:
+def add_fva_seat_number(fva_data: dict) -> dict:
+    fva_data["seat_number"] = SEAT_NUMBER_MAP.get(fva_data.get("seat_position_label"))
+    return fva_data
+
+
+def normalize_heads_up(hand_setup_state: dict, fva: dict | None = None) -> dict:
     if hand_setup_state.get("total_seat_count") != 2:
         return hand_setup_state
     for player in hand_setup_state.get("players", []):
         if player.get("seat_position_label") == "SB":
             player["seat_position_label"] = "BTN"
             player["seat_number"] = SEAT_NUMBER_MAP["BTN"]
+    if fva is not None and fva.get("seat_position_label") == "SB":
+        fva["seat_position_label"] = "BTN"
+        fva["seat_number"] = SEAT_NUMBER_MAP["BTN"]
     return hand_setup_state

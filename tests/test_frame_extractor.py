@@ -69,6 +69,24 @@ def test_timestamp_3665():
     assert argv[3] == "01:01:05.000"
 
 
+def test_timestamp_float():
+    with patch("table_talk.frame_extractor.subprocess.run", return_value=_mock_run()) as mock_run, \
+         patch("table_talk.frame_extractor.os.path.exists", return_value=True):
+        extract_frame("/path/to/video.mp4", 332.5, "/tmp/out.jpg")
+
+    argv = mock_run.call_args[0][0]
+    assert argv[3] == "00:05:32.500"
+
+
+def test_timestamp_float_crossing_hour_boundary():
+    with patch("table_talk.frame_extractor.subprocess.run", return_value=_mock_run()) as mock_run, \
+         patch("table_talk.frame_extractor.os.path.exists", return_value=True):
+        extract_frame("/path/to/video.mp4", 3665.05, "/tmp/out.jpg")
+
+    argv = mock_run.call_args[0][0]
+    assert argv[3] == "01:01:05.050"
+
+
 def test_nonzero_returncode_raises_with_stderr():
     with patch("table_talk.frame_extractor.subprocess.run", return_value=_mock_run(returncode=1, stderr="No such file")):
         with pytest.raises(FrameExtractionError, match="No such file"):

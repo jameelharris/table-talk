@@ -1,4 +1,9 @@
-from table_talk.seat_enrichment import SEAT_NUMBER_MAP, add_seat_numbers, normalize_heads_up
+from table_talk.seat_enrichment import (
+    SEAT_NUMBER_MAP,
+    add_fva_seat_number,
+    add_seat_numbers,
+    normalize_heads_up,
+)
 
 
 def _make_state(labels, total_seat_count=9):
@@ -91,3 +96,65 @@ def test_normalize_heads_up_no_sb_present():
     before = [dict(p) for p in state["players"]]
     normalize_heads_up(state)
     assert state["players"] == before
+
+
+def test_add_fva_seat_number_known_label():
+    fva = {"seat_position_label": "UTG", "action_type": "raise", "bet_amount": 3.0}
+    add_fva_seat_number(fva)
+    assert fva["seat_number"] == SEAT_NUMBER_MAP["UTG"]
+
+
+def test_add_fva_seat_number_unknown_label():
+    fva = {"seat_position_label": "WEIRD", "action_type": "raise", "bet_amount": 3.0}
+    add_fva_seat_number(fva)
+    assert fva["seat_number"] is None
+
+
+def test_normalize_heads_up_with_fva_sb_rewrites_label_and_seat_number():
+    state = {
+        "total_seat_count": 2,
+        "players": [
+            {"seat_position_label": "BB", "seat_number": 1, "stack_size": 100.0},
+            {"seat_position_label": "SB", "seat_number": 2, "stack_size": 100.0},
+        ],
+    }
+    fva = {"seat_position_label": "SB", "seat_number": 2, "action_type": "raise", "bet_amount": 3.0}
+
+    normalize_heads_up(state, fva=fva)
+
+    assert fva["seat_position_label"] == "BTN"
+    assert fva["seat_number"] == SEAT_NUMBER_MAP["BTN"]
+    # players[] rewrite still happens alongside the fva rewrite
+    labels = {p["seat_position_label"] for p in state["players"]}
+    assert "SB" not in labels
+
+
+def test_normalize_heads_up_with_fva_non_sb_unchanged():
+    state = {
+        "total_seat_count": 2,
+        "players": [
+            {"seat_position_label": "BB", "seat_number": 1, "stack_size": 100.0},
+            {"seat_position_label": "SB", "seat_number": 2, "stack_size": 100.0},
+        ],
+    }
+    fva = {"seat_position_label": "BB", "seat_number": 1, "action_type": "call", "bet_amount": None}
+    before = dict(fva)
+
+    normalize_heads_up(state, fva=fva)
+
+    assert fva == before
+
+
+def test_normalize_heads_up_non_heads_up_with_fva_unchanged():
+    state = {
+        "total_seat_count": 9,
+        "players": [
+            {"seat_position_label": "SB", "seat_number": 2, "stack_size": 100.0},
+        ],
+    }
+    fva = {"seat_position_label": "SB", "seat_number": 2, "action_type": "raise", "bet_amount": 3.0}
+    before = dict(fva)
+
+    normalize_heads_up(state, fva=fva)
+
+    assert fva == before
