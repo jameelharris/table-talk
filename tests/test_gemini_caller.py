@@ -97,6 +97,42 @@ def test_frame_request_structure():
     assert kw["config"].media_resolution == types.MediaResolution.MEDIA_RESOLUTION_HIGH
 
 
+def test_clip_user_text_override():
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        call_gemini_for_clip(
+            prompt=PROMPT,
+            video_gcs_uri=VIDEO_URI,
+            start_offset_seconds=10,
+            end_offset_seconds=50,
+            project_id=PROJECT,
+            user_text="Identify the first voluntary chip commitment and second action in this video window.",
+        )
+
+    kw = mock_client_inst.models.generate_content.call_args.kwargs
+    contents = kw["contents"]
+    assert contents.parts[1].text == (
+        "Identify the first voluntary chip commitment and second action in this video window."
+    )
+
+
+def test_frame_user_text_override():
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        call_gemini_for_frame(
+            prompt=PROMPT,
+            frame_bytes=FRAME_BYTES,
+            project_id=PROJECT,
+            user_text="Extract hole cards for all eligible players from this frame.",
+        )
+
+    kw = mock_client_inst.models.generate_content.call_args.kwargs
+    contents = kw["contents"]
+    assert contents.parts[1].text == "Extract hole cards for all eligible players from this frame."
+
+
 # --- happy path tests ---
 
 

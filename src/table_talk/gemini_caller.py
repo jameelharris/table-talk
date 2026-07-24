@@ -86,6 +86,7 @@ def call_gemini_for_clip(
     end_offset_seconds: int,
     project_id: str,
     location: str = "global",
+    user_text: str = "Identify all new hand setups in this video.",
 ) -> dict:
     client = genai.Client(vertexai=True, project=project_id, location=location)
 
@@ -97,7 +98,7 @@ def call_gemini_for_clip(
             fps=1.0,
         ),
     )
-    part2 = types.Part(text="Identify all new hand setups in this video.")
+    part2 = types.Part(text=user_text)
     request_contents = types.Content(role="user", parts=[part1, part2])
 
     try:
@@ -124,11 +125,12 @@ def call_gemini_for_frame(
     project_id: str,
     location: str = "global",
     mime_type: str = "image/jpeg",
+    user_text: str = "Extract the setup observations from this frame.",
 ) -> dict:
     client = genai.Client(vertexai=True, project=project_id, location=location)
 
     part1 = types.Part(inline_data=types.Blob(data=frame_bytes, mime_type=mime_type))
-    part2 = types.Part(text="Extract the setup observations from this frame.")
+    part2 = types.Part(text=user_text)
     request_contents = types.Content(role="user", parts=[part1, part2])
 
     try:
