@@ -253,6 +253,11 @@ async def process_hand_setup(
         }
         add_fva_seat_number(fva_data)
 
+        # hand_start_state["hand_setup"] is the same dict object as
+        # hs.hand_setup_state (PendingHandSetup is frozen, but its dict
+        # field isn't) — normalize_heads_up and the hole-card matching below
+        # mutate it in place, so hs.hand_setup_state is mutated too. Harmless
+        # today since nothing reads hs after this point.
         hand_start_state = {"hand_setup": hs.hand_setup_state, "fva": fva_data}
         normalize_heads_up(hand_start_state["hand_setup"], fva=hand_start_state["fva"])
 
@@ -337,6 +342,12 @@ async def process_hand_setup(
             )
         else:
             status_message = f"complete: available_seconds={hs.available_seconds}"
+        # Non-atomic with the write_hand_starts() call above: if that insert
+        # succeeded but this attempt write throws, the hand_setup has no
+        # "complete" attempt and gets re-selected next run, producing a
+        # second hand_starts row (unlike Phase 3, where a re-run reproduces
+        # an equivalent row instead of a duplicate). See PR 8 plan's
+        # Post-Implementation Follow-ups.
         _write_attempt(hs.hand_setup_id, "complete", status_message, project_id=project_id, dataset=dataset)
         return "complete"
 
