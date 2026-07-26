@@ -1,6 +1,6 @@
 # CLI entrypoint. Exposes `tt` command via the [project.scripts] entry
 # in pyproject.toml. Subcommands: `tt ingest`, `tt materialize-clips`,
-# `tt process-clips`.
+# `tt process-clips`, `tt process-hand-setups`.
 
 import argparse
 import asyncio
@@ -11,6 +11,7 @@ from google.cloud import bigquery, storage
 
 from .clip_materialization import MaterializeError, materialize_clips, materialize_clips_for_pending_videos
 from .hand_setup_processing import process_pending_clips
+from .hand_start_processing import process_pending_hand_setups
 from .ingest import process_manifest
 
 
@@ -36,6 +37,14 @@ def main() -> None:
     pc_parser.add_argument("--hand-setups-bucket", required=True)
     pc_parser.add_argument("--max-concurrent", type=int, default=4)
     pc_parser.add_argument("--video-id")
+
+    phs_parser = subparsers.add_parser("process-hand-setups")
+    phs_parser.add_argument("--project", required=True)
+    phs_parser.add_argument("--dataset", required=True)
+    phs_parser.add_argument("--videos-bucket", required=True)
+    phs_parser.add_argument("--hand-starts-bucket", required=True)
+    phs_parser.add_argument("--video-id")
+    phs_parser.add_argument("--max-concurrent", type=int, default=4)
 
     args = parser.parse_args()
 
@@ -102,6 +111,42 @@ def main() -> None:
                 extract_player_info_prompt=extract_player_info_prompt,
                 max_concurrent=args.max_concurrent,
                 only_video_ids=only_video_ids,
+            )
+        )
+        for key, value in stats.items():
+            print(f"{key}: {value}")
+    elif args.command == "process-hand-setups":
+        prompts_dir = Path(__file__).resolve().parents[2] / "prompts"
+
+        identify_hand_start_path = prompts_dir / "identify_hand_start.md"
+        if not identify_hand_start_path.exists():
+            print(
+                "prompts/identify_hand_start.md not found — see README for setup",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        extract_hole_cards_path = prompts_dir / "extract_hole_cards.md"
+        if not extract_hole_cards_path.exists():
+            print(
+                "prompts/extract_hole_cards.md not found — see README for setup",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        identify_hand_start_prompt = identify_hand_start_path.read_text()
+        extract_hole_cards_prompt = extract_hole_cards_path.read_text()
+
+        stats = asyncio.run(
+            process_pending_hand_setups(
+                project_id=args.project,
+                dataset=args.dataset,
+                videos_bucket=args.videos_bucket,
+                hand_starts_bucket=args.hand_starts_bucket,
+                identify_hand_start_prompt=identify_hand_start_prompt,
+                extract_hole_cards_prompt=extract_hole_cards_prompt,
+                video_id=args.video_id,
+                max_concurrent=args.max_concurrent,
             )
         )
         for key, value in stats.items():
