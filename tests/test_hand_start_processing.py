@@ -1,4 +1,9 @@
 import asyncio
+import os
+import subprocess
+import tempfile
+import uuid
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -653,3 +658,182 @@ def test_process_pending_hand_setups_download_not_found_marks_permanent():
         row = c.args[0]
         assert row.status == "failed_permanent"
         assert "video_download_not_found" in row.status_message
+
+
+# ---------------------------------------------------------------------------
+# Integration test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_process_pending_hand_setups_integration():
+    asyncio.run(_integration_body())
+
+
+async def _integration_body():
+    from google.cloud import bigquery as bq
+    from google.cloud import storage as gcs
+
+    from table_talk._generated.hand_setups_row import HandSetupsRow
+    from table_talk.clip_manifest_writer import ClipManifestRow as CMRow, write_clip_manifest_rows
+    from table_talk.hand_setups_writer import write_hand_setups
+    from table_talk.videos_writer import VideosRow, write_video_row
+
+    project = "table-talk-497020"
+    dataset = "table_talk_dev"
+    uid = uuid.uuid4().hex[:10]
+    video_id = f"test_p4_{uid}"
+    clip_id = f"{video_id}_001"
+    hand_setup_id = f"{clip_id}_001"
+
+    videos_bucket = "table-talk-497020-videos-dev"
+    hand_setups_bucket = "table-talk-497020-hand-setups-dev"
+    hand_starts_bucket = "table-talk-497020-hand-starts-dev"
+
+    bq_client = bq.Client(project=project)
+    gcs_client = gcs.Client()
+
+    videos_ref = f"{project}.{dataset}.videos"
+    clip_ref = f"{project}.{dataset}.clip_manifest"
+    hand_setups_ref = f"{project}.{dataset}.hand_setups"
+    attempts_ref = f"{project}.{dataset}.hand_setup_processing_attempts"
+    hand_starts_ref = f"{project}.{dataset}.hand_starts"
+
+    # Generate a small test video via ffmpeg (lavfi testsrc, 60 seconds)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fixture_path = os.path.join(tmpdir, "fixture.mp4")
+        subprocess.run(
+            [
+                "ffmpeg", "-f", "lavfi",
+                "-i", "testsrc=duration=60:size=320x240",
+                "-y", fixture_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        with open(fixture_path, "rb") as f:
+            video_bytes = f.read()
+
+    # Upload test video to GCS
+    video_blob = gcs_client.bucket(videos_bucket).blob(f"{video_id}.mp4")
+    video_blob.upload_from_string(video_bytes, content_type="video/mp4")
+
+    # Write setup rows via production writers (Phase 1, Phase 2, Phase 3)
+    write_video_row(
+        VideosRow(
+            video_id=video_id,
+            source_url=f"https://www.youtube.com/watch?v={video_id}",
+            title="Phase 4 Integration Test Video",
+            duration_seconds=60,
+            gcs_path=f"gs://{videos_bucket}/{video_id}.mp4",
+            file_size_bytes=len(video_bytes),
+        ),
+        project=project,
+        dataset=dataset,
+        client=bq_client,
+    )
+    write_clip_manifest_rows(
+        [CMRow(clip_id=clip_id, video_id=video_id, clip_start_time=0, clip_end_time=60)],
+        project=project,
+        dataset=dataset,
+        client=bq_client,
+    )
+    write_hand_setups(
+        [
+            HandSetupsRow(
+                hand_setup_id=hand_setup_id,
+                clip_id=clip_id,
+                video_id=video_id,
+                hand_setup_time_seconds=0,
+                frame_gcs_path=f"gs://{hand_setups_bucket}/{video_id}/{clip_id}/{hand_setup_id}.jpg",
+                hand_setup_state={
+                    "total_seat_count": 6,
+                    "pot_size_bb": 1.5,
+                    "players": [
+                        {"seat_position_label": "BB", "stack_size": 100.0, "seat_number": 1},
+                        {"seat_position_label": "UTG", "stack_size": 100.0, "seat_number": 9},
+                    ],
+                },
+            )
+        ],
+        project_id=project,
+        dataset=dataset,
+        client=bq_client,
+    )
+
+    prompts_dir = Path(__file__).resolve().parents[1] / "prompts"
+    identify_hand_start_prompt = (prompts_dir / "identify_hand_start.md").read_text()
+    extract_hole_cards_prompt = (prompts_dir / "extract_hole_cards.md").read_text()
+
+    try:
+        stats = await process_pending_hand_setups(
+            project_id=project,
+            dataset=dataset,
+            videos_bucket=videos_bucket,
+            hand_starts_bucket=hand_starts_bucket,
+            identify_hand_start_prompt=identify_hand_start_prompt,
+            extract_hole_cards_prompt=extract_hole_cards_prompt,
+            only_hand_setup_ids=[hand_setup_id],
+            bq_client=bq_client,
+            gcs_client=gcs_client,
+        )
+
+        assert stats["hand_setups_processed"] == 1, f"Expected 1 hand_setup processed, got {stats}"
+
+        # Verify attempt row exists (most recent if there are multiple)
+        attempt_rows = list(bq_client.query(
+            f"SELECT status, status_message FROM `{attempts_ref}` "
+            f"WHERE hand_setup_id = @hand_setup_id "
+            f"ORDER BY attempted_at DESC LIMIT 1",
+            job_config=bq.QueryJobConfig(
+                query_parameters=[bq.ScalarQueryParameter("hand_setup_id", "STRING", hand_setup_id)]
+            ),
+        ).result())
+        assert len(attempt_rows) == 1, "No attempt rows written"
+
+        latest = attempt_rows[0]
+        # Lavfi fixture has no poker content. Gemini's response is stochastic:
+        #   - complete: hand judged uncontested (or, less likely, a spurious detection)
+        #   - failed_transient: no_first_voluntary_commitment_found / no_second_action_found
+        # Both prove the orchestration chain ran end-to-end correctly.
+        assert latest.status in ("complete", "failed_transient"), (
+            f"Unexpected status {latest.status!r}: {latest.status_message}"
+        )
+
+        # Atomicity invariant: no hand_starts row unless status is complete
+        # AND a real detection was made (uncontested is complete with zero rows).
+        hand_start_count = list(bq_client.query(
+            f"SELECT COUNT(*) AS n FROM `{hand_starts_ref}` WHERE hand_setup_id = @hand_setup_id",
+            job_config=bq.QueryJobConfig(
+                query_parameters=[bq.ScalarQueryParameter("hand_setup_id", "STRING", hand_setup_id)]
+            ),
+        ).result())[0].n
+
+        if latest.status != "complete":
+            assert hand_start_count == 0, (
+                f"Atomicity violation: status={latest.status} but {hand_start_count} hand_starts rows exist"
+            )
+
+    finally:
+        # Cleanup in reverse dependency order
+        for table, col, val in [
+            (hand_starts_ref, "hand_setup_id", hand_setup_id),
+            (attempts_ref, "hand_setup_id", hand_setup_id),
+            (hand_setups_ref, "hand_setup_id", hand_setup_id),
+            (clip_ref, "clip_id", clip_id),
+            (videos_ref, "video_id", video_id),
+        ]:
+            bq_client.query(
+                f"DELETE FROM `{table}` WHERE {col} = @val",
+                job_config=bq.QueryJobConfig(
+                    query_parameters=[bq.ScalarQueryParameter("val", "STRING", val)]
+                ),
+            ).result()
+
+        # Delete test video from GCS
+        if video_blob.exists():
+            video_blob.delete()
+
+        # Delete any frame objects from the hand_starts bucket
+        for blob in gcs_client.bucket(hand_starts_bucket).list_blobs(prefix=f"{video_id}/"):
+            blob.delete()
