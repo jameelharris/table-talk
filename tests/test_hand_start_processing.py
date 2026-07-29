@@ -56,6 +56,15 @@ _CLIP_RESULT_FOUND = {
     "bet_amount": 3.0,
 }
 
+_CLIP_RESULT_FVA_CO = {
+    "found": True,
+    "timestamp": "01:45",
+    "second_action_timestamp": "01:50",
+    "seat_position_label": "CO",  # seat_number 4 — UTG (seat 9) is non-eligible
+    "action_type": "raise",
+    "bet_amount": 3.0,
+}
+
 _HOLE_CARDS_RESULT = {
     "players": [
         {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
@@ -342,6 +351,220 @@ def test_process_hand_setup_hole_card_no_match_is_none():
     by_label = {p["seat_position_label"]: p for p in players}
     assert by_label["CO"]["hole_cards"] is None
     assert by_label["BB"]["hole_cards"] == ["Ah", "Kd"]
+
+
+# ---------------------------------------------------------------------------
+# process_hand_setup — step C bounded retry for eligible-seat nulls
+# ---------------------------------------------------------------------------
+
+
+def _three_seat_hs():
+    return PendingHandSetup(
+        hand_setup_id="clip_001_001",
+        clip_id="clip_001",
+        video_id="vid_a",
+        hand_setup_time_seconds=100,
+        hand_setup_state=_hand_setup_state(players=[
+            {"seat_position_label": "BB", "stack_size": 100.0, "seat_number": 1},
+            {"seat_position_label": "CO", "stack_size": 60.0, "seat_number": 4},
+            {"seat_position_label": "UTG", "stack_size": 50.0, "seat_number": 9},
+        ]),
+        available_seconds=60,
+        raw_lead_gap_seconds=60,
+    )
+
+
+def test_process_hand_setup_retry_fills_eligible_null():
+    hs = _three_seat_hs()
+    first_response = {
+        "players": [
+            {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+            {"seat_position_label": "UTG", "hole_cards": ["2c", "3c"]},
+            # CO omitted -> null on first call
+        ]
+    }
+    second_response = {
+        "players": [
+            {"seat_position_label": "CO", "hole_cards": ["Th", "9h"]},
+        ]
+    }
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
+        patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_frame",
+            side_effect=[first_response, second_response],
+        ) as mock_gemini_frame,
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_write_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            hs, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+        ))
+
+    assert outcome == "complete"
+    assert mock_gemini_frame.call_count == 2
+    # Retry must reuse the exact same prompt/frame/args as the first call.
+    assert mock_gemini_frame.call_args_list[0] == mock_gemini_frame.call_args_list[1]
+
+    mock_write_starts.assert_called_once()
+    players = mock_write_starts.call_args[0][0][0].hand_start_state["hand_setup"]["players"]
+    by_label = {p["seat_position_label"]: p for p in players}
+    assert by_label["BB"]["hole_cards"] == ["Ah", "Kd"]
+    assert by_label["CO"]["hole_cards"] == ["Th", "9h"]
+    assert by_label["UTG"]["hole_cards"] == ["2c", "3c"]
+
+    attempt_row = mock_write_attempt.call_args[0][0]
+    assert attempt_row.status == "complete"
+    assert "null hole_cards" not in attempt_row.status_message
+
+
+def test_process_hand_setup_retry_still_null_is_still_complete():
+    hs = _three_seat_hs()
+    first_response = {
+        "players": [
+            {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+            {"seat_position_label": "UTG", "hole_cards": ["2c", "3c"]},
+        ]
+    }
+    second_response = {"players": []}  # retry also misses CO
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
+        patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_frame",
+            side_effect=[first_response, second_response],
+        ) as mock_gemini_frame,
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_write_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            hs, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+        ))
+
+    assert outcome == "complete"
+    assert mock_gemini_frame.call_count == 2
+    mock_write_starts.assert_called_once()
+
+    players = mock_write_starts.call_args[0][0][0].hand_start_state["hand_setup"]["players"]
+    by_label = {p["seat_position_label"]: p for p in players}
+    assert by_label["CO"]["hole_cards"] is None
+
+    attempt_row = mock_write_attempt.call_args[0][0]
+    assert attempt_row.status == "complete"
+    assert "null hole_cards after retry" in attempt_row.status_message
+    assert "CO" in attempt_row.status_message
+
+
+def test_process_hand_setup_retry_does_not_clobber_first_call_answer():
+    hs = _three_seat_hs()
+    first_response = {
+        "players": [
+            {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+            {"seat_position_label": "UTG", "hole_cards": ["2c", "3c"]},
+            # CO omitted -> null, triggers retry
+        ]
+    }
+    second_response = {
+        "players": [
+            {"seat_position_label": "BB", "hole_cards": None},  # simulated flip: null this time
+            {"seat_position_label": "CO", "hole_cards": ["Th", "9h"]},
+        ]
+    }
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
+        patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_frame",
+            side_effect=[first_response, second_response],
+        ) as mock_gemini_frame,
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row"),
+    ):
+        outcome = _run(process_hand_setup(
+            hs, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+        ))
+
+    assert outcome == "complete"
+    assert mock_gemini_frame.call_count == 2
+
+    players = mock_write_starts.call_args[0][0][0].hand_start_state["hand_setup"]["players"]
+    by_label = {p["seat_position_label"]: p for p in players}
+    assert by_label["BB"]["hole_cards"] == ["Ah", "Kd"]  # retained, not clobbered by retry's null
+    assert by_label["CO"]["hole_cards"] == ["Th", "9h"]  # filled by retry
+    assert by_label["UTG"]["hole_cards"] == ["2c", "3c"]
+
+
+def test_process_hand_setup_no_retry_when_first_call_fully_populated():
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
+        patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_frame",
+            return_value=_HOLE_CARDS_RESULT,
+        ) as mock_gemini_frame,
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts"),
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_write_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+        ))
+
+    assert outcome == "complete"
+    assert mock_gemini_frame.call_count == 1
+
+    attempt_row = mock_write_attempt.call_args[0][0]
+    assert "null hole_cards" not in attempt_row.status_message
+
+
+def test_process_hand_setup_non_eligible_null_does_not_trigger_retry():
+    hs = _three_seat_hs()
+    # FVA is CO (seat 4) -> UTG (seat 9) is non-eligible, and it's the one that's null.
+    result = {
+        "players": [
+            {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+            {"seat_position_label": "CO", "hole_cards": ["2c", "3c"]},
+            # UTG omitted -> null, but non-eligible
+        ]
+    }
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FVA_CO),
+        patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_frame",
+            return_value=result,
+        ) as mock_gemini_frame,
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_write_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            hs, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+        ))
+
+    assert outcome == "complete"
+    assert mock_gemini_frame.call_count == 1
+
+    players = mock_write_starts.call_args[0][0][0].hand_start_state["hand_setup"]["players"]
+    by_label = {p["seat_position_label"]: p for p in players}
+    assert by_label["UTG"]["hole_cards"] is None
+
+    attempt_row = mock_write_attempt.call_args[0][0]
+    assert "null hole_cards" not in attempt_row.status_message
 
 
 # ---------------------------------------------------------------------------

@@ -271,7 +271,7 @@ async def process_hand_setup(
                     paths.append(local_path)
                 return paths
 
-            async def _run_step_c() -> tuple[str, dict]:
+            async def _run_step_c() -> tuple[str, str, bytes, dict]:
                 fva_frame_local_path = os.path.join(frame_tmpdir, "fva.jpg")
                 await asyncio.to_thread(extract_frame, local_video_path, fva_time_seconds, fva_frame_local_path)
                 with open(fva_frame_local_path, "rb") as fh:
@@ -288,11 +288,12 @@ async def process_hand_setup(
                     project_id,
                     user_text="Extract hole cards for all eligible players from this frame.",
                 )
-                return fva_frame_local_path, hole_cards_result
+                return fva_frame_local_path, filled_hole_cards_prompt, frame_bytes, hole_cards_result
 
-            verify_frame_local_paths, (fva_frame_local_path, hole_cards_result) = await asyncio.gather(
-                _extract_verify_frames(), _run_step_c()
-            )
+            (
+                verify_frame_local_paths,
+                (fva_frame_local_path, filled_hole_cards_prompt, frame_bytes, hole_cards_result),
+            ) = await asyncio.gather(_extract_verify_frames(), _run_step_c())
 
             hole_cards_by_label = {
                 p.get("seat_position_label"): p for p in hole_cards_result.get("players", [])
@@ -303,6 +304,42 @@ async def process_hand_setup(
                     player["hole_cards"] = normalize_cards(matched["hole_cards"])
                 else:
                     player["hole_cards"] = None
+
+            # Step C is non-deterministic: the same frame + prompt sometimes
+            # returns hole_cards: null for an eligible seat even when the
+            # card is legible (it never returns a wrong card, only null). A
+            # narrower single-seat retry prompt was tested and rejected — it
+            # returned another player's cards mislabeled onto the retried
+            # seat — so the retry reuses this exact frame/prompt, fills gaps
+            # only, and never overwrites a non-null first-call answer.
+            fva_seat_number = hand_start_state["fva"]["seat_number"]
+            hand_setup_players = hand_start_state["hand_setup"].get("players", [])
+            eligible_players = (
+                hand_setup_players if fva_seat_number is None
+                else [p for p in hand_setup_players if p["seat_number"] <= fva_seat_number]
+            )
+
+            if any(p.get("hole_cards") is None for p in eligible_players):
+                retry_hole_cards_result = await asyncio.to_thread(
+                    call_gemini_for_frame,
+                    filled_hole_cards_prompt,
+                    frame_bytes,
+                    project_id,
+                    user_text="Extract hole cards for all eligible players from this frame.",
+                )
+                retry_by_label = {
+                    p.get("seat_position_label"): p for p in retry_hole_cards_result.get("players", [])
+                }
+                for player in hand_setup_players:
+                    if player.get("hole_cards") is not None:
+                        continue  # first call is authoritative — retry only fills gaps
+                    matched = retry_by_label.get(player.get("seat_position_label"))
+                    if matched and matched.get("hole_cards") is not None:
+                        player["hole_cards"] = normalize_cards(matched["hole_cards"])
+
+            residual_null_labels = [
+                p.get("seat_position_label") for p in eligible_players if p.get("hole_cards") is None
+            ]
 
             fva_frame_gcs_path = (
                 f"gs://{hand_starts_bucket}/{hs.video_id}/{hs.clip_id}/{hs.hand_setup_id}/fva.jpg"
@@ -342,6 +379,8 @@ async def process_hand_setup(
             )
         else:
             status_message = f"complete: available_seconds={hs.available_seconds}"
+        if residual_null_labels:
+            status_message += f"; null hole_cards after retry — {', '.join(residual_null_labels)}"
         # Non-atomic with the write_hand_starts() call above: if that insert
         # succeeded but this attempt write throws, the hand_setup has no
         # "complete" attempt and gets re-selected next run, producing a
