@@ -65,7 +65,7 @@ def test_build_hole_card_context_nine_handed_fva_at_first_seat():
         "hand_setup": {"players": _NINE_HANDED_PLAYERS},
         "fva": {"seat_number": 1},
     }
-    assert build_hole_card_context(state) == "- Seat 1 (BB) — FVA, stop here"
+    assert build_hole_card_context(state) == "- Seat 1 (BB) | Stack: 100.0 BB"
 
 
 def test_build_hole_card_context_nine_handed_fva_mid_table():
@@ -74,11 +74,11 @@ def test_build_hole_card_context_nine_handed_fva_mid_table():
         "fva": {"seat_number": 5},
     }
     assert build_hole_card_context(state) == (
-        "- Seat 1 (BB)\n"
-        "- Seat 2 (SB)\n"
-        "- Seat 3 (BTN)\n"
-        "- Seat 4 (CO)\n"
-        "- Seat 5 (HJ) — FVA, stop here"
+        "- Seat 1 (BB) | Stack: 100.0 BB\n"
+        "- Seat 2 (SB) | Stack: 100.0 BB\n"
+        "- Seat 3 (BTN) | Stack: 100.0 BB\n"
+        "- Seat 4 (CO) | Stack: 100.0 BB\n"
+        "- Seat 5 (HJ) | Stack: 100.0 BB"
     )
 
 
@@ -89,7 +89,7 @@ def test_build_hole_card_context_nine_handed_fva_at_last_seat():
     }
     result = build_hole_card_context(state)
     assert result.count("\n") == 8
-    assert result.endswith("- Seat 9 (UTG) — FVA, stop here")
+    assert result.endswith("- Seat 9 (UTG) | Stack: 100.0 BB")
 
 
 def test_build_hole_card_context_six_handed():
@@ -106,23 +106,23 @@ def test_build_hole_card_context_six_handed():
         "fva": {"seat_number": 4},
     }
     assert build_hole_card_context(state) == (
-        "- Seat 1 (BB)\n"
-        "- Seat 2 (SB)\n"
-        "- Seat 3 (BTN)\n"
-        "- Seat 4 (CO) — FVA, stop here"
+        "- Seat 1 (BB) | Stack: 100.0 BB\n"
+        "- Seat 2 (SB) | Stack: 100.0 BB\n"
+        "- Seat 3 (BTN) | Stack: 100.0 BB\n"
+        "- Seat 4 (CO) | Stack: 100.0 BB"
     )
 
 
 def test_build_hole_card_context_fva_seat_number_none_returns_all_unmarked():
     # add_fva_seat_number yields None for an unrecognized label; the filter
-    # degrades to the full player list with no FVA marker.
+    # degrades to the full player list.
     state = {
         "hand_setup": {"players": _NINE_HANDED_PLAYERS},
         "fva": {"seat_number": None},
     }
     result = build_hole_card_context(state)
     assert result.count("\n") == 8
-    assert "FVA, stop here" not in result
+    assert result.count("| Stack: 100.0 BB") == 9
 
 
 def test_build_hole_card_context_heads_up():
@@ -136,6 +136,6 @@ def test_build_hole_card_context_heads_up():
         "fva": {"seat_number": 3},
     }
     assert build_hole_card_context(state) == (
-        "- Seat 1 (BB)\n"
-        "- Seat 3 (BTN) — FVA, stop here"
+        "- Seat 1 (BB) | Stack: 100.0 BB\n"
+        "- Seat 3 (BTN) | Stack: 100.0 BB"
     )

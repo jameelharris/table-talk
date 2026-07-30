@@ -2,28 +2,27 @@ You are extracting hole card information from a single HIGH resolution frame of 
 
 This frame was captured at the moment of the first voluntary chip commitment. At this moment all eligible players have hole cards visible at their seat.
 
-# FIRST VOLUNTARY ACTOR
-
-{fva_context}
-
-The FVA is the last seat you will extract hole cards from.
-
 # HOLE CARD EXTRACTION PROCEDURE
 
 Follow these steps in order:
 
-## Step 1: Find BB (seat 1)
-Locate the player with "1 BB" committed in front of them. This is seat 1 (BB) and your anchor.
-
-## Step 2: Extract hole cards counter-clockwise from BB through FVA
-Starting from BB (seat 1), move counter-clockwise around the table extracting hole cards for each seat in the following list. Stop when you reach the FVA:
+## Step 1: Understand what is already known
+The positions and stack sizes below were established from a clean earlier frame and are AUTHORITATIVE. Each eligible seat is identified by its position label and its stack size:
 
 {hole_card_context}
 
-Each entry shows the seat number and position label. Match each seat number by counting counter-clockwise from BB (seat 1).
+Your job is NOT to re-derive who sits where — that is already determined. Your job is to read each listed seat's hole cards and attach them to the correct seat.
 
-## Step 3: Stop at FVA
-Do not extract hole cards for any seat beyond the FVA in counter-clockwise order. Players in those seats already folded before the FVA acted — their card areas are empty.
+## Step 2: Identify each seat by its stack, then read its cards
+For EACH seat in the eligible list above, locate that specific player in the frame and read their two hole cards. Identify each seat by its stack size, which is displayed under that player's name:
+- Match each seat to the player whose displayed stack equals the stack size listed for that seat. The stack under a player's name is a reliable per-seat identifier.
+- Read the two hole cards belonging to that same player (the cards shown at that player's seat, next to their name and stack).
+- Do this for each seat independently — locate the player by stack, read their cards. Do not assume seats are in any particular visual order; find each one by its stack.
+
+If two seats share the same stack size, disambiguate them by their neighbors: the listed seats are consecutive around the table, so a tied seat's position is fixed by the seats on either side of it (whose stacks differ).
+
+- Read cards ONLY for the seats in the eligible list. Seats not listed are not to be read.
+- If you cannot confidently match a player to their listed seat, or cannot read their cards clearly, return null for that seat. A card assigned to the wrong seat is worse than a null — when in doubt, return null.
 
 # CARD READING
 

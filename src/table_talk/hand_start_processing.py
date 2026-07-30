@@ -27,7 +27,7 @@ from .frame_uploader import upload_frame
 from .gemini_caller import GeminiPermanentError, call_gemini_for_clip, call_gemini_for_frame
 from .hand_setup_processing_attempts_writer import write_hand_setup_processing_attempt_row
 from .hand_starts_writer import write_hand_starts
-from .prompt_context import build_fva_context, build_hole_card_context, build_player_context
+from .prompt_context import build_hole_card_context, build_player_context
 from .seat_enrichment import add_fva_seat_number, normalize_heads_up
 from .timestamp_utils import parse_timestamp
 from .videos_downloader import DownloadPermanentError, download_video
@@ -279,7 +279,6 @@ async def process_hand_setup(
                 filled_hole_cards_prompt = (
                     extract_hole_cards_prompt
                     .replace("{hole_card_context}", build_hole_card_context(hand_start_state))
-                    .replace("{fva_context}", build_fva_context(hand_start_state["fva"]))
                 )
                 hole_cards_result = await asyncio.to_thread(
                     call_gemini_for_frame,
