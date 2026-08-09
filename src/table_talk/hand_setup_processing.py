@@ -115,6 +115,7 @@ async def process_clip(
         hand_setups = clip_result.get("hand_setups", [])
 
         if not hand_setups:
+            write_hand_setups([], clip_id=clip.clip_id, project_id=project_id, dataset=dataset)
             write_clip_processing_attempt_row(
                 ClipProcessingAttemptsRow(
                     clip_id=clip.clip_id,
@@ -181,7 +182,7 @@ async def process_clip(
                     )
                 )
 
-            write_hand_setups(rows, project_id=project_id, dataset=dataset)
+            write_hand_setups(rows, clip_id=clip.clip_id, project_id=project_id, dataset=dataset)
             write_clip_processing_attempt_row(
                 ClipProcessingAttemptsRow(
                     clip_id=clip.clip_id,

@@ -264,6 +264,7 @@ def test_process_hand_setup_happy_path():
     assert outcome == "complete"
     assert mock_upload.call_count == 4  # fva + 3 verify frames
 
+    assert mock_write_starts.call_args.kwargs["hand_setup_id"] == "clip_001_001"
     rows_arg = mock_write_starts.call_args[0][0]
     assert len(rows_arg) == 1
     row = rows_arg[0]
@@ -622,7 +623,9 @@ def test_process_hand_setup_uncontested_is_complete_zero_rows():
 
     assert outcome == "complete"
     mock_extract.assert_not_called()
-    mock_write_starts.assert_not_called()
+    mock_write_starts.assert_called_once_with(
+        [], hand_setup_id="clip_001_001", project_id="proj", dataset="ds"
+    )
     attempt_row = mock_write_attempt.call_args[0][0]
     assert attempt_row.status == "complete"
     assert "uncontested" in attempt_row.status_message
@@ -757,13 +760,15 @@ def test_process_hand_setup_hallucinated_fva_wins_over_no_second_action():
 
 
 def test_process_hand_setup_no_hand_starts_row_unless_complete_with_row():
-    """Every non-complete outcome across the suite writes zero hand_starts rows."""
+    """Non-complete outcomes never call write_hand_starts; uncontested (complete,
+    zero rows) calls it with an empty list to clear any stale row from a prior
+    run."""
     scenarios = [
-        {"found": False, "reason": "uncontested"},
-        {"found": False, "reason": "no_first_voluntary_commitment_found"},
-        {**_CLIP_RESULT_FOUND, "second_action_timestamp": None},
+        ({"found": False, "reason": "uncontested"}, True),
+        ({"found": False, "reason": "no_first_voluntary_commitment_found"}, False),
+        ({**_CLIP_RESULT_FOUND, "second_action_timestamp": None}, False),
     ]
-    for result in scenarios:
+    for result, expect_zero_row_call in scenarios:
         with (
             patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=result),
             patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
@@ -774,7 +779,12 @@ def test_process_hand_setup_no_hand_starts_row_unless_complete_with_row():
                 "videos-bucket", "hand-starts-bucket",
                 "identify prompt", "extract prompt",
             ))
-        mock_write_starts.assert_not_called()
+        if expect_zero_row_call:
+            mock_write_starts.assert_called_once_with(
+                [], hand_setup_id="clip_001_001", project_id="proj", dataset="ds"
+            )
+        else:
+            mock_write_starts.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -979,6 +989,7 @@ async def _integration_body():
                 },
             )
         ],
+        clip_id=clip_id,
         project_id=project,
         dataset=dataset,
         client=bq_client,

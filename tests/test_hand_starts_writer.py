@@ -1,6 +1,6 @@
 import json
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -48,34 +48,60 @@ def test_happy_path():
     mock_client, mock_job = _mock_client()
     row = _sample_row()
 
-    write_hand_starts([row], project_id="proj", dataset="ds", client=mock_client)
+    write_hand_starts([row], hand_setup_id=row.hand_setup_id, project_id="proj", dataset="ds", client=mock_client)
 
     mock_client.query.assert_called_once()
     args, kwargs = mock_client.query.call_args
     query_str = args[0]
     job_config = kwargs["job_config"]
-    assert query_str.startswith("INSERT INTO")
-    assert "proj.ds.hand_starts" in query_str
+    assert query_str.startswith("BEGIN TRANSACTION")
+    begin_idx = query_str.index("BEGIN TRANSACTION")
+    delete_idx = query_str.index("DELETE FROM `proj.ds.hand_starts` WHERE hand_setup_id = @replace_key")
+    insert_idx = query_str.index("INSERT INTO `proj.ds.hand_starts`")
+    commit_idx = query_str.index("COMMIT TRANSACTION")
+    assert begin_idx < delete_idx < insert_idx < commit_idx
     param_names = {p.name for p in job_config.query_parameters}
-    expected = {f"{c}_0" for c in asdict(row).keys()}
+    expected = {f"{c}_0" for c in asdict(row).keys()} | {"replace_key"}
     assert param_names == expected
     assert not any("detected_at" in n for n in param_names)
     mock_job.result.assert_called_once()
 
 
-def test_empty_list_is_noop():
+def test_empty_list_issues_bare_delete():
     mock_client, _ = _mock_client()
 
-    write_hand_starts([], project_id="proj", dataset="ds", client=mock_client)
+    write_hand_starts(
+        [], hand_setup_id="dQw4w9WgXcQ_001_001", project_id="proj", dataset="ds", client=mock_client
+    )
+
+    mock_client.query.assert_called_once()
+    args, kwargs = mock_client.query.call_args
+    query_str = args[0]
+    assert query_str == "DELETE FROM `proj.ds.hand_starts` WHERE hand_setup_id = @replace_key"
+    assert "BEGIN TRANSACTION" not in query_str
+    assert "INSERT" not in query_str
+    params = kwargs["job_config"].query_parameters
+    assert len(params) == 1
+    assert params[0].name == "replace_key"
+    assert params[0].value == "dQw4w9WgXcQ_001_001"
+
+
+def test_mismatched_hand_setup_id_raises_no_query_issued():
+    mock_client, _ = _mock_client()
+    row = _sample_row()
+
+    with pytest.raises(HandStartsWriteError, match="hand_setup_id"):
+        write_hand_starts([row], hand_setup_id="some_other_id", project_id="proj", dataset="ds", client=mock_client)
 
     mock_client.query.assert_not_called()
 
 
 def test_n_rows_single_query():
     mock_client, _ = _mock_client()
-    rows = [_sample_row(suffix=f"{i:03d}") for i in range(3)]
+    base = _sample_row()
+    rows = [replace(base, hand_start_id=f"{base.hand_setup_id}_{i:03d}") for i in range(3)]
 
-    write_hand_starts(rows, project_id="proj", dataset="ds", client=mock_client)
+    write_hand_starts(rows, hand_setup_id=base.hand_setup_id, project_id="proj", dataset="ds", client=mock_client)
 
     mock_client.query.assert_called_once()
     args, kwargs = mock_client.query.call_args
@@ -83,14 +109,14 @@ def test_n_rows_single_query():
     assert "hand_starts" in query_str
     params = kwargs["job_config"].query_parameters
     col_count = len(asdict(rows[0]))
-    assert len(params) == 3 * col_count
+    assert len(params) == 3 * col_count + 1  # +1 for replace_key
 
 
 def test_json_parameter_type_and_value():
     mock_client, _ = _mock_client()
     row = _sample_row()
 
-    write_hand_starts([row], project_id="proj", dataset="ds", client=mock_client)
+    write_hand_starts([row], hand_setup_id=row.hand_setup_id, project_id="proj", dataset="ds", client=mock_client)
 
     _, kwargs = mock_client.query.call_args
     params = {p.name: p for p in kwargs["job_config"].query_parameters}
@@ -103,7 +129,7 @@ def test_no_double_encoding_of_hand_start_state():
     mock_client, _ = _mock_client()
     row = _sample_row()
 
-    write_hand_starts([row], project_id="proj", dataset="ds", client=mock_client)
+    write_hand_starts([row], hand_setup_id=row.hand_setup_id, project_id="proj", dataset="ds", client=mock_client)
 
     _, kwargs = mock_client.query.call_args
     params = {p.name: p for p in kwargs["job_config"].query_parameters}
@@ -120,7 +146,7 @@ def test_verify_frame_gcs_paths_uses_array_query_parameter():
     paths = ["gs://bucket/verify_001.jpg", "gs://bucket/verify_002.jpg"]
     row = _sample_row(verify_frame_gcs_paths=paths)
 
-    write_hand_starts([row], project_id="proj", dataset="ds", client=mock_client)
+    write_hand_starts([row], hand_setup_id=row.hand_setup_id, project_id="proj", dataset="ds", client=mock_client)
 
     _, kwargs = mock_client.query.call_args
     params = {p.name: p for p in kwargs["job_config"].query_parameters}
@@ -139,7 +165,7 @@ def test_verify_frame_gcs_paths_empty_list_wire_value_is_list_not_none():
     mock_client, _ = _mock_client()
     row = _sample_row(verify_frame_gcs_paths=[])
 
-    write_hand_starts([row], project_id="proj", dataset="ds", client=mock_client)
+    write_hand_starts([row], hand_setup_id=row.hand_setup_id, project_id="proj", dataset="ds", client=mock_client)
 
     _, kwargs = mock_client.query.call_args
     params = {p.name: p for p in kwargs["job_config"].query_parameters}
@@ -154,37 +180,41 @@ def test_verify_frame_gcs_paths_empty_list_wire_value_is_list_not_none():
 
 def test_job_errors_raises():
     mock_client, _ = _mock_client(job_errors=[{"message": "bad schema"}])
+    row = _sample_row()
 
     with pytest.raises(HandStartsWriteError, match="bad schema"):
-        write_hand_starts([_sample_row()], project_id="proj", dataset="ds", client=mock_client)
+        write_hand_starts([row], hand_setup_id=row.hand_setup_id, project_id="proj", dataset="ds", client=mock_client)
 
 
 def test_google_cloud_error_raises():
     mock_client = MagicMock()
     err = gcloud_exceptions.GoogleCloudError("network error")
     mock_client.query.side_effect = err
+    row = _sample_row()
 
     with pytest.raises(HandStartsWriteError, match="network error"):
-        write_hand_starts([_sample_row()], project_id="proj", dataset="ds", client=mock_client)
+        write_hand_starts([row], hand_setup_id=row.hand_setup_id, project_id="proj", dataset="ds", client=mock_client)
 
 
 def test_client_none_instantiates_with_project():
     mock_client, _ = _mock_client()
+    row = _sample_row()
 
     with patch("table_talk.hand_starts_writer.bigquery.Client", return_value=mock_client) as mock_cls:
-        write_hand_starts([_sample_row()], project_id="myproj", dataset="ds")
+        write_hand_starts([row], hand_setup_id=row.hand_setup_id, project_id="myproj", dataset="ds")
         mock_cls.assert_called_once_with(project="myproj")
 
 
 def test_client_provided_not_instantiated():
     mock_client, _ = _mock_client()
+    row = _sample_row()
 
     with patch("table_talk.hand_starts_writer.bigquery.Client") as mock_cls:
-        write_hand_starts([_sample_row()], project_id="proj", dataset="ds", client=mock_client)
+        write_hand_starts([row], hand_setup_id=row.hand_setup_id, project_id="proj", dataset="ds", client=mock_client)
         mock_cls.assert_not_called()
 
 
-# --- integration test ---
+# --- integration tests ---
 
 
 @pytest.mark.integration
@@ -248,25 +278,26 @@ def test_write_hand_starts_integration():
                     hand_setup_state=hand_setup_state,
                 )
             ],
+            clip_id=clip_id,
             project_id=project,
             dataset=dataset,
             client=client,
         )
 
+        first_row = HandStartsRow(
+            hand_start_id=hand_start_id,
+            hand_setup_id=hand_setup_id,
+            clip_id=clip_id,
+            video_id=video_id,
+            fva_time_seconds=32,
+            second_action_time_seconds=35,
+            hand_start_state=hand_start_state,
+            fva_frame_gcs_path=f"gs://bucket/{hand_start_id}_fva.jpg",
+            verify_frame_gcs_paths=verify_paths,
+        )
         write_hand_starts(
-            [
-                HandStartsRow(
-                    hand_start_id=hand_start_id,
-                    hand_setup_id=hand_setup_id,
-                    clip_id=clip_id,
-                    video_id=video_id,
-                    fva_time_seconds=32,
-                    second_action_time_seconds=35,
-                    hand_start_state=hand_start_state,
-                    fva_frame_gcs_path=f"gs://bucket/{hand_start_id}_fva.jpg",
-                    verify_frame_gcs_paths=verify_paths,
-                )
-            ],
+            [first_row],
+            hand_setup_id=hand_setup_id,
             project_id=project,
             dataset=dataset,
             client=client,
@@ -287,6 +318,131 @@ def test_write_hand_starts_integration():
         assert r.detected_at is not None
         skew = abs(r.detected_at.replace(tzinfo=UTC) - datetime.now(UTC))
         assert skew < timedelta(seconds=30)
+
+        # Reprocess with the same key and a modified row: proves REPLACE
+        # semantics — this is the direct regression test for the
+        # MPBLfM4mwfE_006_004 duplicate-row incident.
+        second_row = replace(first_row, fva_time_seconds=99, second_action_time_seconds=101)
+        write_hand_starts(
+            [second_row],
+            hand_setup_id=hand_setup_id,
+            project_id=project,
+            dataset=dataset,
+            client=client,
+        )
+        results = list(client.query(query, job_config=job_config).result())
+        assert len(results) == 1
+        assert results[0].fva_time_seconds == 99
+        assert results[0].second_action_time_seconds == 101
+    finally:
+        for table, col, val in [
+            (hand_starts_ref, "hand_setup_id", hand_setup_id),
+            (hand_setups_ref, "hand_setup_id", hand_setup_id),
+            (clip_ref, "clip_id", clip_id),
+            (videos_ref, "video_id", video_id),
+        ]:
+            client.query(
+                f"DELETE FROM `{table}` WHERE {col} = @val",
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[bigquery.ScalarQueryParameter("val", "STRING", val)]
+                ),
+            ).result()
+
+
+@pytest.mark.integration
+def test_write_hand_starts_integration_zero_row_deletes_existing():
+    from table_talk.clip_manifest_writer import ClipManifestRow, write_clip_manifest_rows
+    from table_talk.hand_setups_writer import HandSetupsRow, write_hand_setups
+    from table_talk.videos_writer import VideosRow, write_video_row
+
+    project = "table-talk-497020"
+    dataset = "table_talk_dev"
+    uid = uuid.uuid4().hex[:8]
+    video_id = f"test_{uid}"
+    clip_id = f"{video_id}_001"
+    hand_setup_id = f"{clip_id}_001"
+    hand_start_id = f"{hand_setup_id}_001"
+
+    client = bigquery.Client(project=project)
+    videos_ref = f"{project}.{dataset}.videos"
+    clip_ref = f"{project}.{dataset}.clip_manifest"
+    hand_setups_ref = f"{project}.{dataset}.hand_setups"
+    hand_starts_ref = f"{project}.{dataset}.hand_starts"
+
+    hand_setup_state = {"hand_setup_time_seconds": 30, "total_seat_count": 6, "pot_size_bb": None, "players": []}
+    hand_start_state = {
+        "hand_setup": hand_setup_state,
+        "fva": {"seat_position_label": "BB", "seat_number": 1, "action_type": "raise", "bet_amount": 3.0},
+    }
+
+    try:
+        write_video_row(
+            VideosRow(
+                video_id=video_id,
+                source_url=f"https://www.youtube.com/watch?v={video_id}",
+                title="Integration Test Video",
+                duration_seconds=300,
+                gcs_path=f"gs://table-talk-videos/{video_id}.mp4",
+                file_size_bytes=12345,
+            ),
+            project=project,
+            dataset=dataset,
+            client=client,
+        )
+        write_clip_manifest_rows(
+            [ClipManifestRow(clip_id=clip_id, video_id=video_id, clip_start_time=0, clip_end_time=300)],
+            project=project,
+            dataset=dataset,
+            client=client,
+        )
+        write_hand_setups(
+            [
+                HandSetupsRow(
+                    hand_setup_id=hand_setup_id,
+                    clip_id=clip_id,
+                    video_id=video_id,
+                    hand_setup_time_seconds=30,
+                    frame_gcs_path=f"gs://bucket/{hand_setup_id}.jpg",
+                    hand_setup_state=hand_setup_state,
+                )
+            ],
+            clip_id=clip_id,
+            project_id=project,
+            dataset=dataset,
+            client=client,
+        )
+        write_hand_starts(
+            [
+                HandStartsRow(
+                    hand_start_id=hand_start_id,
+                    hand_setup_id=hand_setup_id,
+                    clip_id=clip_id,
+                    video_id=video_id,
+                    fva_time_seconds=32,
+                    second_action_time_seconds=35,
+                    hand_start_state=hand_start_state,
+                    fva_frame_gcs_path=f"gs://bucket/{hand_start_id}_fva.jpg",
+                    verify_frame_gcs_paths=[],
+                )
+            ],
+            hand_setup_id=hand_setup_id,
+            project_id=project,
+            dataset=dataset,
+            client=client,
+        )
+
+        query = f"SELECT * FROM `{hand_starts_ref}` WHERE hand_setup_id = @hand_setup_id"
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("hand_setup_id", "STRING", hand_setup_id)]
+        )
+        assert len(list(client.query(query, job_config=job_config).result())) == 1
+
+        # This is Phase 4's uncontested branch: a reprocess that concludes
+        # with zero hand_starts rows must remove the stale row from a prior
+        # run, not just skip writing.
+        write_hand_starts([], hand_setup_id=hand_setup_id, project_id=project, dataset=dataset, client=client)
+
+        assert list(client.query(query, job_config=job_config).result()) == []
     finally:
         for table, col, val in [
             (hand_starts_ref, "hand_setup_id", hand_setup_id),

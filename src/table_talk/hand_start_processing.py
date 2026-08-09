@@ -230,6 +230,7 @@ async def process_hand_setup(
         if not clip_result.get("found"):
             if clip_result.get("reason") == "uncontested":
                 status_message = "complete: uncontested — no voluntary chip commitment"
+                write_hand_starts([], hand_setup_id=hs.hand_setup_id, project_id=project_id, dataset=dataset)
                 _write_attempt(hs.hand_setup_id, "complete", status_message, project_id=project_id, dataset=dataset)
                 return "complete"
             status_message = f"failed_transient: {clip_result.get('reason', 'not found')}"
@@ -367,6 +368,7 @@ async def process_hand_setup(
                         verify_frame_gcs_paths=verify_frame_gcs_paths,
                     )
                 ],
+                hand_setup_id=hs.hand_setup_id,
                 project_id=project_id,
                 dataset=dataset,
             )
@@ -380,12 +382,9 @@ async def process_hand_setup(
             status_message = f"complete: available_seconds={hs.available_seconds}"
         if residual_null_labels:
             status_message += f"; null hole_cards after retry — {', '.join(residual_null_labels)}"
-        # Non-atomic with the write_hand_starts() call above: if that insert
-        # succeeded but this attempt write throws, the hand_setup has no
-        # "complete" attempt and gets re-selected next run, producing a
-        # second hand_starts row (unlike Phase 3, where a re-run reproduces
-        # an equivalent row instead of a duplicate). See PR 8 plan's
-        # Post-Implementation Follow-ups.
+        # write_hand_starts() is REPLACE (DELETE+INSERT) semantics keyed on
+        # hand_setup_id, so a post-write attempt-write failure here is safe:
+        # re-running reproduces the same row set instead of duplicating it.
         _write_attempt(hs.hand_setup_id, "complete", status_message, project_id=project_id, dataset=dataset)
         return "complete"
 

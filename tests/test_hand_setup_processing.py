@@ -158,6 +158,7 @@ def test_process_clip_happy_path():
     assert "1 hand_setups" in attempt_row.status_message
 
     # hand_setups rows written
+    assert mock_write_setups.call_args.kwargs["clip_id"] == "dQw4w9WgXcQ_001"
     rows_arg = mock_write_setups.call_args[0][0]
     assert len(rows_arg) == 1
     assert rows_arg[0].hand_setup_id == "dQw4w9WgXcQ_001_001"
@@ -187,7 +188,9 @@ def test_process_clip_empty_hand_setups():
     assert outcome == "complete"
     mock_extract.assert_not_called()
     mock_upload.assert_not_called()
-    mock_write_setups.assert_not_called()
+    mock_write_setups.assert_called_once_with(
+        [], clip_id="dQw4w9WgXcQ_001", project_id="proj", dataset="ds"
+    )
     attempt_row = mock_write_attempt.call_args[0][0]
     assert attempt_row.status == "complete"
     assert "No hand setups" in attempt_row.status_message

@@ -37,25 +37,48 @@ def test_happy_path():
     mock_client, mock_job = _mock_client()
     row = _sample_row()
 
-    write_hand_setups([row], project_id="proj", dataset="ds", client=mock_client)
+    write_hand_setups([row], clip_id=row.clip_id, project_id="proj", dataset="ds", client=mock_client)
 
     mock_client.query.assert_called_once()
     args, kwargs = mock_client.query.call_args
     query_str = args[0]
     job_config = kwargs["job_config"]
-    assert query_str.startswith("INSERT INTO")
-    assert "proj.ds.hand_setups" in query_str
+    assert query_str.startswith("BEGIN TRANSACTION")
+    begin_idx = query_str.index("BEGIN TRANSACTION")
+    delete_idx = query_str.index("DELETE FROM `proj.ds.hand_setups` WHERE clip_id = @replace_key")
+    insert_idx = query_str.index("INSERT INTO `proj.ds.hand_setups`")
+    commit_idx = query_str.index("COMMIT TRANSACTION")
+    assert begin_idx < delete_idx < insert_idx < commit_idx
     param_names = {p.name for p in job_config.query_parameters}
-    expected = {f"{c}_0" for c in asdict(row).keys()}
+    expected = {f"{c}_0" for c in asdict(row).keys()} | {"replace_key"}
     assert param_names == expected
     assert not any("detected_at" in n for n in param_names)
     mock_job.result.assert_called_once()
 
 
-def test_empty_list_is_noop():
+def test_empty_list_issues_bare_delete():
     mock_client, _ = _mock_client()
 
-    write_hand_setups([], project_id="proj", dataset="ds", client=mock_client)
+    write_hand_setups([], clip_id="dQw4w9WgXcQ_001", project_id="proj", dataset="ds", client=mock_client)
+
+    mock_client.query.assert_called_once()
+    args, kwargs = mock_client.query.call_args
+    query_str = args[0]
+    assert query_str == "DELETE FROM `proj.ds.hand_setups` WHERE clip_id = @replace_key"
+    assert "BEGIN TRANSACTION" not in query_str
+    assert "INSERT" not in query_str
+    params = kwargs["job_config"].query_parameters
+    assert len(params) == 1
+    assert params[0].name == "replace_key"
+    assert params[0].value == "dQw4w9WgXcQ_001"
+
+
+def test_mismatched_clip_id_raises_no_query_issued():
+    mock_client, _ = _mock_client()
+    row = _sample_row()
+
+    with pytest.raises(HandSetupsWriteError, match="clip_id"):
+        write_hand_setups([row], clip_id="some_other_clip", project_id="proj", dataset="ds", client=mock_client)
 
     mock_client.query.assert_not_called()
 
@@ -74,7 +97,7 @@ def test_n_rows_single_query():
         for i in range(3)
     ]
 
-    write_hand_setups(rows, project_id="proj", dataset="ds", client=mock_client)
+    write_hand_setups(rows, clip_id="dQw4w9WgXcQ_001", project_id="proj", dataset="ds", client=mock_client)
 
     mock_client.query.assert_called_once()
     args, kwargs = mock_client.query.call_args
@@ -82,7 +105,7 @@ def test_n_rows_single_query():
     assert "hand_setups" in query_str
     params = kwargs["job_config"].query_parameters
     col_count = len(asdict(rows[0]))
-    assert len(params) == 3 * col_count
+    assert len(params) == 3 * col_count + 1  # +1 for replace_key
 
 
 def test_json_parameter_type_and_value():
@@ -97,7 +120,7 @@ def test_json_parameter_type_and_value():
         hand_setup_state=state,
     )
 
-    write_hand_setups([row], project_id="proj", dataset="ds", client=mock_client)
+    write_hand_setups([row], clip_id=row.clip_id, project_id="proj", dataset="ds", client=mock_client)
 
     _, kwargs = mock_client.query.call_args
     params = {p.name: p for p in kwargs["job_config"].query_parameters}
@@ -123,7 +146,7 @@ def test_no_double_encoding_of_hand_setup_state():
         hand_setup_state=state,
     )
 
-    write_hand_setups([row], project_id="proj", dataset="ds", client=mock_client)
+    write_hand_setups([row], clip_id=row.clip_id, project_id="proj", dataset="ds", client=mock_client)
 
     _, kwargs = mock_client.query.call_args
     params = {p.name: p for p in kwargs["job_config"].query_parameters}
@@ -138,37 +161,41 @@ def test_no_double_encoding_of_hand_setup_state():
 
 def test_job_errors_raises():
     mock_client, _ = _mock_client(job_errors=[{"message": "bad schema"}])
+    row = _sample_row()
 
     with pytest.raises(HandSetupsWriteError, match="bad schema"):
-        write_hand_setups([_sample_row()], project_id="proj", dataset="ds", client=mock_client)
+        write_hand_setups([row], clip_id=row.clip_id, project_id="proj", dataset="ds", client=mock_client)
 
 
 def test_google_cloud_error_raises():
     mock_client = MagicMock()
     err = gcloud_exceptions.GoogleCloudError("network error")
     mock_client.query.side_effect = err
+    row = _sample_row()
 
     with pytest.raises(HandSetupsWriteError, match="network error"):
-        write_hand_setups([_sample_row()], project_id="proj", dataset="ds", client=mock_client)
+        write_hand_setups([row], clip_id=row.clip_id, project_id="proj", dataset="ds", client=mock_client)
 
 
 def test_client_none_instantiates_with_project():
     mock_client, _ = _mock_client()
+    row = _sample_row()
 
     with patch("table_talk.hand_setups_writer.bigquery.Client", return_value=mock_client) as mock_cls:
-        write_hand_setups([_sample_row()], project_id="myproj", dataset="ds")
+        write_hand_setups([row], clip_id=row.clip_id, project_id="myproj", dataset="ds")
         mock_cls.assert_called_once_with(project="myproj")
 
 
 def test_client_provided_not_instantiated():
     mock_client, _ = _mock_client()
+    row = _sample_row()
 
     with patch("table_talk.hand_setups_writer.bigquery.Client") as mock_cls:
-        write_hand_setups([_sample_row()], project_id="proj", dataset="ds", client=mock_client)
+        write_hand_setups([row], clip_id=row.clip_id, project_id="proj", dataset="ds", client=mock_client)
         mock_cls.assert_not_called()
 
 
-# --- integration test ---
+# --- integration tests ---
 
 
 @pytest.mark.integration
@@ -238,6 +265,7 @@ def test_write_hand_setups_integration():
                     hand_setup_state=state_2,
                 ),
             ],
+            clip_id=clip_id,
             project_id=project,
             dataset=dataset,
             client=client,
@@ -259,6 +287,30 @@ def test_write_hand_setups_integration():
         assert r1.detected_at is not None
         skew = abs(r1.detected_at.replace(tzinfo=UTC) - datetime.now(UTC))
         assert skew < timedelta(seconds=30)
+
+        # Reprocess with the same clip_id and an equivalent row set: proves
+        # REPLACE semantics — the direct regression test for the
+        # MPBLfM4mwfE_006_004-style duplicate-row incident.
+        write_hand_setups(
+            [
+                HandSetupsRow(
+                    hand_setup_id=hand_setup_id_1,
+                    clip_id=clip_id,
+                    video_id=video_id,
+                    hand_setup_time_seconds=45,
+                    frame_gcs_path=f"gs://bucket/{hand_setup_id_1}.jpg",
+                    hand_setup_state=state_1,
+                ),
+            ],
+            clip_id=clip_id,
+            project_id=project,
+            dataset=dataset,
+            client=client,
+        )
+        results = list(client.query(query, job_config=job_config).result())
+        assert len(results) == 1
+        assert results[0].hand_setup_id == hand_setup_id_1
+        assert results[0].hand_setup_time_seconds == 45
     finally:
         client.query(
             f"DELETE FROM `{hand_setups_ref}` WHERE clip_id = @clip_id",
@@ -272,6 +324,187 @@ def test_write_hand_setups_integration():
                 query_parameters=[bigquery.ScalarQueryParameter("clip_id", "STRING", clip_id)]
             ),
         ).result()
+        client.query(
+            f"DELETE FROM `{videos_ref}` WHERE video_id = @video_id",
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("video_id", "STRING", video_id)]
+            ),
+        ).result()
+
+
+@pytest.mark.integration
+def test_write_hand_setups_integration_shrinkage_drops_stale_row():
+    from table_talk.clip_manifest_writer import ClipManifestRow, write_clip_manifest_rows
+    from table_talk.videos_writer import VideosRow, write_video_row
+
+    project = "table-talk-497020"
+    dataset = "table_talk_dev"
+    uid = uuid.uuid4().hex[:8]
+    video_id = f"test_{uid}"
+    clip_id = f"{video_id}_001"
+
+    client = bigquery.Client(project=project)
+    videos_ref = f"{project}.{dataset}.videos"
+    clip_ref = f"{project}.{dataset}.clip_manifest"
+    hand_setups_ref = f"{project}.{dataset}.hand_setups"
+
+    def _row(ordinal: int) -> HandSetupsRow:
+        hand_setup_id = f"{clip_id}_{ordinal:03d}"
+        return HandSetupsRow(
+            hand_setup_id=hand_setup_id,
+            clip_id=clip_id,
+            video_id=video_id,
+            hand_setup_time_seconds=ordinal * 30,
+            frame_gcs_path=f"gs://bucket/{hand_setup_id}.jpg",
+            hand_setup_state={
+                "hand_setup_time_seconds": ordinal * 30,
+                "total_seat_count": 6,
+                "pot_size_bb": None,
+                "players": [],
+            },
+        )
+
+    query = f"SELECT hand_setup_id FROM `{hand_setups_ref}` WHERE clip_id = @clip_id ORDER BY hand_setup_id"
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("clip_id", "STRING", clip_id)]
+    )
+
+    try:
+        write_video_row(
+            VideosRow(
+                video_id=video_id,
+                source_url=f"https://www.youtube.com/watch?v={video_id}",
+                title="Integration Test Video",
+                duration_seconds=300,
+                gcs_path=f"gs://table-talk-videos/{video_id}.mp4",
+                file_size_bytes=12345,
+            ),
+            project=project,
+            dataset=dataset,
+            client=client,
+        )
+        write_clip_manifest_rows(
+            [ClipManifestRow(clip_id=clip_id, video_id=video_id, clip_start_time=0, clip_end_time=300)],
+            project=project,
+            dataset=dataset,
+            client=client,
+        )
+
+        # First run: 4 hand_setups detected for this clip.
+        write_hand_setups(
+            [_row(i) for i in range(1, 5)],
+            clip_id=clip_id,
+            project_id=project,
+            dataset=dataset,
+            client=client,
+        )
+        results = list(client.query(query, job_config=job_config).result())
+        assert [r.hand_setup_id for r in results] == [f"{clip_id}_{i:03d}" for i in range(1, 5)]
+
+        # Reprocess detects only 3 — this is the scenario clip_id-keying
+        # exists for: per-row keying would silently orphan _004 instead of
+        # removing it.
+        write_hand_setups(
+            [_row(i) for i in range(1, 4)],
+            clip_id=clip_id,
+            project_id=project,
+            dataset=dataset,
+            client=client,
+        )
+        results = list(client.query(query, job_config=job_config).result())
+        assert [r.hand_setup_id for r in results] == [f"{clip_id}_{i:03d}" for i in range(1, 4)]
+        assert f"{clip_id}_004" not in [r.hand_setup_id for r in results]
+    finally:
+        client.query(
+            f"DELETE FROM `{hand_setups_ref}` WHERE clip_id = @clip_id",
+            job_config=job_config,
+        ).result()
+        client.query(
+            f"DELETE FROM `{clip_ref}` WHERE clip_id = @clip_id",
+            job_config=job_config,
+        ).result()
+        client.query(
+            f"DELETE FROM `{videos_ref}` WHERE video_id = @video_id",
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("video_id", "STRING", video_id)]
+            ),
+        ).result()
+
+
+@pytest.mark.integration
+def test_write_hand_setups_integration_zero_row_deletes_existing():
+    from table_talk.clip_manifest_writer import ClipManifestRow, write_clip_manifest_rows
+    from table_talk.videos_writer import VideosRow, write_video_row
+
+    project = "table-talk-497020"
+    dataset = "table_talk_dev"
+    uid = uuid.uuid4().hex[:8]
+    video_id = f"test_{uid}"
+    clip_id = f"{video_id}_001"
+    hand_setup_id = f"{clip_id}_001"
+
+    client = bigquery.Client(project=project)
+    videos_ref = f"{project}.{dataset}.videos"
+    clip_ref = f"{project}.{dataset}.clip_manifest"
+    hand_setups_ref = f"{project}.{dataset}.hand_setups"
+
+    query = f"SELECT * FROM `{hand_setups_ref}` WHERE clip_id = @clip_id"
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("clip_id", "STRING", clip_id)]
+    )
+
+    try:
+        write_video_row(
+            VideosRow(
+                video_id=video_id,
+                source_url=f"https://www.youtube.com/watch?v={video_id}",
+                title="Integration Test Video",
+                duration_seconds=300,
+                gcs_path=f"gs://table-talk-videos/{video_id}.mp4",
+                file_size_bytes=12345,
+            ),
+            project=project,
+            dataset=dataset,
+            client=client,
+        )
+        write_clip_manifest_rows(
+            [ClipManifestRow(clip_id=clip_id, video_id=video_id, clip_start_time=0, clip_end_time=300)],
+            project=project,
+            dataset=dataset,
+            client=client,
+        )
+        write_hand_setups(
+            [
+                HandSetupsRow(
+                    hand_setup_id=hand_setup_id,
+                    clip_id=clip_id,
+                    video_id=video_id,
+                    hand_setup_time_seconds=30,
+                    frame_gcs_path=f"gs://bucket/{hand_setup_id}.jpg",
+                    hand_setup_state={
+                        "hand_setup_time_seconds": 30,
+                        "total_seat_count": 6,
+                        "pot_size_bb": None,
+                        "players": [],
+                    },
+                )
+            ],
+            clip_id=clip_id,
+            project_id=project,
+            dataset=dataset,
+            client=client,
+        )
+        assert len(list(client.query(query, job_config=job_config).result())) == 1
+
+        # This is Phase 3's "No hand setups detected" branch: a reprocess
+        # that concludes with zero hand_setups rows must remove the stale
+        # row set from a prior run, not just skip writing.
+        write_hand_setups([], clip_id=clip_id, project_id=project, dataset=dataset, client=client)
+
+        assert list(client.query(query, job_config=job_config).result()) == []
+    finally:
+        client.query(f"DELETE FROM `{hand_setups_ref}` WHERE clip_id = @clip_id", job_config=job_config).result()
+        client.query(f"DELETE FROM `{clip_ref}` WHERE clip_id = @clip_id", job_config=job_config).result()
         client.query(
             f"DELETE FROM `{videos_ref}` WHERE video_id = @video_id",
             job_config=bigquery.QueryJobConfig(
