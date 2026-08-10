@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,6 +15,7 @@ from table_talk.hand_start_processing import (
     PendingHandSetup,
     _find_pending_hand_setups,
     _hallucination_guard,
+    _transient_status,
     check_preconditions,
     process_hand_setup,
     process_pending_hand_setups,
@@ -45,6 +47,7 @@ _HS = PendingHandSetup(
     hand_setup_state=_hand_setup_state(),
     available_seconds=60,
     raw_lead_gap_seconds=60,
+    consecutive_failures=0,
 )
 
 _CLIP_RESULT_FOUND = {
@@ -174,6 +177,21 @@ def test_hallucination_guard_out_of_window_raises():
 
 
 # ---------------------------------------------------------------------------
+# _transient_status
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("consecutive_failures,expected", [
+    (0, "failed_transient"),
+    (1, "failed_transient"),
+    (2, "failed_parked"),
+    (5, "failed_parked"),
+])
+def test_transient_status_boundary(consecutive_failures, expected):
+    assert _transient_status(consecutive_failures, max_attempts=3) == expected
+
+
+# ---------------------------------------------------------------------------
 # _find_pending_hand_setups
 # ---------------------------------------------------------------------------
 
@@ -225,6 +243,7 @@ def test_find_pending_hand_setups_builds_pending_hand_setup():
     row.hand_setup_state = {"players": []}
     row.available_seconds = 60
     row.raw_lead_gap_seconds = 120
+    row.consecutive_failures = 3
     mock_client = _mock_bq_client(rows=[row])
 
     results = _find_pending_hand_setups("proj", "ds", client=mock_client)
@@ -238,6 +257,7 @@ def test_find_pending_hand_setups_builds_pending_hand_setup():
         hand_setup_state={"players": []},
         available_seconds=60,
         raw_lead_gap_seconds=120,
+        consecutive_failures=3,
     )
 
 
@@ -298,6 +318,7 @@ def test_process_hand_setup_status_message_notes_capped_window():
         hand_setup_state=_hand_setup_state(),
         available_seconds=60,
         raw_lead_gap_seconds=200,  # capped: raw > available
+        consecutive_failures=0,
     )
     with (
         patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
@@ -331,6 +352,7 @@ def test_process_hand_setup_hole_card_no_match_is_none():
         ]),
         available_seconds=60,
         raw_lead_gap_seconds=60,
+        consecutive_failures=0,
     )
     # Gemini's response omits CO — its hole_cards should end up None.
     with (
@@ -372,6 +394,7 @@ def _three_seat_hs():
         ]),
         available_seconds=60,
         raw_lead_gap_seconds=60,
+        consecutive_failures=0,
     )
 
 
@@ -582,6 +605,7 @@ def test_process_hand_setup_complete_skipped():
         hand_setup_state=_hand_setup_state(total_seat_count=1),  # fails precondition
         available_seconds=60,
         raw_lead_gap_seconds=60,
+        consecutive_failures=0,
     )
     with (
         patch("table_talk.hand_start_processing.call_gemini_for_clip") as mock_gemini,
@@ -755,6 +779,109 @@ def test_process_hand_setup_hallucinated_fva_wins_over_no_second_action():
 
 
 # ---------------------------------------------------------------------------
+# process_hand_setup — retry cap (failed_parked)
+# ---------------------------------------------------------------------------
+
+_HS_AT_CAP = replace(_HS, consecutive_failures=2)
+
+
+def test_process_hand_setup_no_first_voluntary_commitment_parks_at_cap():
+    result = {"found": False, "reason": "no_first_voluntary_commitment_found"}
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=result),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_write_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            max_attempts=3,
+        ))
+
+    assert outcome == "failed_parked"
+    mock_write_starts.assert_not_called()
+    attempt_row = mock_write_attempt.call_args[0][0]
+    assert attempt_row.status == "failed_parked"
+    assert "no_first_voluntary_commitment_found" in attempt_row.status_message
+
+
+def test_process_hand_setup_no_second_action_parks_at_cap():
+    result = dict(_CLIP_RESULT_FOUND)
+    result["second_action_timestamp"] = None
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=result),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_write_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            max_attempts=3,
+        ))
+
+    assert outcome == "failed_parked"
+    mock_write_starts.assert_not_called()
+    attempt_row = mock_write_attempt.call_args[0][0]
+    assert attempt_row.status == "failed_parked"
+    assert "no second action" in attempt_row.status_message
+
+
+def test_process_hand_setup_catch_all_exception_parks_at_cap():
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip",
+              side_effect=RuntimeError("boom")),
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            max_attempts=3,
+        ))
+
+    assert outcome == "failed_parked"
+    assert mock_attempt.call_args[0][0].status == "failed_parked"
+
+
+def test_process_hand_setup_gemini_permanent_error_unaffected_by_cap():
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip",
+              side_effect=GeminiPermanentError("malformed JSON")),
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            max_attempts=3,
+        ))
+
+    assert outcome == "failed_permanent"
+    assert mock_attempt.call_args[0][0].status == "failed_permanent"
+
+
+def test_process_hand_setup_complete_unaffected_by_cap():
+    result = {"found": False, "reason": "uncontested"}
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=result),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_write_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            max_attempts=3,
+        ))
+
+    assert outcome == "complete"
+    attempt_row = mock_write_attempt.call_args[0][0]
+    assert attempt_row.status == "complete"
+
+
+# ---------------------------------------------------------------------------
 # process_hand_setup — atomicity invariant
 # ---------------------------------------------------------------------------
 
@@ -794,9 +921,9 @@ def test_process_hand_setup_no_hand_starts_row_unless_complete_with_row():
 
 def test_process_pending_hand_setups_dispatch():
     hand_setups = [
-        PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60),
-        PendingHandSetup("vid_a_001_002", "vid_a_001", "vid_a", 60, {}, 60, 60),
-        PendingHandSetup("vid_b_001_001", "vid_b_001", "vid_b", 0, {}, 60, 60),
+        PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0),
+        PendingHandSetup("vid_a_001_002", "vid_a_001", "vid_a", 60, {}, 60, 60, 0),
+        PendingHandSetup("vid_b_001_001", "vid_b_001", "vid_b", 0, {}, 60, 60, 0),
     ]
     with (
         patch("table_talk.hand_start_processing._find_pending_hand_setups", return_value=hand_setups),
@@ -853,7 +980,7 @@ def test_process_pending_hand_setups_no_video_id_means_no_video_scope():
 
 
 def test_process_pending_hand_setups_download_failure_marks_transient():
-    hand_setups = [PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60)]
+    hand_setups = [PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0)]
     with (
         patch("table_talk.hand_start_processing._find_pending_hand_setups", return_value=hand_setups),
         patch("table_talk.hand_start_processing.download_video", side_effect=Exception("network error")),
@@ -865,15 +992,32 @@ def test_process_pending_hand_setups_download_failure_marks_transient():
     mock_process.assert_not_called()
     assert stats["hand_setups_processed"] == 1
     assert stats["hand_setups_failed_transient"] == 1
+    assert stats["hand_setups_failed_parked"] == 0
     attempt_row = mock_attempt.call_args[0][0]
     assert attempt_row.status == "failed_transient"
     assert "video_download_failed" in attempt_row.status_message
 
 
+def test_process_pending_hand_setups_download_failure_parks_at_cap():
+    hand_setups = [PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 2)]
+    with (
+        patch("table_talk.hand_start_processing._find_pending_hand_setups", return_value=hand_setups),
+        patch("table_talk.hand_start_processing.download_video", side_effect=Exception("network error")),
+        patch("table_talk.hand_start_processing.process_hand_setup", new_callable=AsyncMock) as mock_process,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
+    ):
+        stats = _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep", max_attempts=3))
+
+    mock_process.assert_not_called()
+    assert stats["hand_setups_failed_parked"] == 1
+    attempt_row = mock_attempt.call_args[0][0]
+    assert attempt_row.status == "failed_parked"
+
+
 def test_process_pending_hand_setups_download_not_found_marks_permanent():
     hand_setups = [
-        PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60),
-        PendingHandSetup("vid_a_001_002", "vid_a_001", "vid_a", 60, {}, 60, 60),
+        PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0),
+        PendingHandSetup("vid_a_001_002", "vid_a_001", "vid_a", 60, {}, 60, 60, 0),
     ]
     with (
         patch("table_talk.hand_start_processing._find_pending_hand_setups", return_value=hand_setups),
@@ -1071,3 +1215,195 @@ async def _integration_body():
         # Delete any frame objects from the hand_starts bucket
         for blob in gcs_client.bucket(hand_starts_bucket).list_blobs(prefix=f"{video_id}/"):
             blob.delete()
+
+
+# ---------------------------------------------------------------------------
+# _find_pending_hand_setups — pending-query integration tests (consecutive
+# failure counting, retry cap)
+# ---------------------------------------------------------------------------
+
+_PENDING_QUERY_PROJECT = "table-talk-497020"
+_PENDING_QUERY_DATASET = "table_talk_dev"
+
+
+def _seed_hand_setup_for_pending_query(bq_client):
+    from table_talk._generated.hand_setups_row import HandSetupsRow
+    from table_talk.hand_setups_writer import write_hand_setups
+    from table_talk.videos_writer import VideosRow, write_video_row
+
+    uid = uuid.uuid4().hex[:10]
+    video_id = f"test_p4q_{uid}"
+    clip_id = f"{video_id}_001"
+    hand_setup_id = f"{clip_id}_001"
+
+    write_video_row(
+        VideosRow(
+            video_id=video_id,
+            source_url=f"https://www.youtube.com/watch?v={video_id}",
+            title="Pending query test video",
+            duration_seconds=60,
+            gcs_path=f"gs://fake-bucket/{video_id}.mp4",
+            file_size_bytes=1,
+        ),
+        project=_PENDING_QUERY_PROJECT,
+        dataset=_PENDING_QUERY_DATASET,
+        client=bq_client,
+    )
+    write_hand_setups(
+        [
+            HandSetupsRow(
+                hand_setup_id=hand_setup_id,
+                clip_id=clip_id,
+                video_id=video_id,
+                hand_setup_time_seconds=0,
+                frame_gcs_path=f"gs://fake-bucket/{hand_setup_id}.jpg",
+                hand_setup_state={"players": []},
+            )
+        ],
+        clip_id=clip_id,
+        project_id=_PENDING_QUERY_PROJECT,
+        dataset=_PENDING_QUERY_DATASET,
+        client=bq_client,
+    )
+    return video_id, hand_setup_id
+
+
+def _write_pending_query_attempt(bq_client, hand_setup_id, status):
+    from table_talk._generated.hand_setup_processing_attempts_row import HandSetupProcessingAttemptsRow
+    from table_talk.hand_setup_processing_attempts_writer import write_hand_setup_processing_attempt_row
+
+    write_hand_setup_processing_attempt_row(
+        HandSetupProcessingAttemptsRow(
+            attempt_id=uuid.uuid4().hex,
+            hand_setup_id=hand_setup_id,
+            status=status,
+            status_message=status,
+        ),
+        project=_PENDING_QUERY_PROJECT,
+        dataset=_PENDING_QUERY_DATASET,
+        client=bq_client,
+    )
+
+
+def _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id):
+    from google.cloud import bigquery as bq
+
+    videos_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.videos"
+    hand_setups_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.hand_setups"
+    attempts_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.hand_setup_processing_attempts"
+    for table, col, val in [
+        (attempts_ref, "hand_setup_id", hand_setup_id),
+        (hand_setups_ref, "hand_setup_id", hand_setup_id),
+        (videos_ref, "video_id", video_id),
+    ]:
+        bq_client.query(
+            f"DELETE FROM `{table}` WHERE {col} = @val",
+            job_config=bq.QueryJobConfig(
+                query_parameters=[bq.ScalarQueryParameter("val", "STRING", val)]
+            ),
+        ).result()
+
+
+@pytest.mark.integration
+def test_find_pending_hand_setups_transient_then_complete_then_transient_selected_count_one():
+    """The reset case: failed_transient -> complete -> failed_transient must
+    report consecutive_failures=1, not the lifetime count of 2."""
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    video_id, hand_setup_id = _seed_hand_setup_for_pending_query(bq_client)
+    try:
+        _write_pending_query_attempt(bq_client, hand_setup_id, "failed_transient")
+        _write_pending_query_attempt(bq_client, hand_setup_id, "complete")
+        _write_pending_query_attempt(bq_client, hand_setup_id, "failed_transient")
+
+        results = _find_pending_hand_setups(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_hand_setup_ids=[hand_setup_id], client=bq_client,
+        )
+        assert len(results) == 1, f"Expected entity to be selected, got {results}"
+        assert results[0].consecutive_failures == 1, (
+            f"Expected consecutive_failures=1 (reset case), got {results[0].consecutive_failures}"
+        )
+    finally:
+        _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_setups_no_attempts_selected_zero_count():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    video_id, hand_setup_id = _seed_hand_setup_for_pending_query(bq_client)
+    try:
+        results = _find_pending_hand_setups(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_hand_setup_ids=[hand_setup_id], client=bq_client,
+        )
+        assert len(results) == 1
+        assert results[0].consecutive_failures == 0
+    finally:
+        _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_setups_three_transient_selected_count_three():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    video_id, hand_setup_id = _seed_hand_setup_for_pending_query(bq_client)
+    try:
+        for _ in range(3):
+            _write_pending_query_attempt(bq_client, hand_setup_id, "failed_transient")
+
+        results = _find_pending_hand_setups(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_hand_setup_ids=[hand_setup_id], client=bq_client,
+        )
+        assert len(results) == 1
+        assert results[0].consecutive_failures == 3
+    finally:
+        _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_setups_complete_then_transient_then_complete_not_selected():
+    """Mirrors the real MPBLfM4mwfE_006_004 shape: a failure sandwiched
+    between two successes must not carry forward and must not park the
+    entity — the latest status is 'complete', so it's excluded entirely."""
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    video_id, hand_setup_id = _seed_hand_setup_for_pending_query(bq_client)
+    try:
+        _write_pending_query_attempt(bq_client, hand_setup_id, "complete")
+        _write_pending_query_attempt(bq_client, hand_setup_id, "failed_transient")
+        _write_pending_query_attempt(bq_client, hand_setup_id, "complete")
+
+        results = _find_pending_hand_setups(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_hand_setup_ids=[hand_setup_id], client=bq_client,
+        )
+        assert results == [], f"Expected entity to be excluded, got {results}"
+    finally:
+        _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_setups_latest_parked_not_selected():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    video_id, hand_setup_id = _seed_hand_setup_for_pending_query(bq_client)
+    try:
+        _write_pending_query_attempt(bq_client, hand_setup_id, "failed_transient")
+        _write_pending_query_attempt(bq_client, hand_setup_id, "failed_transient")
+        _write_pending_query_attempt(bq_client, hand_setup_id, "failed_parked")
+
+        results = _find_pending_hand_setups(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_hand_setup_ids=[hand_setup_id], client=bq_client,
+        )
+        assert results == [], f"Expected parked entity to be excluded, got {results}"
+    finally:
+        _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id)

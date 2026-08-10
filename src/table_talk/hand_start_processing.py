@@ -46,6 +46,7 @@ class PendingHandSetup:
     hand_setup_state: dict
     available_seconds: int
     raw_lead_gap_seconds: int
+    consecutive_failures: int
 
 
 def _find_pending_hand_setups(
@@ -60,7 +61,7 @@ def _find_pending_hand_setups(
 
     A hand_setup is pending if it has never been attempted or its latest
     attempt status is 'failed_transient'. hand_setups with 'complete',
-    'complete_skipped', or 'failed_permanent' are excluded.
+    'complete_skipped', 'failed_permanent', or 'failed_parked' are excluded.
 
     Production callers leave the scope params as None. Integration tests pass
     uuid-scoped lists to constrain the blast radius per CLAUDE.md.
@@ -101,19 +102,32 @@ def _find_pending_hand_setups(
           FROM `{project_id}.{dataset}.hand_setups` hs
           INNER JOIN `{project_id}.{dataset}.videos` v USING (video_id)
         ),
-        latest_attempts AS (
+        attempt_marks AS (
           SELECT
-            hand_setup_id, status,
-            ROW_NUMBER() OVER (PARTITION BY hand_setup_id ORDER BY attempted_at DESC) AS rn
+            hand_setup_id, status, attempted_at,
+            MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL)) OVER (
+              PARTITION BY hand_setup_id
+            ) AS last_non_failure_at
           FROM `{project_id}.{dataset}.hand_setup_processing_attempts`
+        ),
+        attempt_state AS (
+          SELECT
+            hand_setup_id,
+            ARRAY_AGG(status ORDER BY attempted_at DESC LIMIT 1)[OFFSET(0)] AS latest_status,
+            COUNTIF(
+              status = 'failed_transient'
+              AND (last_non_failure_at IS NULL OR attempted_at > last_non_failure_at)
+            ) AS consecutive_failures
+          FROM attempt_marks
+          GROUP BY hand_setup_id
         )
         SELECT
           w.*,
-          LEAST(w.raw_lead_gap_seconds, @max_available_seconds) AS available_seconds
+          LEAST(w.raw_lead_gap_seconds, @max_available_seconds) AS available_seconds,
+          COALESCE(a.consecutive_failures, 0) AS consecutive_failures
         FROM windowed w
-        LEFT JOIN latest_attempts la
-          ON w.hand_setup_id = la.hand_setup_id AND la.rn = 1
-        WHERE (la.status IS NULL OR la.status = 'failed_transient')
+        LEFT JOIN attempt_state a USING (hand_setup_id)
+        WHERE (a.latest_status IS NULL OR a.latest_status = 'failed_transient')
           {video_filter}
           {hand_setup_filter}
     """
@@ -128,6 +142,7 @@ def _find_pending_hand_setups(
             hand_setup_state=row.hand_setup_state,
             available_seconds=row.available_seconds,
             raw_lead_gap_seconds=row.raw_lead_gap_seconds,
+            consecutive_failures=row.consecutive_failures,
         )
         for row in rows
     ]
@@ -189,6 +204,12 @@ def _write_attempt(
     )
 
 
+def _transient_status(consecutive_failures: int, max_attempts: int) -> str:
+    """Which status to write for a transient failure. The current failure is not
+    yet counted in consecutive_failures, hence the +1."""
+    return "failed_parked" if consecutive_failures + 1 >= max_attempts else "failed_transient"
+
+
 async def process_hand_setup(
     hs: PendingHandSetup,
     local_video_path: str,
@@ -198,6 +219,8 @@ async def process_hand_setup(
     hand_starts_bucket: str,
     identify_hand_start_prompt: str,
     extract_hole_cards_prompt: str,
+    *,
+    max_attempts: int = 3,
 ) -> str:
     """Process one hand_setup end-to-end. Returns the outcome status string.
 
@@ -233,17 +256,19 @@ async def process_hand_setup(
                 write_hand_starts([], hand_setup_id=hs.hand_setup_id, project_id=project_id, dataset=dataset)
                 _write_attempt(hs.hand_setup_id, "complete", status_message, project_id=project_id, dataset=dataset)
                 return "complete"
-            status_message = f"failed_transient: {clip_result.get('reason', 'not found')}"
-            _write_attempt(hs.hand_setup_id, "failed_transient", status_message, project_id=project_id, dataset=dataset)
-            return "failed_transient"
+            status = _transient_status(hs.consecutive_failures, max_attempts)
+            status_message = f"{status}: {clip_result.get('reason', 'not found')}"
+            _write_attempt(hs.hand_setup_id, status, status_message, project_id=project_id, dataset=dataset)
+            return status
 
         fva_time_seconds = parse_timestamp(clip_result["timestamp"])
         _hallucination_guard(fva_time_seconds, hs.hand_setup_time_seconds, hs.available_seconds)
 
         if clip_result.get("second_action_timestamp") is None:
-            status_message = "failed_transient: no second action observed within window"
-            _write_attempt(hs.hand_setup_id, "failed_transient", status_message, project_id=project_id, dataset=dataset)
-            return "failed_transient"
+            status = _transient_status(hs.consecutive_failures, max_attempts)
+            status_message = f"{status}: no second action observed within window"
+            _write_attempt(hs.hand_setup_id, status, status_message, project_id=project_id, dataset=dataset)
+            return status
 
         second_action_time_seconds = parse_timestamp(clip_result["second_action_timestamp"])
 
@@ -392,8 +417,9 @@ async def process_hand_setup(
         _write_attempt(hs.hand_setup_id, "failed_permanent", str(exc)[:500], project_id=project_id, dataset=dataset)
         return "failed_permanent"
     except Exception as exc:
-        _write_attempt(hs.hand_setup_id, "failed_transient", str(exc)[:500], project_id=project_id, dataset=dataset)
-        return "failed_transient"
+        status = _transient_status(hs.consecutive_failures, max_attempts)
+        _write_attempt(hs.hand_setup_id, status, str(exc)[:500], project_id=project_id, dataset=dataset)
+        return status
 
 
 async def process_pending_hand_setups(
@@ -407,6 +433,7 @@ async def process_pending_hand_setups(
     video_id: str | None = None,
     only_hand_setup_ids: list[str] | None = None,
     max_concurrent: int = 4,
+    max_attempts: int = 3,
     bq_client: bigquery.Client | None = None,
     gcs_client=None,
 ) -> dict[str, int]:
@@ -433,6 +460,7 @@ async def process_pending_hand_setups(
         "hand_setups_complete_skipped": 0,
         "hand_setups_failed_transient": 0,
         "hand_setups_failed_permanent": 0,
+        "hand_setups_failed_parked": 0,
     }
 
     for vid, video_hand_setups in by_video.items():
@@ -463,15 +491,16 @@ async def process_pending_hand_setups(
             except Exception as exc:
                 print(f"Failed to download video {vid}: {exc}", file=sys.stderr)
                 for hs in video_hand_setups:
+                    status = _transient_status(hs.consecutive_failures, max_attempts)
                     _write_attempt(
                         hs.hand_setup_id,
-                        "failed_transient",
+                        status,
                         f"video_download_failed: {str(exc)[:400]}",
                         project_id=project_id,
                         dataset=dataset,
                     )
                     stats["hand_setups_processed"] += 1
-                    stats["hand_setups_failed_transient"] += 1
+                    stats[f"hand_setups_{status}"] += 1
                 continue
 
             sem = asyncio.Semaphore(max_concurrent)
@@ -487,6 +516,7 @@ async def process_pending_hand_setups(
                         hand_starts_bucket,
                         identify_hand_start_prompt,
                         extract_hole_cards_prompt,
+                        max_attempts=max_attempts,
                     )
 
             tasks = [_run_hand_setup(hs) for hs in video_hand_setups]

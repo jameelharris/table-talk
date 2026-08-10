@@ -18,6 +18,7 @@ VALID_STATUSES: frozenset[str] = frozenset({
     "complete",
     "failed_transient",
     "failed_permanent",
+    "failed_parked",
 })
 
 

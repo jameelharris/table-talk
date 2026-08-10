@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import uuid
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
@@ -12,22 +13,24 @@ from table_talk.frame_extractor import FrameExtractionError
 from table_talk.gemini_caller import GeminiPermanentError, GeminiTransientError
 from table_talk.videos_downloader import DownloadPermanentError
 from table_talk.hand_setup_processing import (
+    PendingClip,
     _find_pending_clips,
+    _transient_status,
     process_clip,
     process_pending_clips,
 )
-from table_talk._generated.clip_manifest_row import ClipManifestRow
 from table_talk._generated.clip_processing_attempts_row import ClipProcessingAttemptsRow
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
 
-_CLIP = ClipManifestRow(
+_CLIP = PendingClip(
     clip_id="dQw4w9WgXcQ_001",
     video_id="dQw4w9WgXcQ",
     clip_start_time=0,
     clip_end_time=240,
+    consecutive_failures=0,
 )
 
 _PLAYER_INFO = {
@@ -124,6 +127,21 @@ def test_find_pending_clips_both_filters():
     job_config = mock_client.query.call_args[1]["job_config"]
     param_names = {p.name for p in job_config.query_parameters}
     assert param_names == {"only_clip_ids", "only_video_ids"}
+
+
+# ---------------------------------------------------------------------------
+# _transient_status
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("consecutive_failures,expected", [
+    (0, "failed_transient"),
+    (1, "failed_transient"),
+    (2, "failed_parked"),
+    (5, "failed_parked"),
+])
+def test_transient_status_boundary(consecutive_failures, expected):
+    assert _transient_status(consecutive_failures, max_attempts=3) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +332,64 @@ def test_process_clip_gemini_frame_error_no_inserts_no_uploads():
 
 
 # ---------------------------------------------------------------------------
+# process_clip — retry cap (failed_parked)
+# ---------------------------------------------------------------------------
+
+_CLIP_AT_CAP = replace(_CLIP, consecutive_failures=2)
+
+
+def test_process_clip_catch_all_exception_parks_at_cap():
+    with (
+        patch("table_talk.hand_setup_processing.call_gemini_for_clip",
+              side_effect=RuntimeError("boom")),
+        patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
+    ):
+        outcome = _run(process_clip(
+            _CLIP_AT_CAP, "/tmp/video.mp4", "proj", "ds",
+            "hand-setups-bucket", "videos-bucket",
+            "identify prompt", "extract prompt",
+            max_attempts=3,
+        ))
+
+    assert outcome == "failed_parked"
+    assert mock_attempt.call_args[0][0].status == "failed_parked"
+
+
+def test_process_clip_gemini_permanent_error_unaffected_by_cap():
+    with (
+        patch("table_talk.hand_setup_processing.call_gemini_for_clip",
+              side_effect=GeminiPermanentError("safety block")),
+        patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
+    ):
+        outcome = _run(process_clip(
+            _CLIP_AT_CAP, "/tmp/video.mp4", "proj", "ds",
+            "hand-setups-bucket", "videos-bucket",
+            "identify prompt", "extract prompt",
+            max_attempts=3,
+        ))
+
+    assert outcome == "failed_permanent"
+    assert mock_attempt.call_args[0][0].status == "failed_permanent"
+
+
+def test_process_clip_complete_unaffected_by_cap():
+    with (
+        patch("table_talk.hand_setup_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_EMPTY),
+        patch("table_talk.hand_setup_processing.write_hand_setups") as mock_write_setups,
+        patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
+    ):
+        outcome = _run(process_clip(
+            _CLIP_AT_CAP, "/tmp/video.mp4", "proj", "ds",
+            "hand-setups-bucket", "videos-bucket",
+            "identify prompt", "extract prompt",
+            max_attempts=3,
+        ))
+
+    assert outcome == "complete"
+    assert mock_attempt.call_args[0][0].status == "complete"
+
+
+# ---------------------------------------------------------------------------
 # process_clip — seat enrichment applied before writing HandSetupsRow
 # ---------------------------------------------------------------------------
 
@@ -367,9 +443,9 @@ def test_process_clip_seat_enrichment_applied():
 
 def test_process_pending_clips_dispatch():
     clips = [
-        ClipManifestRow("vid_a_001", "vid_a", 0, 240),
-        ClipManifestRow("vid_a_002", "vid_a", 240, 480),
-        ClipManifestRow("vid_b_001", "vid_b", 0, 240),
+        PendingClip("vid_a_001", "vid_a", 0, 240, 0),
+        PendingClip("vid_a_002", "vid_a", 240, 480, 0),
+        PendingClip("vid_b_001", "vid_b", 0, 240, 0),
     ]
 
     with (
@@ -414,7 +490,7 @@ def test_process_pending_clips_scope_params_propagated():
 
 
 def test_process_pending_clips_download_failure_marks_clips_failed():
-    clips = [ClipManifestRow("vid_a_001", "vid_a", 0, 240)]
+    clips = [PendingClip("vid_a_001", "vid_a", 0, 240, 0)]
 
     with (
         patch("table_talk.hand_setup_processing._find_pending_clips", return_value=clips),
@@ -430,15 +506,36 @@ def test_process_pending_clips_download_failure_marks_clips_failed():
     mock_process.assert_not_called()
     assert stats["clips_processed"] == 1
     assert stats["clips_failed_transient"] == 1
+    assert stats["clips_failed_parked"] == 0
     attempt_row = mock_attempt.call_args[0][0]
     assert attempt_row.status == "failed_transient"
     assert "video_download_failed" in attempt_row.status_message
 
 
+def test_process_pending_clips_download_failure_parks_at_cap():
+    clips = [PendingClip("vid_a_001", "vid_a", 0, 240, 2)]
+
+    with (
+        patch("table_talk.hand_setup_processing._find_pending_clips", return_value=clips),
+        patch("table_talk.hand_setup_processing.download_video",
+              side_effect=Exception("network error")),
+        patch("table_talk.hand_setup_processing.process_clip", new_callable=AsyncMock) as mock_process,
+        patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
+    ):
+        stats = _run(process_pending_clips(
+            "proj", "ds", "vb", "hb", "ip", "ep", max_attempts=3,
+        ))
+
+    mock_process.assert_not_called()
+    assert stats["clips_failed_parked"] == 1
+    attempt_row = mock_attempt.call_args[0][0]
+    assert attempt_row.status == "failed_parked"
+
+
 def test_process_pending_clips_download_not_found_marks_clips_permanent():
     clips = [
-        ClipManifestRow("vid_a_001", "vid_a", 0, 240),
-        ClipManifestRow("vid_a_002", "vid_a", 240, 480),
+        PendingClip("vid_a_001", "vid_a", 0, 240, 0),
+        PendingClip("vid_a_002", "vid_a", 240, 480, 0),
     ]
     with (
         patch("table_talk.hand_setup_processing._find_pending_clips", return_value=clips),
@@ -607,3 +704,160 @@ async def _integration_body():
         # Delete any frame objects from hand_setups bucket
         for blob in gcs_client.bucket(hand_setups_bucket).list_blobs(prefix=f"{video_id}/"):
             blob.delete()
+
+
+# ---------------------------------------------------------------------------
+# _find_pending_clips — pending-query integration tests (consecutive failure
+# counting, retry cap)
+# ---------------------------------------------------------------------------
+
+_PENDING_QUERY_PROJECT = "table-talk-497020"
+_PENDING_QUERY_DATASET = "table_talk_dev"
+
+
+def _seed_clip_for_pending_query(bq_client):
+    from table_talk.clip_manifest_writer import ClipManifestRow as CMRow, write_clip_manifest_rows
+
+    uid = uuid.uuid4().hex[:10]
+    video_id = f"test_p3q_{uid}"
+    clip_id = f"{video_id}_001"
+
+    write_clip_manifest_rows(
+        [CMRow(clip_id=clip_id, video_id=video_id, clip_start_time=0, clip_end_time=240)],
+        project=_PENDING_QUERY_PROJECT,
+        dataset=_PENDING_QUERY_DATASET,
+        client=bq_client,
+    )
+    return clip_id
+
+
+def _write_pending_query_clip_attempt(bq_client, clip_id, status):
+    from table_talk._generated.clip_processing_attempts_row import ClipProcessingAttemptsRow
+    from table_talk.clip_processing_attempts_writer import write_clip_processing_attempt_row
+
+    write_clip_processing_attempt_row(
+        ClipProcessingAttemptsRow(
+            clip_id=clip_id,
+            status=status,
+            status_message=status,
+        ),
+        project=_PENDING_QUERY_PROJECT,
+        dataset=_PENDING_QUERY_DATASET,
+        client=bq_client,
+    )
+
+
+def _cleanup_pending_query_clip_fixture(bq_client, clip_id):
+    from google.cloud import bigquery as bq
+
+    clip_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.clip_manifest"
+    attempts_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.clip_processing_attempts"
+    for table in (attempts_ref, clip_ref):
+        bq_client.query(
+            f"DELETE FROM `{table}` WHERE clip_id = @val",
+            job_config=bq.QueryJobConfig(
+                query_parameters=[bq.ScalarQueryParameter("val", "STRING", clip_id)]
+            ),
+        ).result()
+
+
+@pytest.mark.integration
+def test_find_pending_clips_no_attempts_selected_zero_count():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    clip_id = _seed_clip_for_pending_query(bq_client)
+    try:
+        results = _find_pending_clips(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_clip_ids=[clip_id], client=bq_client,
+        )
+        assert len(results) == 1
+        assert results[0].consecutive_failures == 0
+    finally:
+        _cleanup_pending_query_clip_fixture(bq_client, clip_id)
+
+
+@pytest.mark.integration
+def test_find_pending_clips_three_transient_selected_count_three():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    clip_id = _seed_clip_for_pending_query(bq_client)
+    try:
+        for _ in range(3):
+            _write_pending_query_clip_attempt(bq_client, clip_id, "failed_transient")
+
+        results = _find_pending_clips(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_clip_ids=[clip_id], client=bq_client,
+        )
+        assert len(results) == 1
+        assert results[0].consecutive_failures == 3
+    finally:
+        _cleanup_pending_query_clip_fixture(bq_client, clip_id)
+
+
+@pytest.mark.integration
+def test_find_pending_clips_complete_then_transient_then_complete_not_selected():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    clip_id = _seed_clip_for_pending_query(bq_client)
+    try:
+        _write_pending_query_clip_attempt(bq_client, clip_id, "complete")
+        _write_pending_query_clip_attempt(bq_client, clip_id, "failed_transient")
+        _write_pending_query_clip_attempt(bq_client, clip_id, "complete")
+
+        results = _find_pending_clips(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_clip_ids=[clip_id], client=bq_client,
+        )
+        assert results == [], f"Expected clip to be excluded, got {results}"
+    finally:
+        _cleanup_pending_query_clip_fixture(bq_client, clip_id)
+
+
+@pytest.mark.integration
+def test_find_pending_clips_transient_then_complete_then_transient_selected_count_one():
+    """The reset case: failed_transient -> complete -> failed_transient must
+    report consecutive_failures=1, not the lifetime count of 2."""
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    clip_id = _seed_clip_for_pending_query(bq_client)
+    try:
+        _write_pending_query_clip_attempt(bq_client, clip_id, "failed_transient")
+        _write_pending_query_clip_attempt(bq_client, clip_id, "complete")
+        _write_pending_query_clip_attempt(bq_client, clip_id, "failed_transient")
+
+        results = _find_pending_clips(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_clip_ids=[clip_id], client=bq_client,
+        )
+        assert len(results) == 1, f"Expected clip to be selected, got {results}"
+        assert results[0].consecutive_failures == 1, (
+            f"Expected consecutive_failures=1 (reset case), got {results[0].consecutive_failures}"
+        )
+    finally:
+        _cleanup_pending_query_clip_fixture(bq_client, clip_id)
+
+
+@pytest.mark.integration
+def test_find_pending_clips_latest_parked_not_selected():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    clip_id = _seed_clip_for_pending_query(bq_client)
+    try:
+        _write_pending_query_clip_attempt(bq_client, clip_id, "failed_transient")
+        _write_pending_query_clip_attempt(bq_client, clip_id, "failed_transient")
+        _write_pending_query_clip_attempt(bq_client, clip_id, "failed_parked")
+
+        results = _find_pending_clips(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_clip_ids=[clip_id], client=bq_client,
+        )
+        assert results == [], f"Expected parked clip to be excluded, got {results}"
+    finally:
+        _cleanup_pending_query_clip_fixture(bq_client, clip_id)

@@ -83,6 +83,10 @@ def test_all_valid_statuses_accepted(status):
     mock_client.query.assert_called_once()
 
 
+def test_failed_parked_is_a_valid_status():
+    assert "failed_parked" in VALID_STATUSES
+
+
 def test_job_errors_raises():
     mock_client, _ = _mock_client(job_errors=[{"message": "bad schema"}])
 

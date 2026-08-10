@@ -36,6 +36,7 @@ def main() -> None:
     pc_parser.add_argument("--videos-bucket", required=True)
     pc_parser.add_argument("--hand-setups-bucket", required=True)
     pc_parser.add_argument("--max-concurrent", type=int, default=4)
+    pc_parser.add_argument("--max-attempts", type=int, default=3)
     pc_parser.add_argument("--video-id")
 
     phs_parser = subparsers.add_parser("process-hand-setups")
@@ -45,6 +46,7 @@ def main() -> None:
     phs_parser.add_argument("--hand-starts-bucket", required=True)
     phs_parser.add_argument("--video-id")
     phs_parser.add_argument("--max-concurrent", type=int, default=4)
+    phs_parser.add_argument("--max-attempts", type=int, default=3)
 
     args = parser.parse_args()
 
@@ -111,6 +113,7 @@ def main() -> None:
                 extract_player_info_prompt=extract_player_info_prompt,
                 max_concurrent=args.max_concurrent,
                 only_video_ids=only_video_ids,
+                max_attempts=args.max_attempts,
             )
         )
         for key, value in stats.items():
@@ -147,6 +150,7 @@ def main() -> None:
                 extract_hole_cards_prompt=extract_hole_cards_prompt,
                 video_id=args.video_id,
                 max_concurrent=args.max_concurrent,
+                max_attempts=args.max_attempts,
             )
         )
         for key, value in stats.items():

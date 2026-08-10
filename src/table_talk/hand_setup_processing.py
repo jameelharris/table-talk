@@ -12,10 +12,10 @@ import asyncio
 import os
 import sys
 import tempfile
+from dataclasses import dataclass
 
 from google.cloud import bigquery
 
-from ._generated.clip_manifest_row import ClipManifestRow
 from ._generated.clip_processing_attempts_row import ClipProcessingAttemptsRow
 from ._generated.hand_setups_row import HandSetupsRow
 from .clip_processing_attempts_writer import write_clip_processing_attempt_row
@@ -28,6 +28,15 @@ from .timestamp_utils import parse_timestamp
 from .videos_downloader import DownloadPermanentError, download_video
 
 
+@dataclass(frozen=True)
+class PendingClip:
+    clip_id: str
+    video_id: str
+    clip_start_time: int
+    clip_end_time: int
+    consecutive_failures: int
+
+
 def _find_pending_clips(
     project_id: str,
     dataset: str,
@@ -35,12 +44,12 @@ def _find_pending_clips(
     only_video_ids: list[str] | None = None,
     *,
     client: bigquery.Client | None = None,
-) -> list[ClipManifestRow]:
-    """Return clip_manifest rows pending processing.
+) -> list[PendingClip]:
+    """Return pending clips (as PendingClip) awaiting processing.
 
     A clip is pending if it has never been attempted or its latest attempt
-    status is 'failed_transient'. Clips with 'complete' or 'failed_permanent'
-    are excluded.
+    status is 'failed_transient'. Clips with 'complete', 'failed_permanent',
+    or 'failed_parked' are excluded.
 
     Production callers leave the scope params as None. Integration tests pass
     uuid-scoped lists to constrain the blast radius per CLAUDE.md.
@@ -59,15 +68,29 @@ def _find_pending_clips(
         params.append(bigquery.ArrayQueryParameter("only_video_ids", "STRING", only_video_ids))
 
     query = f"""
-        WITH latest_attempts AS (
-          SELECT clip_id, status,
-                 ROW_NUMBER() OVER (PARTITION BY clip_id ORDER BY attempted_at DESC) AS rn
+        WITH attempt_marks AS (
+          SELECT
+            clip_id, status, attempted_at,
+            MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL)) OVER (
+              PARTITION BY clip_id
+            ) AS last_non_failure_at
           FROM `{project_id}.{dataset}.clip_processing_attempts`
+        ),
+        attempt_state AS (
+          SELECT
+            clip_id,
+            ARRAY_AGG(status ORDER BY attempted_at DESC LIMIT 1)[OFFSET(0)] AS latest_status,
+            COUNTIF(
+              status = 'failed_transient'
+              AND (last_non_failure_at IS NULL OR attempted_at > last_non_failure_at)
+            ) AS consecutive_failures
+          FROM attempt_marks
+          GROUP BY clip_id
         )
-        SELECT m.*
+        SELECT m.*, COALESCE(a.consecutive_failures, 0) AS consecutive_failures
         FROM `{project_id}.{dataset}.clip_manifest` m
-        LEFT JOIN (SELECT * FROM latest_attempts WHERE rn = 1) a USING (clip_id)
-        WHERE (a.status IS NULL OR a.status = 'failed_transient')
+        LEFT JOIN attempt_state a USING (clip_id)
+        WHERE (a.latest_status IS NULL OR a.latest_status = 'failed_transient')
           {clip_filter}
           {video_filter}
         ORDER BY m.video_id, m.clip_start_time
@@ -75,18 +98,25 @@ def _find_pending_clips(
     job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
     rows = list(client.query(query, job_config=job_config).result())
     return [
-        ClipManifestRow(
+        PendingClip(
             clip_id=row.clip_id,
             video_id=row.video_id,
             clip_start_time=row.clip_start_time,
             clip_end_time=row.clip_end_time,
+            consecutive_failures=row.consecutive_failures,
         )
         for row in rows
     ]
 
 
+def _transient_status(consecutive_failures: int, max_attempts: int) -> str:
+    """Which status to write for a transient failure. The current failure is not
+    yet counted in consecutive_failures, hence the +1."""
+    return "failed_parked" if consecutive_failures + 1 >= max_attempts else "failed_transient"
+
+
 async def process_clip(
-    clip: ClipManifestRow,
+    clip: PendingClip,
     local_video_path: str,
     project_id: str,
     dataset: str,
@@ -94,6 +124,8 @@ async def process_clip(
     videos_bucket: str,
     identify_hand_prompt: str,
     extract_player_info_prompt: str,
+    *,
+    max_attempts: int = 3,
 ) -> str:
     """Process one clip end-to-end. Returns the outcome status string.
 
@@ -207,16 +239,17 @@ async def process_clip(
         )
         return "failed_permanent"
     except Exception as exc:
+        status = _transient_status(clip.consecutive_failures, max_attempts)
         write_clip_processing_attempt_row(
             ClipProcessingAttemptsRow(
                 clip_id=clip.clip_id,
-                status="failed_transient",
+                status=status,
                 status_message=str(exc)[:500],
             ),
             project=project_id,
             dataset=dataset,
         )
-        return "failed_transient"
+        return status
 
 
 async def process_pending_clips(
@@ -229,6 +262,8 @@ async def process_pending_clips(
     max_concurrent: int = 4,
     only_clip_ids: list[str] | None = None,
     only_video_ids: list[str] | None = None,
+    *,
+    max_attempts: int = 3,
 ) -> dict[str, int]:
     """Process all pending clips. Returns summary stats.
 
@@ -239,7 +274,7 @@ async def process_pending_clips(
         project_id, dataset, only_clip_ids=only_clip_ids, only_video_ids=only_video_ids
     )
 
-    by_video: dict[str, list[ClipManifestRow]] = {}
+    by_video: dict[str, list[PendingClip]] = {}
     for clip in clips:
         by_video.setdefault(clip.video_id, []).append(clip)
 
@@ -248,6 +283,7 @@ async def process_pending_clips(
         "clips_complete": 0,
         "clips_failed_transient": 0,
         "clips_failed_permanent": 0,
+        "clips_failed_parked": 0,
     }
 
     for video_id, video_clips in by_video.items():
@@ -279,22 +315,23 @@ async def process_pending_clips(
             except Exception as exc:
                 print(f"Failed to download video {video_id}: {exc}", file=sys.stderr)
                 for clip in video_clips:
+                    status = _transient_status(clip.consecutive_failures, max_attempts)
                     write_clip_processing_attempt_row(
                         ClipProcessingAttemptsRow(
                             clip_id=clip.clip_id,
-                            status="failed_transient",
+                            status=status,
                             status_message=f"video_download_failed: {str(exc)[:400]}",
                         ),
                         project=project_id,
                         dataset=dataset,
                     )
                     stats["clips_processed"] += 1
-                    stats["clips_failed_transient"] += 1
+                    stats[f"clips_{status}"] += 1
                 continue
 
             sem = asyncio.Semaphore(max_concurrent)
 
-            async def _run_clip(c: ClipManifestRow) -> str:
+            async def _run_clip(c: PendingClip) -> str:
                 async with sem:
                     return await process_clip(
                         c,
@@ -305,6 +342,7 @@ async def process_pending_clips(
                         videos_bucket,
                         identify_hand_prompt,
                         extract_player_info_prompt,
+                        max_attempts=max_attempts,
                     )
 
             clip_tasks = [_run_clip(c) for c in video_clips]
