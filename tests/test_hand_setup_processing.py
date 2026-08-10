@@ -153,9 +153,9 @@ def test_process_clip_happy_path():
     call_order = []
 
     with (
-        patch("table_talk.hand_setup_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_ONE_SETUP),
+        patch("table_talk.hand_setup_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_ONE_SETUP) as mock_call_clip,
         patch("table_talk.hand_setup_processing.extract_frame", side_effect=_fake_extract_frame),
-        patch("table_talk.hand_setup_processing.call_gemini_for_frame", return_value=_PLAYER_INFO),
+        patch("table_talk.hand_setup_processing.call_gemini_for_frame", return_value=_PLAYER_INFO) as mock_call_frame,
         patch("table_talk.hand_setup_processing.upload_frame", side_effect=lambda *a, **k: call_order.append("upload")),
         patch("table_talk.hand_setup_processing.write_hand_setups", side_effect=lambda *a, **k: call_order.append("write_setups")) as mock_write_setups,
         patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row", side_effect=lambda *a, **k: call_order.append("write_attempt")) as mock_write_attempt,
@@ -169,6 +169,9 @@ def test_process_clip_happy_path():
     assert outcome == "complete"
     # Upload before batch insert, attempt row last
     assert call_order == ["upload", "write_setups", "write_attempt"]
+
+    assert mock_call_clip.call_args.kwargs["user_text"] == "Identify all new hand setups in this video."
+    assert mock_call_frame.call_args.kwargs["user_text"] == "Extract the setup observations from this frame."
 
     # Attempt row has correct status
     attempt_row = mock_write_attempt.call_args[0][0]

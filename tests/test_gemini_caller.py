@@ -19,6 +19,7 @@ PROJECT = "test-project"
 PROMPT = "You are a poker analyst."
 VIDEO_URI = "gs://bucket/video.mp4"
 FRAME_BYTES = b"\xff\xd8\xff" + b"\x00" * 20  # fake bytes — mocked, not parsed
+USER_TEXT = "Do the thing."
 
 
 def _make_response(text: str, finish_reason=types.FinishReason.STOP):
@@ -50,6 +51,7 @@ def test_clip_request_structure():
             end_offset_seconds=50,
             project_id=PROJECT,
             location="us-central1",
+            user_text=USER_TEXT,
         )
 
     mock_cls.assert_called_once_with(vertexai=True, project=PROJECT, location="us-central1")
@@ -68,7 +70,7 @@ def test_clip_request_structure():
     assert p0.video_metadata.end_offset == "50s"
     assert p0.video_metadata.fps == 1.0
 
-    assert contents.parts[1].text == "Identify all new hand setups in this video."
+    assert contents.parts[1].text == USER_TEXT
 
 
 def test_frame_request_structure():
@@ -82,6 +84,7 @@ def test_frame_request_structure():
             project_id=PROJECT,
             location="us-east1",
             mime_type="image/png",
+            user_text=USER_TEXT,
         )
 
     mock_cls.assert_called_once_with(vertexai=True, project=PROJECT, location="us-east1")
@@ -92,7 +95,7 @@ def test_frame_request_structure():
     contents = kw["contents"]
     assert contents.parts[0].inline_data.data == custom_bytes
     assert contents.parts[0].inline_data.mime_type == "image/png"
-    assert contents.parts[1].text == "Extract the setup observations from this frame."
+    assert contents.parts[1].text == USER_TEXT
 
     assert kw["config"].media_resolution == types.MediaResolution.MEDIA_RESOLUTION_HIGH
 
@@ -133,6 +136,22 @@ def test_frame_user_text_override():
     assert contents.parts[1].text == "Extract hole cards for all eligible players from this frame."
 
 
+def test_clip_user_text_required():
+    with pytest.raises(TypeError):
+        call_gemini_for_clip(
+            prompt=PROMPT,
+            video_gcs_uri=VIDEO_URI,
+            start_offset_seconds=10,
+            end_offset_seconds=50,
+            project_id=PROJECT,
+        )
+
+
+def test_frame_user_text_required():
+    with pytest.raises(TypeError):
+        call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+
+
 # --- happy path tests ---
 
 
@@ -140,7 +159,7 @@ def test_happy_path_returns_dict():
     mock_client_inst = _patched_client(_make_response('{"hand_starts": []}'))
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
-        result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+        result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
     assert result == {"hand_starts": []}
 
@@ -149,7 +168,7 @@ def test_strips_json_code_fence():
     mock_client_inst = _patched_client(_make_response('```json\n{"x": 1}\n```'))
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
-        result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+        result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
     assert result == {"x": 1}
 
@@ -158,7 +177,7 @@ def test_strips_bare_code_fence():
     mock_client_inst = _patched_client(_make_response('```\n{"x": 1}\n```'))
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
-        result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+        result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
     assert result == {"x": 1}
 
@@ -180,7 +199,7 @@ def test_transient_exceptions(exc):
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with patch("table_talk.gemini_caller.time.sleep"):
             with pytest.raises(GeminiTransientError):
-                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
 
 @pytest.mark.parametrize("exc", [
@@ -196,7 +215,7 @@ def test_permanent_exceptions(exc):
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with pytest.raises(GeminiPermanentError):
-            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
 
 # --- error classification: response-level failures ---
@@ -208,7 +227,7 @@ def test_max_tokens_finish_reason():
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with pytest.raises(GeminiPermanentError, match="MAX_TOKENS"):
-            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
 
 def test_safety_finish_reason():
@@ -217,7 +236,7 @@ def test_safety_finish_reason():
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with pytest.raises(GeminiPermanentError, match="SAFETY"):
-            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
 
 def test_empty_text_raises():
@@ -226,7 +245,7 @@ def test_empty_text_raises():
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with pytest.raises(GeminiPermanentError, match="empty response"):
-            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
 
 def test_malformed_json_raises():
@@ -235,7 +254,7 @@ def test_malformed_json_raises():
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with pytest.raises(GeminiPermanentError, match="malformed JSON"):
-            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
 
 # --- retry / backoff tests ---
@@ -246,7 +265,7 @@ def test_retry_success_on_first_try():
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
-            result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+            result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
     assert result == {"ok": True}
     mock_sleep.assert_not_called()
@@ -263,7 +282,7 @@ def test_retry_success_after_n_429s(n_failures):
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
-            result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+            result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
     assert result == {"ok": True}
     assert mock_sleep.call_count == n_failures
@@ -277,7 +296,7 @@ def test_retry_exhaustion_raises_transient_with_message():
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with patch("table_talk.gemini_caller.time.sleep"):
             with pytest.raises(GeminiTransientError, match="retries exhausted"):
-                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
     assert mock_client_inst.models.generate_content.call_count == _RETRY_MAX_ATTEMPTS
 
@@ -289,7 +308,7 @@ def test_retry_non_429_transient_not_retried():
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
             with pytest.raises(GeminiTransientError):
-                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
     mock_sleep.assert_not_called()
     mock_client_inst.models.generate_content.assert_called_once()
@@ -302,7 +321,7 @@ def test_retry_permanent_error_not_retried():
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
             with pytest.raises(GeminiPermanentError):
-                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
     mock_sleep.assert_not_called()
     mock_client_inst.models.generate_content.assert_called_once()
@@ -323,7 +342,7 @@ def test_retry_backoff_timing():
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         with patch("table_talk.gemini_caller.time.sleep", side_effect=capture_sleep):
-            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+            call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
 
     assert len(sleep_calls) == 4
     # attempt=0 → [0, 10], attempt=1 → [0, 20], attempt=2 → [0, 40], attempt=3 → [0, 60]
@@ -362,6 +381,7 @@ def test_call_gemini_for_frame_integration():
         frame_bytes=img_bytes,
         project_id="table-talk-497020",
         location="global",
+        user_text="Extract the status from this frame.",
     )
 
     assert isinstance(result, dict)

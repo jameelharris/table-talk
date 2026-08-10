@@ -143,6 +143,7 @@ async def process_clip(
             clip.clip_start_time,
             clip.clip_end_time,
             project_id,
+            user_text="Identify all new hand setups in this video.",
         )
         hand_setups = clip_result.get("hand_setups", [])
 
@@ -173,7 +174,11 @@ async def process_clip(
                 with open(temp_path, "rb") as fh:
                     frame_bytes = fh.read()
                 player_info = await asyncio.to_thread(
-                    call_gemini_for_frame, extract_player_info_prompt, frame_bytes, project_id
+                    call_gemini_for_frame,
+                    extract_player_info_prompt,
+                    frame_bytes,
+                    project_id,
+                    user_text="Extract the setup observations from this frame.",
                 )
                 return (ordinal, ts, player_info, temp_path)
 
