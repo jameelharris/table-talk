@@ -64,11 +64,13 @@ success criteria let you loop independently. Weak criteria ("make it work") requ
 
 ## Project Conventions
 
-These conventions govern the structure and design of code in this project. They are project-specific rules that new code must follow, distinct from the general coding discipline in sections 1-4. ARCHITECTURE.md describes the phases where these conventions are applied; this section is the authoritative source for the rules themselves.
+These conventions govern the structure and design of code in this project. They are project-specific rules that new code must follow, distinct from the general coding discipline in sections 1-4. ARCHITECTURE.md describes the phases where these conventions are applied and records the incidents that produced them; this section is the authoritative source for the rules themselves.
 
 ### Schemas are the source of truth
 
 BigQuery table schemas live at `schemas/*.json` at the repo root. Python dataclasses are generated from them via `scripts/gen_schemas.py` and land in `src/table_talk/_generated/`. Generated files are committed and never edited by hand. After changing a schema, regenerate before committing. The same JSON also drives Terraform table creation — see "Infrastructure is Terraform-managed."
+
+Not every value a phase needs is a column. Query-computed values (window-function results, derived counts) belong on a module-local frozen dataclass in the orchestrator, not in a schema and not hand-added to a generated row class. `PendingHandSetup` and `PendingClip` are the pattern: they carry the table's columns plus the values the pending query derives.
 
 ### Infrastructure is Terraform-managed
 
@@ -93,34 +95,92 @@ Consequences:
 - A phase's infrastructure lands as its own focused PR, consistent with the
   commit conventions above.
 
-### BQ writes use DML INSERT with parameterized queries
+Bucket lifecycle rules must be scoped to noncurrent versions only. Frames are referenced by paths stored on stage rows and are never discovered by scanning, so an age-based rule on current versions would delete live, referenced evidence.
+
+### Table taxonomy
+
+Three kinds of table:
+
+- **Fact tables** hold durable entity records. `videos` is currently the only one.
+- **Stage tables** hold the output of a processing phase, consumed by later phases: `clip_manifest`, `hand_setups`, `hand_starts`. A future assembly phase combines them into fact tables.
+- **State tables** are insert-only logs of processing attempts, one row per attempt, named `*_attempts`: `video_ingestion_attempts`, `clip_processing_attempts`, `hand_setup_processing_attempts`. They carry a server-defaulted `attempted_at`.
+
+Each processing phase pairs a stage table with a state table. The current state of an entity is derived: the latest row in its state table by `attempted_at`. No in-flight states are stored; rows are written only after attempts conclude.
+
+**State tables are append-only audit logs.** Never UPDATE a state row and never DELETE one. To reverse a prior outcome, insert a new row that supersedes it. A deletion destroys the record of what actually happened, which is the table's whole purpose.
+
+**Latest status does not tell you whether output exists.** It records what the client believed at the time, which can be wrong — see "Idempotence." Several outcomes are legitimately terminal with zero stage rows, so the presence or absence of output can't be inferred from status either. Both directions of that inference are unsafe.
+
+### Attempt status semantics
+
+Status values vary by phase, but every status falls into one of three categories, and new statuses must declare which:
+
+- **Terminal success** — the entity is done; never re-selected. (`complete`, `complete_skipped`)
+- **Terminal failure** — the entity cannot complete; never re-selected. (`failed_permanent`, `failed_parked`, Phase 1's `failed_terminal`)
+- **Retryable** — re-selected on the next run. (`failed_transient`, Phase 1's `failed_transient_predownload` / `failed_transient_postdownload`)
+
+`complete_skipped` is for precondition failures caught before any LLM call — the entity was examined and deliberately not processed. It is a success, not a failure: retrying would produce the same skip.
+
+Pending queries select entities whose latest status is retryable or absent. Adding a status means deciding its category and updating the pending query if it is retryable.
+
+### BQ writes use DML with parameterized queries
 
 Not load jobs. This is so BigQuery applies column DEFAULTs server-side. The codegen omits any column with `defaultValueExpression` set, since BQ supplies those values.
 
-### Two-table pattern (inventory + state machine)
+**Stage-table writes use replace semantics.** In a single multi-statement transaction: DELETE existing rows for the entity's natural key, then INSERT the new rows. Three properties, all required:
 
-Each major entity has two tables:
+- **Unconditional.** The DELETE runs on every write. Nothing checks whether a row exists, and nothing compares the stage table to the state table. The path that prevents duplicates is the same path exercised on every normal write, not a rare branch that only fires during an outage.
+- **At write time, after all processing.** Not a pre-flight step. A DELETE up front would leave an entity with zero rows if processing then failed.
+- **Atomic.** As two separate statements, a committed DELETE followed by a failed INSERT destroys a good row — worse than the duplicate being prevented.
 
-- An **inventory table** — immutable per row, captures "this thing exists." Written once at entity creation.
-- A **state machine table** — insert-only, captures "this is what happened during an attempt to process this thing." One row per attempt. Server-defaulted `attempted_at` timestamp.
+The DELETE must run even when there are no rows to insert, because the outcomes that most need it are the zero-row ones. This means the natural key is an explicit writer parameter, never derived from the rows, and an empty row list is not a no-op.
 
-The current state of an entity is derived: latest row in the attempts table (by `attempted_at`) for that entity. No in-flight states are stored; rows are only written after attempts conclude.
+The natural key is the entity the phase processes, which is not always the stage row's own id: `hand_setups` keys on `clip_id`, not `hand_setup_id`, because reprocessing a clip can produce a different number of rows and per-row keying would orphan the surplus.
 
-Never UPDATE state machine rows; insert new rows instead.
+Replace semantics make stage writes mutating DML, which BigQuery serializes per table rather than running with the concurrency available to INSERT-only writes. This is a throughput constraint, not a correctness one: an aborted transaction surfaces as a write error, is classified retryable, and the retry is safe precisely because the write is idempotent.
+
+`clip_manifest` is written once per video with no state table and has no replace wrapper; Phase 2's retry derives from the absence of output rows, which is the same principle applied through a different mechanism.
+
+### Idempotence and self-healing
+
+Processing functions must be idempotent on their inputs. Re-running a command must be safe and must naturally fill in missing work.
+
+**Idempotence derives from the output table, never from the attempts table.** A state row says what the client believed happened. That belief can be wrong: a write can succeed while the client's confirmation fails, producing a failure row for completed work and returning the entity to the pending set. Any check that consults the attempts table to decide whether to write inherits the same wrong belief and permits the duplicate anyway. The output table is the only authoritative record of whether a row landed.
+
+For the same reason, do not add an output-existence guard to a pending query. Several outcomes are legitimately terminal with zero stage rows; a `NOT EXISTS` filter would mark them permanently pending and reprocess them forever.
+
+Replace-semantics writes are what deliver idempotence. They also keep deliberate reprocessing available — after a prompt fix, re-running an entity replaces its output rather than being skipped or duplicated.
+
+### Retry caps and terminal parking
+
+`failed_transient` means "retry on every run," which is wrong for an entity that deterministically cannot complete: it burns LLM calls indefinitely and never succeeds.
+
+Orchestrators cap retries. After N consecutive failures (default 3, `--max-attempts`), write a terminal `failed_parked` instead of `failed_transient`. Parked entities stop being selected and collect in a queryable bucket for later batch diagnosis. Un-parking is a manual append of a retryable status — never an edit to the parked row.
+
+Two rules govern the counter:
+
+- **It counts consecutive failures since the last non-failure, not lifetime failures.** A failure can follow a success, so a lifetime count would park healthy entities early.
+- **It is computed in the pending query and carried on the dataclass, never re-queried inside a failure handler.** The handler runs precisely when BigQuery may be unreachable, so a read there would fail too, and the natural fallback would silently defeat the cap for every entity an outage touches.
+
+The current failure is not yet counted when the handler runs, so the threshold test is `consecutive_failures + 1 >= max_attempts`.
 
 ### Writers are hand-written per table
 
-Each table has its own writer module, no shared base class. Follow the template of `videos_writer.py` for simple cases or `video_ingestion_attemptster.py` for cases with status validation. Some duplication across writers is accepted for consistency.
+Each table has its own writer module, no shared base class. Follow the template of `videos_writer.py` for simple cases or `video_ingestion_attempts_writer.py` for cases with status validation. Some duplication across writers is accepted for consistency.
+
+Shared *pure helpers* are fine where the duplication would be exact and mechanical — `bq_utils.bq_param_type` for parameter typing, `bq_utils.build_replace_sql` for statement assembly. The line is between a small stateless function both writers call and an abstraction that owns the write. Orchestrators are not shared at all; phases duplicate structure rather than coupling to each other.
 
 ### Batch DML for high-cardinality writes
 
-When one operator action produces many rows for a single entity (like `clip_manifest`'s many-clips-per-video), the writer accepts a list and produces one atomic DML INSERT. For single-row-per-event writes (`videos`, `video_ingestion_attempts`, `clip_processing_attempts`), writers stay single-row.
+When one operator action produces many rows for a single entity (like `clip_manifest`'s many-clips-per-video), the writer accepts a list and produces one atomic DML statement. For single-row-per-event writes (`videos`, `video_ingestion_attempts`, `clip_processing_attempts`), writers stay single-row.
 
-The atomicity unit is the logical group that belongs together. A video's clips all land in one DML statement so partial-state idempotence failures cannot happen.
+The atomicity unit is the logical group that belongs together, and for stage tables it is also the replace key: a clip's hand_setups all land in one statement and are all replaced together.
 
 ### Primitives are stateless and ignorant of orchestration
 
 Fetcher, uploader, and writers each take inputs and produce outputs (or raise classified exceptions). They do not consult BigQuery for context, do not decide retry policy, and do not know about other primitives. Orchestrators compose them.
+
+Writers are the boundary case: a writer owns its own statement's atomicity, including the DELETE that makes it idempotent, but does not decide *whether* to write. Nothing in a primitive touches GCS on behalf of a BQ write or vice versa.
 
 ### CLI commands map to logical groups
 
@@ -128,11 +188,7 @@ Each `tt` subcommand does one logical group's work. Cross-group composition is v
 
 ### INT64 seconds for video-offset times
 
-All time offsets within a video (clip start/end, hand start within clip, etc.) are stored as INT64 seconds. Not floats, not milliseconds, not durations.
-
-### Idempotence and self-healing
-
-Processing functions must be idempotent on their inputs. Re-running a command should be safe and should naturally fill in any missing work. Idempotence checks derive from the attempts tables: "does any attempt with status='complete' exist for this entity?"
+All time offsets within a video (clip start/end, hand start within clip, etc.) are stored as INT64 seconds. Not floats, not milliseconds, not durations. Sub-second values may exist transiently in memory (verification frames are extracted at fractional offsets) but are never persisted.
 
 ### Integration tests are opt-in
 
@@ -160,7 +216,7 @@ phase3_function(clip_id, ...)
 ...
 
 # Cleanup in reverse dependency order
-DELETE FROM hand_setups WHER...
+DELETE FROM hand_setups WHERE ...
 DELETE FROM clip_manifest WHERE ...
 DELETE FROM videos WHERE ...
 ```
@@ -178,3 +234,7 @@ Integration tests must operate only on data they create. This has two implicatio
 Functions that take a specific identifier as an argument (a video_id, a row, a URL) naturally scope to that identifier and don't need additional scope-limiting parameters.
 
 The principle is enforced by code review — there is no automated check.
+
+### Prompts have no automated tests
+
+`prompts/*.md` are versioned with code so prompt changes ride code review, but nothing asserts on their content. The regression guard is reproduction: before changing a prompt, reproduce the exact failing call in a notebook against the real stored frame or video window, and confirm the fix against both the failing case and a control. Theorising about a prompt bug without looking at the actual frame has produced wrong hypotheses more than once.
