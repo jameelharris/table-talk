@@ -62,3 +62,29 @@ def test_hand_setup_processing_attempts_schema_generates_expected_dataclass():
     assert "    status: str" in output
     assert "    status_message: str | None = None" in output
     assert "attempted_at" not in output
+
+
+def test_hand_actions_schema_generates_expected_dataclass():
+    output = generate_dataclass(SCHEMAS_DIR / "hand_actions.json")
+    assert "class HandActionsRow:" in output
+    assert "from typing import Any" in output
+    assert "    hand_start_id: str" in output
+    assert "    hand_setup_id: str" in output
+    assert "    clip_id: str" in output
+    assert "    video_id: str" in output
+    assert "    hand_action_state: dict[str, Any]" in output
+    assert "    street_frame_gcs_paths: list[str]" in output
+    assert "detected_at" not in output
+    # hand_actions is 1:1 with hand_starts, so hand_start_id is the primary key
+    # and there is deliberately no hand_action_id column.
+    assert "hand_action_id" not in output
+
+
+def test_hand_start_processing_attempts_schema_generates_expected_dataclass():
+    output = generate_dataclass(SCHEMAS_DIR / "hand_start_processing_attempts.json")
+    assert "class HandStartProcessingAttemptsRow:" in output
+    assert "    attempt_id: str" in output
+    assert "    hand_start_id: str" in output
+    assert "    status: str" in output
+    assert "    status_message: str | None = None" in output
+    assert "attempted_at" not in output

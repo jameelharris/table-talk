@@ -1,0 +1,45 @@
+[
+  {
+    "name": "hand_start_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Primary key. Foreign key to hand_starts.hand_start_id. hand_actions is 1:1 with hand_starts, so the parent id is the primary key — there is no separate hand_action_id. Also the natural key for this table's replace-semantics writes."
+  },
+  {
+    "name": "hand_setup_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Denormalized grandparent hand setup identifier. Equals hand_starts.hand_setup_id for this hand start; stored to give the assembly phase a direct join to hand_setups."
+  },
+  {
+    "name": "clip_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Denormalized parent clip identifier. Equals hand_starts.clip_id for this hand start; stored to avoid joins on common queries."
+  },
+  {
+    "name": "video_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Denormalized parent video identifier. Equals hand_starts.video_id for this hand start; stored to avoid joins on common queries."
+  },
+  {
+    "name": "hand_action_state",
+    "type": "JSON",
+    "mode": "REQUIRED",
+    "description": "Observed action sequence, community cards, and outcome for the hand. Structure: {hand_start: {...verbatim copy of hand_starts.hand_start_state}, streets: [{street_name: string, street_timestamp: int|null, community_cards: [string], actions: [{action_order: int, seat_position_label: string, action_type: string, bet_amount: number|null}]}], winning_positions: [string]}. street_timestamp is an offset from the start of the source video in whole seconds, and is null for preflop (there is no card-reveal moment). The embedded hand_start is a snapshot taken at write time; reprocessing Phase 4 does not update it."
+  },
+  {
+    "name": "street_frame_gcs_paths",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Full gs://... URIs to the frames extracted shortly after each postflop street's reveal timestamp, one per resolved street, ordered flop then turn then river. Empty for a hand that ended preflop. Never NULL — an empty repeated column is an empty array."
+  },
+  {
+    "name": "detected_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "defaultValueExpression": "CURRENT_TIMESTAMP()",
+    "description": "Timestamp when this hand action row was written. Auto-populated on insert via DEFAULT."
+  }
+]
