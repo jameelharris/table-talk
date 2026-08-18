@@ -88,10 +88,11 @@ def call_gemini_for_clip(
     location: str = "global",
     *,
     user_text: str,
+    reference_images: list[tuple[bytes, str]] | None = None,
 ) -> dict:
     client = genai.Client(vertexai=True, project=project_id, location=location)
 
-    part1 = types.Part(
+    video_part = types.Part(
         file_data=types.FileData(file_uri=video_gcs_uri, mime_type="video/*"),
         video_metadata=types.VideoMetadata(
             start_offset=f"{start_offset_seconds}s",
@@ -99,8 +100,18 @@ def call_gemini_for_clip(
             fps=1.0,
         ),
     )
-    part2 = types.Part(text=user_text)
-    request_contents = types.Content(role="user", parts=[part1, part2])
+    # Video first, then any reference images as (bytes, mime_type), then the
+    # user turn. Omitting reference_images reproduces the original two-part
+    # request exactly, which is why this one stays optional while user_text
+    # is required — the default here is correct for every caller, not a
+    # silently-wrong inherited value.
+    parts = [video_part]
+    parts += [
+        types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type))
+        for image_bytes, mime_type in (reference_images or [])
+    ]
+    parts.append(types.Part(text=user_text))
+    request_contents = types.Content(role="user", parts=parts)
 
     try:
         response = _call_with_retry(

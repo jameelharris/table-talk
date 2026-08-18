@@ -2,6 +2,7 @@ from table_talk.seat_enrichment import (
     SEAT_NUMBER_MAP,
     add_fva_seat_number,
     add_seat_numbers,
+    heads_up_label,
     normalize_heads_up,
 )
 
@@ -158,3 +159,30 @@ def test_normalize_heads_up_non_heads_up_with_fva_unchanged():
     normalize_heads_up(state, fva=fva)
 
     assert fva == before
+
+
+# heads_up_label is the pure atom normalize_heads_up rewrites through. Phase 5
+# applies it directly to bare labels in step D's actions[] and winning_positions[],
+# which do not live inside hand_setup_state.
+
+
+def test_heads_up_label_sb_heads_up_becomes_btn():
+    assert heads_up_label("SB", 2) == "BTN"
+
+
+def test_heads_up_label_sb_not_heads_up_unchanged():
+    assert heads_up_label("SB", 6) == "SB"
+    assert heads_up_label("SB", 9) == "SB"
+
+
+def test_heads_up_label_non_sb_unchanged_heads_up():
+    assert heads_up_label("BB", 2) == "BB"
+    assert heads_up_label("BTN", 2) == "BTN"
+
+
+def test_heads_up_label_none_label_unchanged():
+    assert heads_up_label(None, 2) is None
+
+
+def test_heads_up_label_none_seat_count_unchanged():
+    assert heads_up_label("SB", None) == "SB"

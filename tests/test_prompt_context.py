@@ -1,9 +1,17 @@
-# These formats are a contract with the PR 7 prompt files (prompts/identify_hand_start.md,
-# prompts/extract_hole_cards.md), which are written to expect exactly this text shape at
-# their {player_context}/{fva_context}/{hole_card_context} slots. If you change a format
-# here, the paired prompt file needs to change too.
+# These formats are a contract with the prompt files, which are written to expect exactly
+# this text shape at their substitution slots. If you change a format here, the paired
+# prompt file needs to change too.
+#
+#   build_player_context    -> {player_context}    in identify_hand_start.md
+#   build_hole_card_context -> {hole_card_context} in extract_hole_cards.md
+#   build_action_context    -> {player_context}    in extract_player_actions.md
+#   build_fva_context       -> {fva_context}       in extract_player_actions.md
+#
+# build_fva_context had no caller between the step-C stack-anchor fix and Phase 5;
+# extract_player_actions.md uses it again to establish that the FVA is action_order 1.
 
 from table_talk.prompt_context import (
+    build_action_context,
     build_fva_context,
     build_hole_card_context,
     build_player_context,
@@ -139,3 +147,72 @@ def test_build_hole_card_context_heads_up():
         "- Seat 1 (BB) | Stack: 100.0 BB\n"
         "- Seat 3 (BTN) | Stack: 100.0 BB"
     )
+
+
+# ---------------------------------------------------------------------------
+# build_action_context
+# ---------------------------------------------------------------------------
+
+
+def _action_state(players):
+    return {"hand_setup": {"players": players}, "fva": {"seat_number": 9}}
+
+
+def test_build_action_context_full_hole_cards():
+    state = _action_state([
+        {"seat_number": 1, "seat_position_label": "BB", "stack_size": 14.5,
+         "hole_cards": ["Ah", "Kd"]},
+        {"seat_number": 9, "seat_position_label": "UTG", "stack_size": 22.0,
+         "hole_cards": ["2c", "3c"]},
+    ])
+    assert build_action_context(state) == (
+        "- Seat 1 (BB) | Stack: 14.5 BB | Hole cards: Ah Kd\n"
+        "- Seat 9 (UTG) | Stack: 22.0 BB | Hole cards: 2c 3c"
+    )
+
+
+def test_build_action_context_null_hole_cards_render_unknown():
+    state = _action_state([
+        {"seat_number": 1, "seat_position_label": "BB", "stack_size": 14.5, "hole_cards": None},
+    ])
+    assert build_action_context(state) == "- Seat 1 (BB) | Stack: 14.5 BB | Hole cards: unknown"
+
+
+def test_build_action_context_partially_null_pair_renders_unknown():
+    # Phase 4 can leave a half-read pair; half a hand is not a usable anchor.
+    state = _action_state([
+        {"seat_number": 1, "seat_position_label": "BB", "stack_size": 14.5,
+         "hole_cards": ["Ah", None]},
+    ])
+    assert build_action_context(state) == "- Seat 1 (BB) | Stack: 14.5 BB | Hole cards: unknown"
+
+
+def test_build_action_context_missing_hole_cards_key_renders_unknown():
+    state = _action_state([
+        {"seat_number": 1, "seat_position_label": "BB", "stack_size": 14.5},
+    ])
+    assert build_action_context(state) == "- Seat 1 (BB) | Stack: 14.5 BB | Hole cards: unknown"
+
+
+def test_build_action_context_emits_all_seats_not_just_fva_eligible():
+    # The contrast with build_hole_card_context: D tracks the hand to showdown,
+    # so seats beyond the FVA must still appear.
+    players = [dict(p, hole_cards=["Ah", "Kd"]) for p in _NINE_HANDED_PLAYERS]
+    state = {"hand_setup": {"players": players}, "fva": {"seat_number": 3}}
+    result = build_action_context(state)
+    assert result.count("\n") == 8
+    assert "- Seat 9 (UTG) | Stack: 100.0 BB | Hole cards: Ah Kd" in result
+
+
+def test_build_action_context_empty_player_list():
+    assert build_action_context(_action_state([])) == ""
+
+
+def test_build_action_context_null_stack_renders_none():
+    # check_preconditions does not re-check stacks in Phase 5 (Phase 4 already
+    # skipped any hand with a null stack), so this is a shape guarantee only.
+    state = _action_state([
+        {"seat_number": 1, "seat_position_label": "BB", "stack_size": None,
+         "hole_cards": ["Ah", "Kd"]},
+    ])
+    assert build_action_context(state) == "- Seat 1 (BB) | Stack: None BB | Hole cards: Ah Kd"

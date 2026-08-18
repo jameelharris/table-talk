@@ -136,6 +136,78 @@ def test_frame_user_text_override():
     assert contents.parts[1].text == "Extract hole cards for all eligible players from this frame."
 
 
+def test_clip_without_reference_images_is_unchanged_two_parts():
+    # Regression guard for the four pre-Phase-5 call sites: omitting
+    # reference_images must reproduce the original video + text request exactly.
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        call_gemini_for_clip(
+            prompt=PROMPT,
+            video_gcs_uri=VIDEO_URI,
+            start_offset_seconds=10,
+            end_offset_seconds=50,
+            project_id=PROJECT,
+            user_text=USER_TEXT,
+        )
+
+    contents = mock_client_inst.models.generate_content.call_args.kwargs["contents"]
+    assert len(contents.parts) == 2
+    assert contents.parts[0].file_data.file_uri == VIDEO_URI
+    assert contents.parts[0].inline_data is None
+    assert contents.parts[1].text == USER_TEXT
+
+
+def test_clip_with_reference_images_orders_video_images_then_text():
+    images = [(b"\x01flop", "image/jpeg"), (b"\x02turn", "image/jpeg"), (b"\x03river", "image/png")]
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        call_gemini_for_clip(
+            prompt=PROMPT,
+            video_gcs_uri=VIDEO_URI,
+            start_offset_seconds=10,
+            end_offset_seconds=50,
+            project_id=PROJECT,
+            user_text=USER_TEXT,
+            reference_images=images,
+        )
+
+    contents = mock_client_inst.models.generate_content.call_args.kwargs["contents"]
+    assert len(contents.parts) == 5
+
+    # Video first.
+    assert contents.parts[0].file_data.file_uri == VIDEO_URI
+
+    # Then the reference images, in the order given, with their own mime types.
+    for part, (expected_bytes, expected_mime) in zip(contents.parts[1:4], images, strict=True):
+        assert part.inline_data.data == expected_bytes
+        assert part.inline_data.mime_type == expected_mime
+        assert part.text is None
+
+    # User turn stays last.
+    assert contents.parts[4].text == USER_TEXT
+
+
+def test_clip_empty_reference_images_list_is_two_parts():
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        call_gemini_for_clip(
+            prompt=PROMPT,
+            video_gcs_uri=VIDEO_URI,
+            start_offset_seconds=10,
+            end_offset_seconds=50,
+            project_id=PROJECT,
+            user_text=USER_TEXT,
+            reference_images=[],
+        )
+
+    contents = mock_client_inst.models.generate_content.call_args.kwargs["contents"]
+    assert len(contents.parts) == 2
+    assert contents.parts[1].text == USER_TEXT
+
+
 def test_clip_user_text_required():
     with pytest.raises(TypeError):
         call_gemini_for_clip(
