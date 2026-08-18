@@ -5,11 +5,14 @@
 import json
 import random
 import re
+import sys
 import time
 
 import google.api_core.exceptions as api_exc
 from google import genai
 from google.genai import types
+
+_MODEL = "gemini-2.5-pro"
 
 _RETRY_MAX_ATTEMPTS = 5
 _RETRY_BASE_DELAY_SECONDS = 5.0
@@ -59,6 +62,31 @@ def _call_with_retry(fn):
             time.sleep(random.uniform(0, cap_delay))
 
 
+def _log_usage(response, label: str | None) -> None:
+    """Emit one greppable stderr line of token counts for a completed call.
+
+    Phase 5 costs up to 7 calls per hand, so per-call token counts are what
+    turn a run into a dollar figure. Grep with `gemini_usage`.
+
+    Called before _parse_and_validate, so a response that fails validation
+    (MAX_TOKENS, SAFETY, malformed JSON) still reports what it consumed —
+    those calls are billed too.
+    """
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return
+    counts = {
+        "prompt_tokens": getattr(usage, "prompt_token_count", None),
+        "candidates_tokens": getattr(usage, "candidates_token_count", None),
+        "total_tokens": getattr(usage, "total_token_count", None),
+    }
+    fields = [f"gemini_usage model={_MODEL}"]
+    if label is not None:
+        fields.append(f"label={label}")
+    fields += [f"{k}={v}" for k, v in counts.items() if v is not None]
+    print(" ".join(fields), file=sys.stderr)
+
+
 def _parse_and_validate(response) -> dict:
     candidate = response.candidates[0]
     if candidate.finish_reason in (types.FinishReason.MAX_TOKENS, types.FinishReason.SAFETY):
@@ -89,6 +117,7 @@ def call_gemini_for_clip(
     *,
     user_text: str,
     reference_images: list[tuple[bytes, str]] | None = None,
+    label: str | None = None,
 ) -> dict:
     client = genai.Client(vertexai=True, project=project_id, location=location)
 
@@ -116,7 +145,7 @@ def call_gemini_for_clip(
     try:
         response = _call_with_retry(
             lambda: client.models.generate_content(
-                model="gemini-2.5-pro",
+                model=_MODEL,
                 config=types.GenerateContentConfig(system_instruction=prompt),
                 contents=request_contents,
             )
@@ -128,6 +157,7 @@ def call_gemini_for_clip(
     except _PERMANENT_EXC as exc:
         raise GeminiPermanentError(str(exc)) from exc
 
+    _log_usage(response, label)
     return _parse_and_validate(response)
 
 
@@ -139,6 +169,7 @@ def call_gemini_for_frame(
     mime_type: str = "image/jpeg",
     *,
     user_text: str,
+    label: str | None = None,
 ) -> dict:
     client = genai.Client(vertexai=True, project=project_id, location=location)
 
@@ -149,7 +180,7 @@ def call_gemini_for_frame(
     try:
         response = _call_with_retry(
             lambda: client.models.generate_content(
-                model="gemini-2.5-pro",
+                model=_MODEL,
                 config=types.GenerateContentConfig(
                     system_instruction=prompt,
                     media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
@@ -164,4 +195,5 @@ def call_gemini_for_frame(
     except _PERMANENT_EXC as exc:
         raise GeminiPermanentError(str(exc)) from exc
 
+    _log_usage(response, label)
     return _parse_and_validate(response)

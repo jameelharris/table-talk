@@ -22,12 +22,23 @@ FRAME_BYTES = b"\xff\xd8\xff" + b"\x00" * 20  # fake bytes — mocked, not parse
 USER_TEXT = "Do the thing."
 
 
+def _usage(prompt=1200, candidates=340, total=1540):
+    usage = MagicMock()
+    usage.prompt_token_count = prompt
+    usage.candidates_token_count = candidates
+    usage.total_token_count = total
+    return usage
+
+
 def _make_response(text: str, finish_reason=types.FinishReason.STOP):
     candidate = MagicMock()
     candidate.finish_reason = finish_reason
     response = MagicMock()
     response.text = text
     response.candidates = [candidate]
+    # A bare MagicMock would auto-create usage_metadata and print mock reprs on
+    # every call, so give every response realistic counts by default.
+    response.usage_metadata = _usage()
     return response
 
 
@@ -222,6 +233,102 @@ def test_clip_user_text_required():
 def test_frame_user_text_required():
     with pytest.raises(TypeError):
         call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT)
+
+
+# --- usage / cost instrumentation tests ---
+
+
+def _call_clip(mock_client_inst, **kwargs):
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        return call_gemini_for_clip(
+            prompt=PROMPT,
+            video_gcs_uri=VIDEO_URI,
+            start_offset_seconds=10,
+            end_offset_seconds=50,
+            project_id=PROJECT,
+            user_text=USER_TEXT,
+            **kwargs,
+        )
+
+
+def test_usage_line_logged_to_stderr_with_label(capsys):
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    _call_clip(mock_client_inst, label="step_d")
+
+    line = capsys.readouterr().err.strip()
+    assert line.startswith("gemini_usage ")
+    assert "model=gemini-2.5-pro" in line
+    assert "label=step_d" in line
+    assert "prompt_tokens=1200" in line
+    assert "candidates_tokens=340" in line
+    assert "total_tokens=1540" in line
+
+
+def test_usage_line_omits_label_when_not_given(capsys):
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    _call_clip(mock_client_inst)
+
+    line = capsys.readouterr().err.strip()
+    assert line.startswith("gemini_usage ")
+    assert "label=" not in line
+    assert "total_tokens=1540" in line
+
+
+def test_usage_logged_for_frame_calls(capsys):
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        call_gemini_for_frame(
+            prompt=PROMPT,
+            frame_bytes=FRAME_BYTES,
+            project_id=PROJECT,
+            user_text=USER_TEXT,
+            label="card_read_flop",
+        )
+
+    line = capsys.readouterr().err.strip()
+    assert "label=card_read_flop" in line
+    assert "total_tokens=1540" in line
+
+
+def test_absent_usage_metadata_logs_nothing_and_call_still_succeeds(capsys):
+    response = _make_response('{"ok": true}')
+    response.usage_metadata = None
+    mock_client_inst = _patched_client(response)
+
+    result = _call_clip(mock_client_inst, label="step_d")
+
+    assert result == {"ok": True}
+    assert capsys.readouterr().err == ""
+
+
+def test_partial_usage_metadata_logs_only_present_counts(capsys):
+    response = _make_response('{"ok": true}')
+    response.usage_metadata = _usage(prompt=900, candidates=None, total=None)
+    mock_client_inst = _patched_client(response)
+
+    _call_clip(mock_client_inst)
+
+    line = capsys.readouterr().err.strip()
+    assert "prompt_tokens=900" in line
+    assert "candidates_tokens" not in line
+    assert "total_tokens" not in line
+
+
+def test_usage_logged_before_parse_failure(capsys):
+    # A malformed or truncated response is still a billed call. Logging before
+    # validation is what keeps those calls visible in the cost total.
+    mock_client_inst = _patched_client(_make_response("not json at all"))
+
+    with pytest.raises(GeminiPermanentError):
+        _call_clip(mock_client_inst, label="step_d")
+
+    line = capsys.readouterr().err.strip()
+    assert "gemini_usage " in line
+    assert "label=step_d" in line
+    assert "total_tokens=1540" in line
 
 
 # --- happy path tests ---
