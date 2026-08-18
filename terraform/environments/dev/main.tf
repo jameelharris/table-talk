@@ -170,6 +170,51 @@ module "hand_setup_processing_attempts_table" {
   deletion_protection = true
 }
 
+module "hand_actions_bucket" {
+  source = "../../modules/gcs_bucket"
+
+  name     = "${var.project_id}-hand-actions-${var.environment}"
+  location = var.region
+  project  = var.project_id
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "hand_actions"
+  }
+}
+
+module "hand_actions_table" {
+  source = "../../modules/bigquery_table"
+
+  dataset_id  = module.bigquery_dataset.dataset_id
+  table_id    = "hand_actions"
+  project     = var.project_id
+  schema      = file("${path.module}/../../../schemas/hand_actions.json")
+  description = "Phase 5 stage table: voluntary action sequence by street, community cards with their reveal timestamps, and winning positions per hand start. One row per hand start."
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "hand_action_stage"
+  }
+  deletion_protection = true
+}
+
+module "hand_start_processing_attempts_table" {
+  source = "../../modules/bigquery_table"
+
+  dataset_id  = module.bigquery_dataset.dataset_id
+  table_id    = "hand_start_processing_attempts"
+  project     = var.project_id
+  schema      = file("${path.module}/../../../schemas/hand_start_processing_attempts.json")
+  description = "Append-only audit log of every hand action processing attempt. One row per attempt. Absence of rows for a hand_start_id means it is unprocessed. Joins to hand_starts via hand_start_id."
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "hand_start_processing_audit"
+  }
+  deletion_protection = true
+}
+
 resource "google_project_iam_audit_config" "storage_audit" {
   project = var.project_id
   service = "storage.googleapis.com"

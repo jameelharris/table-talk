@@ -97,3 +97,38 @@ output "hand_setup_processing_attempts_table_full_id" {
   value       = module.hand_setup_processing_attempts_table.table_full_id
   description = "Fully qualified hand setup processing attempts table ID."
 }
+
+output "hand_actions_bucket_name" {
+  value       = module.hand_actions_bucket.name
+  description = "Name of the hand-actions frames GCS bucket."
+}
+
+output "hand_actions_bucket_url" {
+  value       = module.hand_actions_bucket.url
+  description = "GCS URL of the hand-actions frames bucket."
+}
+
+output "hand_actions_bucket_self_link" {
+  value       = module.hand_actions_bucket.self_link
+  description = "Self-link of the hand-actions frames GCS bucket."
+}
+
+output "hand_actions_table_id" {
+  value       = module.hand_actions_table.table_id
+  description = "BigQuery table ID for the hand actions stage table."
+}
+
+output "hand_actions_table_full_id" {
+  value       = module.hand_actions_table.table_full_id
+  description = "Fully qualified hand actions table ID (project:dataset.table)."
+}
+
+output "hand_start_processing_attempts_table_id" {
+  value       = module.hand_start_processing_attempts_table.table_id
+  description = "BigQuery table ID for the hand start processing audit log."
+}
+
+output "hand_start_processing_attempts_table_full_id" {
+  value       = module.hand_start_processing_attempts_table.table_full_id
+  description = "Fully qualified hand start processing attempts table ID."
+}
