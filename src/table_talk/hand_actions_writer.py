@@ -9,10 +9,16 @@
 # call deletes any existing rows for that hand_start_id, then inserts the
 # given rows, in one atomic multi-statement transaction. This makes the
 # writer idempotent under retries — a reprocess overwrites rather than
-# appends. The DELETE runs unconditionally, including when rows is empty.
-# Phase 5's failure and skip outcomes all conclude with zero hand_actions
-# rows, and those are precisely the cases that must clear a prior run's row,
-# so an empty row list is not a no-op.
+# appends. The DELETE runs unconditionally, including when rows is empty, so
+# an empty row list is a real write rather than a no-op.
+#
+# Phase 5's orchestrator nonetheless never passes an empty list. Every
+# `complete` outcome writes exactly one row (a hand that ends preflop still
+# has a preflop street), and failures deliberately leave any existing row
+# alone — per ARCHITECTURE.md, failures never delete existing output, so a
+# stage row legitimately coexists with a later failed_transient or
+# failed_parked attempt. The empty-list path is kept because it is the
+# template's contract and Phase 4's uncontested branch relies on it.
 #
 # hand_start_id is both the natural key and the table's primary key.
 # hand_actions is 1:1 with hand_starts, so there is no separate

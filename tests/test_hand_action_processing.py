@@ -1,0 +1,950 @@
+import asyncio
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from table_talk.gemini_caller import GeminiPermanentError, GeminiTransientError
+from table_talk.hand_action_processing import (
+    CARD_READ_ATTEMPTS,
+    MAX_WINDOW_SECONDS,
+    CommunityCardUnreadable,
+    PendingHandStart,
+    _find_pending_hand_starts,
+    _street_cards_unusable,
+    _street_timestamp_guard,
+    _transient_status,
+    check_preconditions,
+    process_hand_start,
+    process_pending_hand_starts,
+)
+from table_talk.videos_downloader import DownloadPermanentError
+
+_FVA = {"seat_position_label": "CO", "seat_number": 4, "action_type": "raise", "bet_amount": 2.5}
+
+_ACTIONS_PROMPT = "ACTIONS players={player_context} fva={fva_context}"
+_SCAN_PROMPT = "SCAN street={street_name}"
+_FRAME_PROMPT = "FRAME prior={prior_cards}"
+_REFERENCE_IMAGES = [
+    (b"flopimg", "image/jpeg", "flop"),
+    (b"turnimg", "image/jpeg", "turn"),
+    (b"riverimg", "image/jpeg", "river"),
+]
+
+
+def _hand_start_state(total_seat_count=6, fva=_FVA, players=None):
+    if players is None:
+        players = [
+            {"seat_number": 1, "seat_position_label": "BB", "stack_size": 100.0,
+             "hole_cards": ["Ah", "Kd"]},
+            {"seat_number": 4, "seat_position_label": "CO", "stack_size": 80.0,
+             "hole_cards": ["2c", "3c"]},
+        ]
+    state = {
+        "hand_setup": {
+            "total_seat_count": total_seat_count,
+            "pot_size_bb": 1.5,
+            "players": players,
+        }
+    }
+    if fva is not None:
+        state["fva"] = dict(fva)
+    return state
+
+
+def _pending(**kwargs) -> PendingHandStart:
+    # Window is [100, 160]; the FVA lands at 105.
+    defaults = dict(
+        hand_start_id="clip_001_001_001",
+        hand_setup_id="clip_001_001",
+        clip_id="clip_001",
+        video_id="vid_a",
+        hand_setup_time_seconds=100,
+        fva_time_seconds=105,
+        hand_start_state=_hand_start_state(),
+        raw_lead_gap_seconds=60,
+        consecutive_failures=0,
+    )
+    return PendingHandStart(**{**defaults, **kwargs})
+
+
+_PREFLOP_ACTIONS = [
+    {"action_order": 1, "seat_position_label": "CO", "action_type": "raise", "bet_amount": 2.5},
+    {"action_order": 2, "seat_position_label": "BB", "action_type": "call", "bet_amount": 2.5},
+]
+
+
+def _d_result(street_names=("preflop",), winning_positions=("CO",), actions=None):
+    return {
+        "streets": [
+            {
+                "street_name": name,
+                "actions": (actions if actions is not None else _PREFLOP_ACTIONS)
+                if name == "preflop"
+                else [],
+            }
+            for name in street_names
+        ],
+        "winning_positions": list(winning_positions),
+    }
+
+
+def _scan(found=True, timestamp="02:00"):
+    return {"found": found, "timestamp": timestamp if found else None}
+
+
+def _fake_extract_frame(_video_uri, _ts, output_path):
+    with open(output_path, "wb") as f:
+        f.write(b"\xff\xd8\xff\x00" * 4)
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _mock_bq_client(rows=None):
+    mock_job = MagicMock()
+    mock_job.result.return_value = rows if rows is not None else []
+    mock_client = MagicMock()
+    mock_client.query.return_value = mock_job
+    return mock_client
+
+
+def _bq_row(**kwargs):
+    defaults = dict(
+        hand_start_id="clip_001_001_001",
+        hand_setup_id="clip_001_001",
+        clip_id="clip_001",
+        video_id="vid_a",
+        hand_start_state=_hand_start_state(),
+        fva_time_seconds=105,
+        hand_setup_time_seconds=100,
+        raw_lead_gap_seconds=60,
+        consecutive_failures=0,
+    )
+    return SimpleNamespace(**{**defaults, **kwargs})
+
+
+@contextmanager
+def _patched(clip_results, frame_results=None):
+    with (
+        patch(
+            "table_talk.hand_action_processing.call_gemini_for_clip", side_effect=clip_results
+        ) as clip,
+        patch(
+            "table_talk.hand_action_processing.call_gemini_for_frame",
+            side_effect=frame_results if frame_results is not None else [],
+        ) as frame,
+        patch(
+            "table_talk.hand_action_processing.extract_frame", side_effect=_fake_extract_frame
+        ) as extract,
+        patch("table_talk.hand_action_processing.upload_frame") as upload,
+        patch("table_talk.hand_action_processing.write_hand_actions") as write_actions,
+        patch(
+            "table_talk.hand_action_processing.write_hand_start_processing_attempt_row"
+        ) as write_attempt,
+    ):
+        yield SimpleNamespace(
+            clip=clip, frame=frame, extract=extract, upload=upload,
+            write_actions=write_actions, write_attempt=write_attempt,
+        )
+
+
+def _call(hs):
+    return _run(
+        process_hand_start(
+            hs, "/tmp/video.mp4", "proj", "ds", "videos-bucket", "actions-bucket",
+            _ACTIONS_PROMPT, _SCAN_PROMPT, _FRAME_PROMPT, _REFERENCE_IMAGES,
+        )
+    )
+
+
+def _attempt_row(mocks):
+    return mocks.write_attempt.call_args[0][0]
+
+
+def _written_row(mocks):
+    return mocks.write_actions.call_args[0][0][0]
+
+
+# ---------------------------------------------------------------------------
+# check_preconditions
+# ---------------------------------------------------------------------------
+
+
+def test_check_preconditions_passes_valid_hand_start():
+    assert check_preconditions(_pending()) is None
+
+
+def test_check_preconditions_window_at_cap_passes():
+    assert check_preconditions(_pending(raw_lead_gap_seconds=MAX_WINDOW_SECONDS)) is None
+
+
+def test_check_preconditions_window_over_cap_skips():
+    reason = check_preconditions(_pending(raw_lead_gap_seconds=MAX_WINDOW_SECONDS + 1))
+    assert reason is not None
+    assert reason.startswith("skipped:")
+    assert "241" in reason
+
+
+def test_check_preconditions_missing_fva_skips():
+    reason = check_preconditions(_pending(hand_start_state=_hand_start_state(fva=None)))
+    assert reason is not None
+    assert "fva" in reason
+
+
+def test_check_preconditions_null_fva_seat_position_label_skips():
+    state = _hand_start_state(fva={**_FVA, "seat_position_label": None})
+    reason = check_preconditions(_pending(hand_start_state=state))
+    assert reason is not None
+    assert "seat_position_label" in reason
+
+
+def test_check_preconditions_window_check_wins_over_fva_check():
+    # Checks run in order and the first failure wins.
+    state = _hand_start_state(fva=None)
+    reason = check_preconditions(
+        _pending(raw_lead_gap_seconds=MAX_WINDOW_SECONDS + 1, hand_start_state=state)
+    )
+    assert "raw_lead_gap_seconds" in reason
+
+
+# ---------------------------------------------------------------------------
+# _street_timestamp_guard / _street_cards_unusable / _transient_status
+# ---------------------------------------------------------------------------
+
+
+def test_street_timestamp_guard_in_window_passes():
+    _street_timestamp_guard(120, 105, 160, "flop")
+
+
+def test_street_timestamp_guard_boundaries_pass():
+    _street_timestamp_guard(105, 105, 160, "flop")
+    _street_timestamp_guard(160, 105, 160, "flop")
+
+
+@pytest.mark.parametrize("timestamp", [104, 161])
+def test_street_timestamp_guard_out_of_window_raises(timestamp):
+    with pytest.raises(GeminiPermanentError, match="hallucination"):
+        _street_timestamp_guard(timestamp, 105, 160, "turn")
+
+
+@pytest.mark.parametrize(
+    "cards,prior_count,expected_ok",
+    [
+        (["5d", "8d", "As"], 0, True),
+        (["Kh"], 3, True),
+        (["2s"], 4, True),
+        (["5d", "8d"], 0, False),          # short flop
+        (["5d", "8d", "As", "Kh"], 0, False),  # long flop
+        ([], 0, False),                     # empty read
+        ([None], 3, False),                 # null turn card
+        (["5d", None, "As"], 0, False),     # null inside the flop
+    ],
+)
+def test_street_cards_unusable(cards, prior_count, expected_ok):
+    assert (_street_cards_unusable(cards, prior_count) is None) is expected_ok
+
+
+@pytest.mark.parametrize(
+    "consecutive_failures,expected",
+    [(0, "failed_transient"), (1, "failed_transient"), (2, "failed_parked"), (5, "failed_parked")],
+)
+def test_transient_status_boundary(consecutive_failures, expected):
+    assert _transient_status(consecutive_failures, 3) == expected
+
+
+# ---------------------------------------------------------------------------
+# _find_pending_hand_starts
+# ---------------------------------------------------------------------------
+
+
+def test_find_pending_hand_starts_no_filters():
+    client = _mock_bq_client()
+    _find_pending_hand_starts("proj", "ds", client=client)
+
+    query = client.query.call_args[0][0]
+    assert "only_video_ids" not in query
+    assert "only_hand_start_ids" not in query
+    assert client.query.call_args[1]["job_config"].query_parameters == []
+
+
+def test_find_pending_hand_starts_computes_lead_before_joining_hand_starts():
+    # The next hand setup bounds this hand even when it produced no hand_starts
+    # row, so the LEAD must be computed over hand_setups in its own CTE.
+    client = _mock_bq_client()
+    _find_pending_hand_starts("proj", "ds", client=client)
+
+    query = client.query.call_args[0][0]
+    windowed = query.index("WITH windowed AS")
+    lead = query.index("LEAD(hs.hand_setup_time_seconds)")
+    join = query.index("INNER JOIN windowed w USING (hand_setup_id)")
+    assert windowed < lead < join
+    # No output-existence guard: several outcomes are terminal with zero rows.
+    assert "hand_actions" not in query
+
+
+def test_find_pending_hand_starts_selects_only_pending_statuses():
+    client = _mock_bq_client()
+    _find_pending_hand_starts("proj", "ds", client=client)
+
+    query = client.query.call_args[0][0]
+    assert "a.latest_status IS NULL OR a.latest_status = 'failed_transient'" in query
+
+
+def test_find_pending_hand_starts_video_filter():
+    client = _mock_bq_client()
+    _find_pending_hand_starts("proj", "ds", only_video_ids=["vid_a"], client=client)
+
+    query = client.query.call_args[0][0]
+    assert "AND h.video_id IN UNNEST(@only_video_ids)" in query
+    params = {p.name: p for p in client.query.call_args[1]["job_config"].query_parameters}
+    assert params["only_video_ids"].values == ["vid_a"]
+
+
+def test_find_pending_hand_starts_hand_start_id_filter():
+    client = _mock_bq_client()
+    _find_pending_hand_starts("proj", "ds", only_hand_start_ids=["a", "b"], client=client)
+
+    query = client.query.call_args[0][0]
+    assert "AND h.hand_start_id IN UNNEST(@only_hand_start_ids)" in query
+    params = {p.name: p for p in client.query.call_args[1]["job_config"].query_parameters}
+    assert params["only_hand_start_ids"].values == ["a", "b"]
+
+
+def test_find_pending_hand_starts_empty_scope_list_scopes_to_nothing():
+    # `is not None`, not truthiness — an explicitly empty list must scope to
+    # nothing rather than silently widening to an unscoped scan.
+    client = _mock_bq_client()
+    _find_pending_hand_starts("proj", "ds", only_hand_start_ids=[], client=client)
+
+    assert "AND h.hand_start_id IN UNNEST(@only_hand_start_ids)" in client.query.call_args[0][0]
+
+
+def test_find_pending_hand_starts_builds_pending_hand_start():
+    client = _mock_bq_client([_bq_row()])
+    results = _find_pending_hand_starts("proj", "ds", client=client)
+
+    assert len(results) == 1
+    hs = results[0]
+    assert hs.hand_start_id == "clip_001_001_001"
+    assert hs.hand_setup_id == "clip_001_001"
+    assert hs.fva_time_seconds == 105
+    assert hs.hand_setup_time_seconds == 100
+    assert hs.raw_lead_gap_seconds == 60
+    assert hs.consecutive_failures == 0
+
+
+# ---------------------------------------------------------------------------
+# process_hand_start — preconditions and step D
+# ---------------------------------------------------------------------------
+
+
+def test_complete_skipped_makes_no_gemini_call_and_writes_no_row():
+    with _patched([]) as mocks:
+        outcome = _call(_pending(raw_lead_gap_seconds=MAX_WINDOW_SECONDS + 1))
+
+    assert outcome == "complete_skipped"
+    mocks.clip.assert_not_called()
+    mocks.frame.assert_not_called()
+    mocks.write_actions.assert_not_called()
+    assert _attempt_row(mocks).status == "complete_skipped"
+
+
+def test_preflop_only_hand_issues_no_step_e_calls():
+    with _patched([_d_result()]) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "complete"
+    # One clip call (step D) and zero frame calls — the whole point of running
+    # D and E sequentially rather than in parallel.
+    assert mocks.clip.call_count == 1
+    assert mocks.frame.call_count == 0
+    mocks.upload.assert_not_called()
+
+    row = _written_row(mocks)
+    assert row.street_frame_gcs_paths == []
+    streets = row.hand_action_state["streets"]
+    assert [s["street_name"] for s in streets] == ["preflop"]
+    assert streets[0]["street_timestamp"] is None
+    assert streets[0]["community_cards"] == []
+    assert row.hand_action_state["winning_positions"] == ["CO"]
+
+
+def test_step_d_receives_window_prompts_and_label():
+    with _patched([_d_result()]) as mocks:
+        _call(_pending())
+
+    args, kwargs = mocks.clip.call_args
+    filled_prompt, video_uri, start, end, project = args
+    assert video_uri == "gs://videos-bucket/vid_a.mp4"
+    assert (start, end) == (100, 160)
+    assert project == "proj"
+    assert kwargs["label"] == "step_d_player_actions"
+    # Both slots substituted; no leftover tokens.
+    assert "{player_context}" not in filled_prompt
+    assert "{fva_context}" not in filled_prompt
+    assert "Hole cards: Ah Kd" in filled_prompt
+    assert "Seat 4 (CO)" in filled_prompt
+
+
+def test_full_river_hand_issues_one_d_call_and_six_e_calls():
+    clip_results = [
+        _d_result(street_names=("preflop", "flop", "turn", "river")),
+        _scan(timestamp="02:00"),
+        _scan(timestamp="02:10"),
+        _scan(timestamp="02:20"),
+    ]
+    frame_results = [
+        {"new_cards": ["5d", "8d", "As"]},
+        {"new_cards": ["Kh"]},
+        {"new_cards": ["2s"]},
+    ]
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "complete"
+    assert mocks.clip.call_count == 4    # D + three scans
+    assert mocks.frame.call_count == 3   # three reads
+    assert mocks.upload.call_count == 3
+
+    row = _written_row(mocks)
+    streets = row.hand_action_state["streets"]
+    assert [s["street_name"] for s in streets] == ["preflop", "flop", "turn", "river"]
+    assert streets[1]["community_cards"] == ["5d", "8d", "As"]
+    assert streets[1]["street_timestamp"] == 120
+    assert streets[2]["community_cards"] == ["Kh"]
+    assert streets[3]["community_cards"] == ["2s"]
+    assert row.street_frame_gcs_paths == [
+        "gs://actions-bucket/vid_a/clip_001/clip_001_001/flop.jpg",
+        "gs://actions-bucket/vid_a/clip_001/clip_001_001/turn.jpg",
+        "gs://actions-bucket/vid_a/clip_001/clip_001_001/river.jpg",
+    ]
+
+
+def test_hand_start_state_nested_verbatim_under_hand_start():
+    with _patched([_d_result()]) as mocks:
+        _call(_pending())
+
+    state = _written_row(mocks).hand_action_state
+    assert state["hand_start"] == _hand_start_state()
+    assert set(state) == {"hand_start", "streets", "winning_positions"}
+
+
+# ---------------------------------------------------------------------------
+# A1 — empty winning_positions means the window missed the hand end
+# ---------------------------------------------------------------------------
+
+
+def test_empty_winning_positions_fails_transient_before_any_step_e_call():
+    with _patched([_d_result(winning_positions=())]) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_transient"
+    # The check fires before step E, so a truncated window costs one call not seven.
+    assert mocks.clip.call_count == 1
+    mocks.frame.assert_not_called()
+    mocks.write_actions.assert_not_called()
+
+    attempt = _attempt_row(mocks)
+    assert attempt.status == "failed_transient"
+    assert "no winning position observed" in attempt.status_message
+
+
+def test_missing_winning_positions_key_behaves_as_empty():
+    d_result = _d_result()
+    del d_result["winning_positions"]
+
+    with _patched([d_result]) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_transient"
+    assert "no winning position observed" in _attempt_row(mocks).status_message
+
+
+def test_empty_winning_positions_parks_at_cap():
+    with _patched([_d_result(winning_positions=())]) as mocks:
+        outcome = _call(_pending(consecutive_failures=2))
+
+    assert outcome == "failed_parked"
+    assert _attempt_row(mocks).status == "failed_parked"
+
+
+# ---------------------------------------------------------------------------
+# Step E sequencing and the prior-cards accumulator
+# ---------------------------------------------------------------------------
+
+
+def test_first_scan_starts_at_fva_not_hand_setup_time():
+    # The flop cannot precede the first voluntary action; the narrower window is
+    # deliberate and cheaper than the PoC's hand_setup_time_seconds start.
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    with _patched(clip_results, [{"new_cards": ["5d", "8d", "As"]}]) as mocks:
+        _call(_pending())
+
+    scan_args = mocks.clip.call_args_list[1][0]
+    assert scan_args[2] == 105   # fva_time_seconds, not hand_setup_time_seconds (100)
+    assert scan_args[3] == 160
+
+
+def test_each_scan_starts_at_the_previous_street_timestamp():
+    clip_results = [
+        _d_result(street_names=("preflop", "flop", "turn", "river")),
+        _scan(timestamp="02:00"),
+        _scan(timestamp="02:10"),
+        _scan(timestamp="02:20"),
+    ]
+    frame_results = [
+        {"new_cards": ["5d", "8d", "As"]},
+        {"new_cards": ["Kh"]},
+        {"new_cards": ["2s"]},
+    ]
+    with _patched(clip_results, frame_results) as mocks:
+        _call(_pending())
+
+    starts = [call[0][2] for call in mocks.clip.call_args_list[1:]]
+    assert starts == [105, 120, 130]
+
+
+def test_scans_pass_street_name_reference_images_and_label():
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    with _patched(clip_results, [{"new_cards": ["5d", "8d", "As"]}]) as mocks:
+        _call(_pending())
+
+    scan_call = mocks.clip.call_args_list[1]
+    assert scan_call[0][0] == "SCAN street=flop"
+    assert scan_call[1]["reference_images"] == _REFERENCE_IMAGES
+    assert scan_call[1]["label"] == "step_e_scan_flop"
+
+
+def test_prior_cards_accumulate_across_streets():
+    clip_results = [
+        _d_result(street_names=("preflop", "flop", "turn", "river")),
+        _scan(timestamp="02:00"),
+        _scan(timestamp="02:10"),
+        _scan(timestamp="02:20"),
+    ]
+    frame_results = [
+        {"new_cards": ["5d", "8d", "As"]},
+        {"new_cards": ["Kh"]},
+        {"new_cards": ["2s"]},
+    ]
+    with _patched(clip_results, frame_results) as mocks:
+        _call(_pending())
+
+    prompts = [call[0][0] for call in mocks.frame.call_args_list]
+    assert "(none — 0 prior cards)" in prompts[0]
+    assert "(3 prior cards)" in prompts[1]
+    assert "- 5d" in prompts[1] and "- As" in prompts[1]
+    assert "(4 prior cards)" in prompts[2]
+    assert "- Kh" in prompts[2]
+
+
+def test_frame_extracted_at_street_timestamp_plus_settle_offset():
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    with _patched(clip_results, [{"new_cards": ["5d", "8d", "As"]}]) as mocks:
+        _call(_pending())
+
+    assert mocks.extract.call_args[0][1] == 120.5
+
+
+def test_ten_prefixed_community_cards_are_normalized():
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    with _patched(clip_results, [{"new_cards": ["10d", "8d", "As"]}]) as mocks:
+        _call(_pending())
+
+    streets = _written_row(mocks).hand_action_state["streets"]
+    assert streets[1]["community_cards"] == ["Td", "8d", "As"]
+
+
+# ---------------------------------------------------------------------------
+# Null community cards fail the hand — the PoC accumulator bug guard
+# ---------------------------------------------------------------------------
+
+
+def test_null_flop_card_fails_hand_and_never_issues_the_turn_scan():
+    clip_results = [
+        _d_result(street_names=("preflop", "flop", "turn")),
+        _scan(timestamp="02:00"),
+        _scan(timestamp="02:10"),  # must never be consumed
+    ]
+    frame_results = [{"new_cards": ["5d", None, "As"]}] * CARD_READ_ATTEMPTS
+
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_transient"
+    # D plus the flop scan only — the turn scan is never reached, so a
+    # null-contaminated prior_cards can never reach a downstream read.
+    assert mocks.clip.call_count == 2
+    assert mocks.frame.call_count == CARD_READ_ATTEMPTS
+    mocks.write_actions.assert_not_called()
+
+    attempt = _attempt_row(mocks)
+    assert attempt.status == "failed_transient"
+    assert "flop" in attempt.status_message
+    assert "null card" in attempt.status_message
+
+
+def test_short_flop_read_fails_hand():
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    frame_results = [{"new_cards": ["5d", "8d"]}] * CARD_READ_ATTEMPTS
+
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_transient"
+    assert "expected 3 new card(s), got 2" in _attempt_row(mocks).status_message
+
+
+def test_card_read_retries_then_succeeds():
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    frame_results = [
+        {"new_cards": ["5d", None, "As"]},
+        {"new_cards": ["5d", "8d", "As"]},
+    ]
+
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "complete"
+    assert mocks.frame.call_count == 2
+    streets = _written_row(mocks).hand_action_state["streets"]
+    assert streets[1]["community_cards"] == ["5d", "8d", "As"]
+
+
+def test_card_read_stops_at_attempt_cap():
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    frame_results = [{"new_cards": [None, None, None]}] * (CARD_READ_ATTEMPTS + 2)
+
+    with _patched(clip_results, frame_results) as mocks:
+        _call(_pending())
+
+    assert mocks.frame.call_count == CARD_READ_ATTEMPTS
+
+
+def test_null_card_parks_at_cap():
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    frame_results = [{"new_cards": ["5d", None, "As"]}] * CARD_READ_ATTEMPTS
+
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending(consecutive_failures=2))
+
+    assert outcome == "failed_parked"
+    assert _attempt_row(mocks).status == "failed_parked"
+
+
+def test_community_card_unreadable_is_transient_not_permanent():
+    assert not issubclass(CommunityCardUnreadable, GeminiPermanentError)
+
+
+# ---------------------------------------------------------------------------
+# Scan found: false is how the hand's end is discovered, not a failure
+# ---------------------------------------------------------------------------
+
+
+def test_scan_not_found_truncates_streets_and_still_completes():
+    clip_results = [
+        _d_result(street_names=("preflop", "flop", "turn", "river")),
+        _scan(timestamp="02:00"),
+        _scan(found=False),
+    ]
+    frame_results = [{"new_cards": ["5d", "8d", "As"]}]
+
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "complete"
+    # The river scan is never issued once the turn is absent.
+    assert mocks.clip.call_count == 3
+
+    row = _written_row(mocks)
+    assert [s["street_name"] for s in row.hand_action_state["streets"]] == ["preflop", "flop"]
+    assert len(row.street_frame_gcs_paths) == 1
+
+    # The D/E disagreement is the cross-check sequential execution preserves.
+    message = _attempt_row(mocks).status_message
+    assert "D reported turn" in message
+    assert "truncated" in message
+
+
+def test_status_message_records_window_and_streets_on_clean_run():
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    with _patched(clip_results, [{"new_cards": ["5d", "8d", "As"]}]) as mocks:
+        _call(_pending())
+
+    message = _attempt_row(mocks).status_message
+    assert message.startswith("complete: window=60s streets=preflop,flop")
+    assert "truncated" not in message
+
+
+# ---------------------------------------------------------------------------
+# Heads-up label rewriting
+# ---------------------------------------------------------------------------
+
+
+def test_heads_up_rewrites_sb_in_actions_and_winning_positions():
+    state = _hand_start_state(
+        total_seat_count=2,
+        players=[
+            {"seat_number": 1, "seat_position_label": "BB", "stack_size": 100.0,
+             "hole_cards": ["Ah", "Kd"]},
+            {"seat_number": 3, "seat_position_label": "BTN", "stack_size": 80.0,
+             "hole_cards": ["2c", "3c"]},
+        ],
+    )
+    d_result = _d_result(
+        winning_positions=("SB",),
+        actions=[
+            {"action_order": 1, "seat_position_label": "SB",
+             "action_type": "raise", "bet_amount": 2.5},
+            {"action_order": 2, "seat_position_label": "BB",
+             "action_type": "call", "bet_amount": 2.5},
+        ],
+    )
+
+    with _patched([d_result]) as mocks:
+        outcome = _call(_pending(hand_start_state=state))
+
+    assert outcome == "complete"
+    hand_action_state = _written_row(mocks).hand_action_state
+    assert hand_action_state["winning_positions"] == ["BTN"]
+    labels = [a["seat_position_label"] for a in hand_action_state["streets"][0]["actions"]]
+    assert labels == ["BTN", "BB"]
+
+
+def test_six_handed_sb_is_not_rewritten():
+    d_result = _d_result(
+        winning_positions=("SB",),
+        actions=[
+            {"action_order": 1, "seat_position_label": "SB",
+             "action_type": "raise", "bet_amount": 2.5},
+        ],
+    )
+
+    with _patched([d_result]) as mocks:
+        _call(_pending())
+
+    hand_action_state = _written_row(mocks).hand_action_state
+    assert hand_action_state["winning_positions"] == ["SB"]
+    assert hand_action_state["streets"][0]["actions"][0]["seat_position_label"] == "SB"
+
+
+# ---------------------------------------------------------------------------
+# Error classification and the no-clobber rule
+# ---------------------------------------------------------------------------
+
+
+def test_gemini_permanent_error_is_failed_permanent():
+    with _patched(GeminiPermanentError("malformed JSON from Gemini")) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_permanent"
+    assert _attempt_row(mocks).status == "failed_permanent"
+    mocks.write_actions.assert_not_called()
+
+
+def test_gemini_transient_error_is_failed_transient():
+    with _patched(GeminiTransientError("rate limited")) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_transient"
+    mocks.write_actions.assert_not_called()
+
+
+def test_hallucinated_street_timestamp_is_failed_permanent():
+    clip_results = [
+        _d_result(street_names=("preflop", "flop")),
+        _scan(timestamp="09:99"),  # 599s, far outside [105, 160]
+    ]
+    with _patched(clip_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_permanent"
+    assert "hallucination" in _attempt_row(mocks).status_message
+
+
+def test_gemini_permanent_error_unaffected_by_retry_cap():
+    with _patched(GeminiPermanentError("boom")):
+        outcome = _call(_pending(consecutive_failures=5))
+
+    assert outcome == "failed_permanent"
+
+
+def test_catch_all_exception_parks_at_cap():
+    with _patched(RuntimeError("something else broke")):
+        outcome = _call(_pending(consecutive_failures=2))
+
+    assert outcome == "failed_parked"
+
+
+@pytest.mark.parametrize(
+    "clip_results,frame_results",
+    [
+        (GeminiPermanentError("boom"), None),
+        (RuntimeError("boom"), None),
+        ([_d_result(winning_positions=())], None),
+        (
+            [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")],
+            [{"new_cards": ["5d", None, "As"]}] * CARD_READ_ATTEMPTS,
+        ),
+    ],
+)
+def test_failures_never_clear_an_existing_row(clip_results, frame_results):
+    # ARCHITECTURE.md: failures never delete existing output, so a stage row
+    # legitimately coexists with a later failed_transient or failed_parked
+    # attempt. A failure must not call the writer at all — not even with [].
+    with _patched(clip_results, frame_results) as mocks:
+        _call(_pending())
+
+    mocks.write_actions.assert_not_called()
+
+
+def test_complete_always_writes_exactly_one_row():
+    # Phase 5 has no successful zero-row outcome: a hand that ends preflop still
+    # has a preflop street, so `complete` always means one row.
+    with _patched([_d_result()]) as mocks:
+        _call(_pending())
+
+    mocks.write_actions.assert_called_once()
+    rows, = mocks.write_actions.call_args[0]
+    assert len(rows) == 1
+    assert mocks.write_actions.call_args[1]["hand_start_id"] == "clip_001_001_001"
+
+
+# ---------------------------------------------------------------------------
+# process_pending_hand_starts
+# ---------------------------------------------------------------------------
+
+
+def _run_pending(**kwargs):
+    return _run(
+        process_pending_hand_starts(
+            "proj", "ds", "videos-bucket", "actions-bucket",
+            _ACTIONS_PROMPT, _SCAN_PROMPT, _FRAME_PROMPT, _REFERENCE_IMAGES,
+            **kwargs,
+        )
+    )
+
+
+def test_process_pending_hand_starts_dispatch():
+    hand_starts = [
+        _pending(hand_start_id="a", video_id="vid_a"),
+        _pending(hand_start_id="b", video_id="vid_a"),
+        _pending(hand_start_id="c", video_id="vid_b"),
+    ]
+    with (
+        patch(
+            "table_talk.hand_action_processing._find_pending_hand_starts",
+            return_value=hand_starts,
+        ),
+        patch("table_talk.hand_action_processing.download_video") as mock_download,
+        patch(
+            "table_talk.hand_action_processing.process_hand_start",
+            new_callable=AsyncMock, return_value="complete",
+        ) as mock_process,
+    ):
+        stats = _run_pending()
+
+    assert mock_download.call_count == 2
+    assert mock_process.call_count == 3
+    assert stats["hand_starts_processed"] == 3
+    assert stats["hand_starts_complete"] == 3
+    assert stats["hand_starts_failed_transient"] == 0
+
+
+def test_process_pending_hand_starts_scope_params_translated():
+    with (
+        patch(
+            "table_talk.hand_action_processing._find_pending_hand_starts", return_value=[]
+        ) as mock_find,
+    ):
+        _run_pending(video_id="vid_a", only_hand_start_ids=["x"])
+
+    kwargs = mock_find.call_args[1]
+    assert kwargs["only_video_ids"] == ["vid_a"]
+    assert kwargs["only_hand_start_ids"] == ["x"]
+
+
+def test_process_pending_hand_starts_no_video_id_means_no_video_scope():
+    with patch(
+        "table_talk.hand_action_processing._find_pending_hand_starts", return_value=[]
+    ) as mock_find:
+        _run_pending()
+
+    assert mock_find.call_args[1]["only_video_ids"] is None
+
+
+def test_process_pending_hand_starts_download_failure_marks_transient():
+    with (
+        patch(
+            "table_talk.hand_action_processing._find_pending_hand_starts",
+            return_value=[_pending()],
+        ),
+        patch(
+            "table_talk.hand_action_processing.download_video",
+            side_effect=RuntimeError("network"),
+        ),
+        patch("table_talk.hand_action_processing._write_attempt") as mock_attempt,
+    ):
+        stats = _run_pending()
+
+    assert stats["hand_starts_failed_transient"] == 1
+    assert mock_attempt.call_args[0][1] == "failed_transient"
+    assert "video_download_failed" in mock_attempt.call_args[0][2]
+
+
+def test_process_pending_hand_starts_download_failure_parks_at_cap():
+    with (
+        patch(
+            "table_talk.hand_action_processing._find_pending_hand_starts",
+            return_value=[_pending(consecutive_failures=2)],
+        ),
+        patch(
+            "table_talk.hand_action_processing.download_video",
+            side_effect=RuntimeError("network"),
+        ),
+        patch("table_talk.hand_action_processing._write_attempt") as mock_attempt,
+    ):
+        stats = _run_pending()
+
+    assert stats["hand_starts_failed_parked"] == 1
+    assert mock_attempt.call_args[0][1] == "failed_parked"
+
+
+def test_process_pending_hand_starts_download_not_found_marks_permanent():
+    with (
+        patch(
+            "table_talk.hand_action_processing._find_pending_hand_starts",
+            return_value=[_pending()],
+        ),
+        patch(
+            "table_talk.hand_action_processing.download_video",
+            side_effect=DownloadPermanentError("404"),
+        ),
+        patch("table_talk.hand_action_processing._write_attempt") as mock_attempt,
+    ):
+        stats = _run_pending()
+
+    assert stats["hand_starts_failed_permanent"] == 1
+    assert mock_attempt.call_args[0][1] == "failed_permanent"
+    assert "video_download_not_found" in mock_attempt.call_args[0][2]
+
+
+def test_process_pending_hand_starts_respects_max_attempts_override():
+    with (
+        patch(
+            "table_talk.hand_action_processing._find_pending_hand_starts",
+            return_value=[_pending(consecutive_failures=0)],
+        ),
+        patch(
+            "table_talk.hand_action_processing.download_video",
+            side_effect=RuntimeError("network"),
+        ),
+        patch("table_talk.hand_action_processing._write_attempt") as mock_attempt,
+    ):
+        stats = _run_pending(max_attempts=1)
+
+    assert stats["hand_starts_failed_parked"] == 1
+    assert mock_attempt.call_args[0][1] == "failed_parked"

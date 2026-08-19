@@ -38,6 +38,16 @@ def build_action_context(hand_start_state: dict) -> str:
     return "\n".join(lines)
 
 
+def build_prior_cards_context(prior_cards: list[str]) -> str:
+    # extract_community_cards_from_frame.md keys the number of cards to read off
+    # the number of prior cards (0 -> 3, 3 -> 1, 4 -> 1), so the count is stated
+    # outright rather than left to be inferred from the list.
+    if not prior_cards:
+        return "(none — 0 prior cards)"
+    listed = "\n".join(f"- {card}" for card in prior_cards)
+    return f"{listed}\n\n({len(prior_cards)} prior cards)"
+
+
 def build_hole_card_context(hand_start_state: dict) -> str:
     # The FVA's seat_number bounds the eligible set (seats 1..FVA inclusive),
     # but step C now reads every eligible seat uniformly by stack — no
