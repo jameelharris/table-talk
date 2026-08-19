@@ -2,10 +2,11 @@
 # this text shape at their substitution slots. If you change a format here, the paired
 # prompt file needs to change too.
 #
-#   build_player_context    -> {player_context}    in identify_hand_start.md
-#   build_hole_card_context -> {hole_card_context} in extract_hole_cards.md
-#   build_action_context    -> {player_context}    in extract_player_actions.md
-#   build_fva_context       -> {fva_context}       in extract_player_actions.md
+#   build_player_context      -> {player_context}    in identify_hand_start.md
+#   build_hole_card_context   -> {hole_card_context} in extract_hole_cards.md
+#   build_action_context      -> {player_context}    in extract_player_actions.md
+#   build_fva_context         -> {fva_context}       in extract_player_actions.md
+#   build_prior_cards_context -> {prior_cards}       in extract_community_cards_from_frame.md
 #
 # build_fva_context had no caller between the step-C stack-anchor fix and Phase 5;
 # extract_player_actions.md uses it again to establish that the FVA is action_order 1.
@@ -15,6 +16,7 @@ from table_talk.prompt_context import (
     build_fva_context,
     build_hole_card_context,
     build_player_context,
+    build_prior_cards_context,
 )
 
 _NINE_HANDED_PLAYERS = [
@@ -216,3 +218,47 @@ def test_build_action_context_null_stack_renders_none():
          "hole_cards": ["Ah", "Kd"]},
     ])
     assert build_action_context(state) == "- Seat 1 (BB) | Stack: None BB | Hole cards: Ah Kd"
+
+
+# ---------------------------------------------------------------------------
+# build_prior_cards_context
+# ---------------------------------------------------------------------------
+
+
+def test_build_prior_cards_context_empty_states_zero_outright():
+    # The flop case, and the one most likely to be broken by a future edit.
+    # extract_community_cards_from_frame.md derives how many cards to read from
+    # this slot (0 -> 3, 3 -> 1, 4 -> 1), so "nothing" has to be a positive
+    # statement rather than an empty slot. If the model reads this as non-zero,
+    # the flop read is told it is reading a turn and returns one card instead of
+    # three — a confidently wrong read, not a malformed request.
+    assert build_prior_cards_context([]) == "(none — 0 prior cards)"
+
+
+def test_build_prior_cards_context_three_cards_is_the_turn_case():
+    assert build_prior_cards_context(["5d", "8d", "As"]) == (
+        "- 5d\n"
+        "- 8d\n"
+        "- As\n"
+        "\n"
+        "(3 prior cards)"
+    )
+
+
+def test_build_prior_cards_context_four_cards_is_the_river_case():
+    assert build_prior_cards_context(["5d", "8d", "As", "Kh"]) == (
+        "- 5d\n"
+        "- 8d\n"
+        "- As\n"
+        "- Kh\n"
+        "\n"
+        "(4 prior cards)"
+    )
+
+
+def test_build_prior_cards_context_preserves_supplied_order():
+    # prior_cards accumulates flop, then turn, then river, and the prompt tells
+    # the model each new card sits to the right of the last — so the order the
+    # accumulator supplies is meaning, not presentation.
+    result = build_prior_cards_context(["Kh", "5d", "As", "8d"])
+    assert result.splitlines()[:4] == ["- Kh", "- 5d", "- As", "- 8d"]
