@@ -1,6 +1,6 @@
 # CLI entrypoint. Exposes `tt` command via the [project.scripts] entry
 # in pyproject.toml. Subcommands: `tt ingest`, `tt materialize-clips`,
-# `tt process-clips`, `tt process-hand-setups`.
+# `tt process-clips`, `tt process-hand-setups`, `tt process-hand-starts`.
 
 import argparse
 import asyncio
@@ -10,9 +10,15 @@ from pathlib import Path
 from google.cloud import bigquery, storage
 
 from .clip_materialization import MaterializeError, materialize_clips, materialize_clips_for_pending_videos
+from .hand_action_processing import process_pending_hand_starts
 from .hand_setup_processing import process_pending_clips
 from .hand_start_processing import process_pending_hand_setups
 from .ingest import process_manifest
+from .reference_images import (
+    STREET_REFERENCE_ORDER,
+    load_reference_images,
+    reference_image_filename,
+)
 
 
 def main() -> None:
@@ -47,6 +53,15 @@ def main() -> None:
     phs_parser.add_argument("--video-id")
     phs_parser.add_argument("--max-concurrent", type=int, default=4)
     phs_parser.add_argument("--max-attempts", type=int, default=3)
+
+    pha_parser = subparsers.add_parser("process-hand-starts")
+    pha_parser.add_argument("--project", required=True)
+    pha_parser.add_argument("--dataset", required=True)
+    pha_parser.add_argument("--videos-bucket", required=True)
+    pha_parser.add_argument("--hand-actions-bucket", required=True)
+    pha_parser.add_argument("--video-id")
+    pha_parser.add_argument("--max-concurrent", type=int, default=4)
+    pha_parser.add_argument("--max-attempts", type=int, default=3)
 
     args = parser.parse_args()
 
@@ -148,6 +163,53 @@ def main() -> None:
                 hand_starts_bucket=args.hand_starts_bucket,
                 identify_hand_start_prompt=identify_hand_start_prompt,
                 extract_hole_cards_prompt=extract_hole_cards_prompt,
+                video_id=args.video_id,
+                max_concurrent=args.max_concurrent,
+                max_attempts=args.max_attempts,
+            )
+        )
+        for key, value in stats.items():
+            print(f"{key}: {value}")
+    elif args.command == "process-hand-starts":
+        prompts_dir = Path(__file__).resolve().parents[2] / "prompts"
+        references_dir = Path(__file__).resolve().parents[2] / "references"
+
+        prompt_paths = {}
+        for name in (
+            "extract_player_actions",
+            "extract_community_cards",
+            "extract_community_cards_from_frame",
+        ):
+            path = prompts_dir / f"{name}.md"
+            if not path.exists():
+                print(f"prompts/{name}.md not found — see README for setup", file=sys.stderr)
+                sys.exit(1)
+            prompt_paths[name] = path
+
+        for street in STREET_REFERENCE_ORDER:
+            filename = reference_image_filename(street)
+            if not (references_dir / filename).exists():
+                print(f"references/{filename} not found — see README for setup", file=sys.stderr)
+                sys.exit(1)
+
+        # Read once at startup, not per hand: a corpus run makes up to three
+        # scan calls per hand and each carries all three images.
+        reference_images = load_reference_images(references_dir)
+
+        stats = asyncio.run(
+            process_pending_hand_starts(
+                project_id=args.project,
+                dataset=args.dataset,
+                videos_bucket=args.videos_bucket,
+                hand_actions_bucket=args.hand_actions_bucket,
+                extract_player_actions_prompt=prompt_paths["extract_player_actions"].read_text(),
+                extract_community_cards_prompt=prompt_paths[
+                    "extract_community_cards"
+                ].read_text(),
+                extract_community_cards_from_frame_prompt=prompt_paths[
+                    "extract_community_cards_from_frame"
+                ].read_text(),
+                reference_images=reference_images,
                 video_id=args.video_id,
                 max_concurrent=args.max_concurrent,
                 max_attempts=args.max_attempts,

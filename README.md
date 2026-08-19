@@ -141,3 +141,17 @@ erDiagram
 ## Getting started
 
 This project is under active development and not yet usable end-to-end. See `terraform/README.md` for infrastructure setup.
+
+### Prompts and reference assets
+
+The extraction commands read two directories at the repo root, both versioned with
+code so changes ride code review:
+
+- `prompts/*.md` — the LLM prompts. Each command checks for the ones it needs at
+  startup and exits non-zero if any is missing.
+- `references/*.jpeg` — the street reference images (`flop_reference.jpeg`,
+  `turn_reference.jpeg`, `river_reference.jpeg`) that accompany Phase 5's
+  community-card scan. `tt process-hand-starts` checks for all three at startup.
+
+Both are resolved relative to the source checkout, so the commands must be run from
+a clone rather than an installed wheel.
