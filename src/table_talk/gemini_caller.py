@@ -116,7 +116,7 @@ def call_gemini_for_clip(
     location: str = "global",
     *,
     user_text: str,
-    reference_images: list[tuple[bytes, str]] | None = None,
+    reference_images: list[tuple[bytes, str, str]] | None = None,
     label: str | None = None,
 ) -> dict:
     client = genai.Client(vertexai=True, project=project_id, location=location)
@@ -129,16 +129,24 @@ def call_gemini_for_clip(
             fps=1.0,
         ),
     )
-    # Video first, then any reference images as (bytes, mime_type), then the
-    # user turn. Omitting reference_images reproduces the original two-part
-    # request exactly, which is why this one stays optional while user_text
-    # is required — the default here is correct for every caller, not a
-    # silently-wrong inherited value.
+    # Video first, then the reference images as (bytes, mime_type, label), then
+    # the user turn.
+    #
+    # Each image is preceded by a text part naming it. The scan prompt's STREET
+    # VISUAL REFERENCE section describes the images by name, so three anonymous
+    # blobs would leave the model inferring which is which from arrival order.
+    # The label string must stay exactly "Reference image — {label}:", em dash
+    # included — it is matched against the prompt's own wording, and this is the
+    # configuration the PoC was validated against. Do not reword it.
+    #
+    # Omitting reference_images reproduces the original two-part request
+    # exactly, which is why this one stays optional while user_text is required:
+    # the default here is correct for every caller, not a silently-wrong
+    # inherited value.
     parts = [video_part]
-    parts += [
-        types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type))
-        for image_bytes, mime_type in (reference_images or [])
-    ]
+    for image_bytes, mime_type, image_label in (reference_images or []):
+        parts.append(types.Part(text=f"Reference image — {image_label}:"))
+        parts.append(types.Part(inline_data=types.Blob(data=image_bytes, mime_type=mime_type)))
     parts.append(types.Part(text=user_text))
     request_contents = types.Content(role="user", parts=parts)
 

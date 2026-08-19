@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import google.api_core.exceptions as api_exc
@@ -169,8 +170,12 @@ def test_clip_without_reference_images_is_unchanged_two_parts():
     assert contents.parts[1].text == USER_TEXT
 
 
-def test_clip_with_reference_images_orders_video_images_then_text():
-    images = [(b"\x01flop", "image/jpeg"), (b"\x02turn", "image/jpeg"), (b"\x03river", "image/png")]
+def test_clip_with_reference_images_labels_each_blob_and_keeps_text_last():
+    images = [
+        (b"\x01flop", "image/jpeg", "flop"),
+        (b"\x02turn", "image/jpeg", "turn"),
+        (b"\x03river", "image/png", "river"),
+    ]
     mock_client_inst = _patched_client(_make_response('{"ok": true}'))
 
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
@@ -185,19 +190,41 @@ def test_clip_with_reference_images_orders_video_images_then_text():
         )
 
     contents = mock_client_inst.models.generate_content.call_args.kwargs["contents"]
-    assert len(contents.parts) == 5
+    # video + (label, blob) x 3 + user turn
+    assert len(contents.parts) == 8
 
     # Video first.
     assert contents.parts[0].file_data.file_uri == VIDEO_URI
 
-    # Then the reference images, in the order given, with their own mime types.
-    for part, (expected_bytes, expected_mime) in zip(contents.parts[1:4], images, strict=True):
-        assert part.inline_data.data == expected_bytes
-        assert part.inline_data.mime_type == expected_mime
-        assert part.text is None
+    # Each blob is immediately preceded by a text part naming it, so the model
+    # never has to infer which image is which from arrival order.
+    for i, (expected_bytes, expected_mime, expected_label) in enumerate(images):
+        label_part = contents.parts[1 + i * 2]
+        blob_part = contents.parts[2 + i * 2]
+        assert label_part.text == f"Reference image — {expected_label}:"
+        assert label_part.inline_data is None
+        assert blob_part.inline_data.data == expected_bytes
+        assert blob_part.inline_data.mime_type == expected_mime
+        assert blob_part.text is None
 
     # User turn stays last.
-    assert contents.parts[4].text == USER_TEXT
+    assert contents.parts[7].text == USER_TEXT
+
+
+def test_reference_image_label_wording_matches_the_scan_prompt():
+    """The label binds each image to its description in the scan prompt.
+
+    extract_community_cards.md's STREET VISUAL REFERENCE section names the
+    images with this exact string. Rewording either side silently unbinds the
+    descriptions from the images, and the resulting degradation would be hard
+    to attribute — so the correspondence is asserted rather than commented.
+    """
+    prompt_text = (
+        Path(__file__).resolve().parents[1] / "prompts" / "extract_community_cards.md"
+    ).read_text(encoding="utf-8")
+
+    for street in ("flop", "turn", "river"):
+        assert f"Reference image — {street}:" in prompt_text
 
 
 def test_clip_empty_reference_images_list_is_two_parts():
