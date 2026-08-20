@@ -44,6 +44,7 @@ def main() -> None:
     pc_parser.add_argument("--max-concurrent", type=int, default=4)
     pc_parser.add_argument("--max-attempts", type=int, default=3)
     pc_parser.add_argument("--video-id")
+    pc_parser.add_argument("--clip-id")
 
     phs_parser = subparsers.add_parser("process-hand-setups")
     phs_parser.add_argument("--project", required=True)
@@ -51,6 +52,7 @@ def main() -> None:
     phs_parser.add_argument("--videos-bucket", required=True)
     phs_parser.add_argument("--hand-starts-bucket", required=True)
     phs_parser.add_argument("--video-id")
+    phs_parser.add_argument("--hand-setup-id")
     phs_parser.add_argument("--max-concurrent", type=int, default=4)
     phs_parser.add_argument("--max-attempts", type=int, default=3)
 
@@ -60,6 +62,7 @@ def main() -> None:
     pha_parser.add_argument("--videos-bucket", required=True)
     pha_parser.add_argument("--hand-actions-bucket", required=True)
     pha_parser.add_argument("--video-id")
+    pha_parser.add_argument("--hand-start-id")
     pha_parser.add_argument("--max-concurrent", type=int, default=4)
     pha_parser.add_argument("--max-attempts", type=int, default=3)
 
@@ -117,6 +120,7 @@ def main() -> None:
         identify_hand_prompt = identify_hand_path.read_text()
         extract_player_info_prompt = extract_player_info_path.read_text()
         only_video_ids = [args.video_id] if args.video_id else None
+        only_clip_ids = [args.clip_id] if args.clip_id else None
 
         stats = asyncio.run(
             process_pending_clips(
@@ -128,6 +132,7 @@ def main() -> None:
                 extract_player_info_prompt=extract_player_info_prompt,
                 max_concurrent=args.max_concurrent,
                 only_video_ids=only_video_ids,
+                only_clip_ids=only_clip_ids,
                 max_attempts=args.max_attempts,
             )
         )
@@ -164,6 +169,9 @@ def main() -> None:
                 identify_hand_start_prompt=identify_hand_start_prompt,
                 extract_hole_cards_prompt=extract_hole_cards_prompt,
                 video_id=args.video_id,
+                only_hand_setup_ids=(
+                    [args.hand_setup_id] if args.hand_setup_id else None
+                ),
                 max_concurrent=args.max_concurrent,
                 max_attempts=args.max_attempts,
             )
@@ -211,6 +219,9 @@ def main() -> None:
                 ].read_text(),
                 reference_images=reference_images,
                 video_id=args.video_id,
+                only_hand_start_ids=(
+                    [args.hand_start_id] if args.hand_start_id else None
+                ),
                 max_concurrent=args.max_concurrent,
                 max_attempts=args.max_attempts,
             )
