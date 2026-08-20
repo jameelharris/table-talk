@@ -1,5 +1,10 @@
 import asyncio
+import os
+import subprocess
+import tempfile
+import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -948,3 +953,513 @@ def test_process_pending_hand_starts_respects_max_attempts_override():
 
     assert stats["hand_starts_failed_parked"] == 1
     assert mock_attempt.call_args[0][1] == "failed_parked"
+
+
+# ---------------------------------------------------------------------------
+# Integration tests — require terraform apply and GCP dev credentials.
+#
+# Heavy imports are deferred inside each test so the unit suite does not pay for
+# them. Setup goes through each earlier phase's production writer, never its
+# orchestrator, per CLAUDE.md's cross-phase setup rule.
+# ---------------------------------------------------------------------------
+
+_INTEGRATION_PROJECT = "table-talk-497020"
+_INTEGRATION_DATASET = "table_talk_dev"
+
+
+def _seed_hand_start(bq_client, *, hand_setup_time_seconds=0, duration_seconds=60, uid_tag="p5"):
+    """Create videos -> clip_manifest -> hand_setups -> hand_starts for one hand.
+
+    duration_seconds drives raw_lead_gap_seconds: with a single hand_setups row
+    the pending query's LEAD finds no next hand and falls back to the video's
+    duration, so the window is (duration_seconds - hand_setup_time_seconds).
+    """
+    from table_talk._generated.hand_setups_row import HandSetupsRow
+    from table_talk._generated.hand_starts_row import HandStartsRow
+    from table_talk.clip_manifest_writer import ClipManifestRow, write_clip_manifest_rows
+    from table_talk.hand_setups_writer import write_hand_setups
+    from table_talk.hand_starts_writer import write_hand_starts
+    from table_talk.videos_writer import VideosRow, write_video_row
+
+    uid = uuid.uuid4().hex[:10]
+    video_id = f"test_{uid_tag}_{uid}"
+    clip_id = f"{video_id}_001"
+    hand_setup_id = f"{clip_id}_001"
+    hand_start_id = f"{hand_setup_id}_001"
+
+    hand_setup_state = {
+        "total_seat_count": 6,
+        "pot_size_bb": 1.5,
+        "players": [
+            {"seat_number": 1, "seat_position_label": "BB", "stack_size": 100.0,
+             "hole_cards": ["Ah", "Kd"]},
+            {"seat_number": 4, "seat_position_label": "CO", "stack_size": 80.0,
+             "hole_cards": ["2c", "3c"]},
+        ],
+    }
+
+    # project= for the Phase 1/2 writers, project_id= for the stage writers —
+    # the known keyword asymmetry, honoured rather than normalized.
+    write_video_row(
+        VideosRow(
+            video_id=video_id,
+            source_url=f"https://www.youtube.com/watch?v={video_id}",
+            title="Phase 5 integration test",
+            duration_seconds=duration_seconds,
+            gcs_path=f"gs://fake-bucket/{video_id}.mp4",
+            file_size_bytes=1,
+        ),
+        project=_INTEGRATION_PROJECT,
+        dataset=_INTEGRATION_DATASET,
+        client=bq_client,
+    )
+    write_clip_manifest_rows(
+        [
+            ClipManifestRow(
+                clip_id=clip_id,
+                video_id=video_id,
+                clip_start_time=0,
+                clip_end_time=duration_seconds,
+            )
+        ],
+        project=_INTEGRATION_PROJECT,
+        dataset=_INTEGRATION_DATASET,
+        client=bq_client,
+    )
+    write_hand_setups(
+        [
+            HandSetupsRow(
+                hand_setup_id=hand_setup_id,
+                clip_id=clip_id,
+                video_id=video_id,
+                hand_setup_time_seconds=hand_setup_time_seconds,
+                frame_gcs_path=f"gs://fake-bucket/{hand_setup_id}.jpg",
+                hand_setup_state=hand_setup_state,
+            )
+        ],
+        clip_id=clip_id,
+        project_id=_INTEGRATION_PROJECT,
+        dataset=_INTEGRATION_DATASET,
+        client=bq_client,
+    )
+    write_hand_starts(
+        [
+            HandStartsRow(
+                hand_start_id=hand_start_id,
+                hand_setup_id=hand_setup_id,
+                clip_id=clip_id,
+                video_id=video_id,
+                fva_time_seconds=hand_setup_time_seconds + 2,
+                second_action_time_seconds=hand_setup_time_seconds + 4,
+                hand_start_state={
+                    "hand_setup": hand_setup_state,
+                    "fva": {
+                        "seat_position_label": "CO",
+                        "seat_number": 4,
+                        "action_type": "raise",
+                        "bet_amount": 2.5,
+                    },
+                },
+                fva_frame_gcs_path=f"gs://fake-bucket/{hand_setup_id}_fva.jpg",
+                verify_frame_gcs_paths=[f"gs://fake-bucket/{hand_setup_id}_verify_000.jpg"],
+            )
+        ],
+        hand_setup_id=hand_setup_id,
+        project_id=_INTEGRATION_PROJECT,
+        dataset=_INTEGRATION_DATASET,
+        client=bq_client,
+    )
+    return SimpleNamespace(
+        video_id=video_id,
+        clip_id=clip_id,
+        hand_setup_id=hand_setup_id,
+        hand_start_id=hand_start_id,
+    )
+
+
+def _upload_fixture_video(gcs_client, videos_bucket, video_id, duration_seconds=1):
+    """Generate a lavfi test video, upload it, and return the blob for cleanup.
+
+    process_pending_hand_starts downloads a video once per video *before*
+    dispatching to process_hand_start, so every integration test that reaches the
+    orchestrator needs an object in GCS — including one whose hand skips on
+    preconditions, because the download precedes the precondition check.
+
+    The file's own duration is irrelevant to the pending query, which reads
+    duration_seconds off the videos row, so callers that never decode the video
+    can leave this at one second.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fixture_path = os.path.join(tmpdir, "fixture.mp4")
+        subprocess.run(
+            ["ffmpeg", "-f", "lavfi",
+             "-i", f"testsrc=duration={duration_seconds}:size=320x240",
+             "-y", fixture_path],
+            check=True,
+            capture_output=True,
+        )
+        with open(fixture_path, "rb") as fh:
+            video_bytes = fh.read()
+
+    blob = gcs_client.bucket(videos_bucket).blob(f"{video_id}.mp4")
+    blob.upload_from_string(video_bytes, content_type="video/mp4")
+    return blob
+
+
+def _write_hand_start_attempt(bq_client, hand_start_id, status):
+    from table_talk._generated.hand_start_processing_attempts_row import (
+        HandStartProcessingAttemptsRow,
+    )
+    from table_talk.hand_start_processing_attempts_writer import (
+        write_hand_start_processing_attempt_row,
+    )
+
+    write_hand_start_processing_attempt_row(
+        HandStartProcessingAttemptsRow(
+            attempt_id=uuid.uuid4().hex,
+            hand_start_id=hand_start_id,
+            status=status,
+            status_message=status,
+        ),
+        project=_INTEGRATION_PROJECT,
+        dataset=_INTEGRATION_DATASET,
+        client=bq_client,
+    )
+
+
+def _query_rows(bq_client, sql, **params):
+    from google.cloud import bigquery as bq
+
+    job_config = bq.QueryJobConfig(
+        query_parameters=[
+            bq.ScalarQueryParameter(name, "STRING", value) for name, value in params.items()
+        ]
+    )
+    return list(bq_client.query(sql, job_config=job_config).result())
+
+
+def _cleanup_hand_start(bq_client, ids):
+    """Delete in reverse dependency order: deepest stage table first, videos last."""
+    from google.cloud import bigquery as bq
+
+    prefix = f"{_INTEGRATION_PROJECT}.{_INTEGRATION_DATASET}"
+    for table, column, value in [
+        (f"{prefix}.hand_actions", "hand_start_id", ids.hand_start_id),
+        (f"{prefix}.hand_start_processing_attempts", "hand_start_id", ids.hand_start_id),
+        (f"{prefix}.hand_starts", "hand_setup_id", ids.hand_setup_id),
+        (f"{prefix}.hand_setup_processing_attempts", "hand_setup_id", ids.hand_setup_id),
+        (f"{prefix}.hand_setups", "hand_setup_id", ids.hand_setup_id),
+        (f"{prefix}.clip_manifest", "clip_id", ids.clip_id),
+        (f"{prefix}.videos", "video_id", ids.video_id),
+    ]:
+        bq_client.query(
+            f"DELETE FROM `{table}` WHERE {column} = @val",
+            job_config=bq.QueryJobConfig(
+                query_parameters=[bq.ScalarQueryParameter("val", "STRING", value)]
+            ),
+        ).result()
+
+
+@pytest.mark.integration
+def test_process_pending_hand_starts_precondition_skip_integration():
+    """The deterministic counterpart to the happy-path test below.
+
+    The happy-path test accepts several outcomes because Gemini is stochastic
+    against lavfi content, so it can pass while the pending query, the writers or
+    the cleanup are subtly wrong as long as something got written. This one has
+    exactly one correct answer and costs no Gemini call.
+
+    It also covers a path nothing else reaches: the unit tests build
+    PendingHandStart by hand, so only this proves the pending query populates
+    raw_lead_gap_seconds from the LEAD-and-duration_seconds fallback and hands it
+    to the real check_preconditions.
+
+    A fixture video is still required. process_pending_hand_starts downloads once
+    per video before dispatching to process_hand_start, so without an object in
+    GCS the per-video DownloadPermanentError branch writes failed_permanent for
+    every hand and the precondition is never reached. The download is amortised
+    across a video's hands in production, so it is not worth reordering the
+    orchestrator to skip it — see CLAUDE.md section 2.
+    """
+    from google.cloud import bigquery as bq
+    from google.cloud import storage as gcs
+
+    videos_bucket = "table-talk-497020-videos-dev"
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    gcs_client = gcs.Client()
+
+    # One hand_setups row, so LEAD falls back to duration_seconds: 500 - 100 = 400,
+    # comfortably past MAX_WINDOW_SECONDS.
+    ids = _seed_hand_start(
+        bq_client, hand_setup_time_seconds=100, duration_seconds=500, uid_tag="p5skip"
+    )
+    expected_gap = 400
+    assert expected_gap > MAX_WINDOW_SECONDS
+
+    # Uploaded before the try, so finally covers its deletion. One second is
+    # enough — the hand skips before anything decodes it.
+    video_blob = _upload_fixture_video(gcs_client, videos_bucket, ids.video_id)
+
+    try:
+        stats = _run(
+            process_pending_hand_starts(
+                project_id=_INTEGRATION_PROJECT,
+                dataset=_INTEGRATION_DATASET,
+                videos_bucket=videos_bucket,
+                hand_actions_bucket="table-talk-497020-hand-actions-dev",
+                extract_player_actions_prompt="UNUSED {player_context} {fva_context}",
+                extract_community_cards_prompt="UNUSED {street_name}",
+                extract_community_cards_from_frame_prompt="UNUSED {prior_cards}",
+                reference_images=[],
+                only_hand_start_ids=[ids.hand_start_id],
+                bq_client=bq_client,
+                gcs_client=gcs_client,
+            )
+        )
+
+        assert stats["hand_starts_processed"] == 1
+        assert stats["hand_starts_complete_skipped"] == 1
+        assert stats["hand_starts_complete"] == 0
+
+        attempts = _query_rows(
+            bq_client,
+            f"SELECT status, status_message FROM "
+            f"`{_INTEGRATION_PROJECT}.{_INTEGRATION_DATASET}.hand_start_processing_attempts` "
+            f"WHERE hand_start_id = @hand_start_id",
+            hand_start_id=ids.hand_start_id,
+        )
+        assert len(attempts) == 1
+        assert attempts[0].status == "complete_skipped"
+        assert str(expected_gap) in attempts[0].status_message
+        assert "MAX_WINDOW_SECONDS" in attempts[0].status_message
+
+        action_rows = _query_rows(
+            bq_client,
+            f"SELECT hand_start_id FROM "
+            f"`{_INTEGRATION_PROJECT}.{_INTEGRATION_DATASET}.hand_actions` "
+            f"WHERE hand_start_id = @hand_start_id",
+            hand_start_id=ids.hand_start_id,
+        )
+        assert action_rows == []
+    finally:
+        _cleanup_hand_start(bq_client, ids)
+        if video_blob.exists():
+            video_blob.delete()
+
+
+@pytest.mark.integration
+def test_process_pending_hand_starts_integration():
+    """Full path against real infrastructure: pending query, Gemini, ffmpeg, GCS.
+
+    The outcome is deliberately loose — lavfi test-pattern content has no poker in
+    it, so Gemini's answer is stochastic. What this proves is that the whole chain
+    is wired correctly end to end, including that the reference_images tuples and
+    the video request reach the API in a shape it accepts.
+    """
+    from google.cloud import bigquery as bq
+    from google.cloud import storage as gcs
+
+    from table_talk.reference_images import load_reference_images
+
+    videos_bucket = "table-talk-497020-videos-dev"
+    hand_actions_bucket = "table-talk-497020-hand-actions-dev"
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    gcs_client = gcs.Client()
+
+    ids = _seed_hand_start(
+        bq_client, hand_setup_time_seconds=0, duration_seconds=60, uid_tag="p5"
+    )
+
+    prompts_dir = Path(__file__).resolve().parents[1] / "prompts"
+    references_dir = Path(__file__).resolve().parents[1] / "references"
+
+    # Uploaded before the try, so finally covers its deletion.
+    video_blob = _upload_fixture_video(
+        gcs_client, videos_bucket, ids.video_id, duration_seconds=60
+    )
+
+    try:
+        stats = _run(
+            process_pending_hand_starts(
+                project_id=_INTEGRATION_PROJECT,
+                dataset=_INTEGRATION_DATASET,
+                videos_bucket=videos_bucket,
+                hand_actions_bucket=hand_actions_bucket,
+                extract_player_actions_prompt=(
+                    prompts_dir / "extract_player_actions.md"
+                ).read_text(),
+                extract_community_cards_prompt=(
+                    prompts_dir / "extract_community_cards.md"
+                ).read_text(),
+                extract_community_cards_from_frame_prompt=(
+                    prompts_dir / "extract_community_cards_from_frame.md"
+                ).read_text(),
+                reference_images=load_reference_images(references_dir),
+                only_hand_start_ids=[ids.hand_start_id],
+                bq_client=bq_client,
+                gcs_client=gcs_client,
+            )
+        )
+
+        assert stats["hand_starts_processed"] == 1
+
+        attempts = _query_rows(
+            bq_client,
+            f"SELECT status, status_message FROM "
+            f"`{_INTEGRATION_PROJECT}.{_INTEGRATION_DATASET}.hand_start_processing_attempts` "
+            f"WHERE hand_start_id = @hand_start_id ORDER BY attempted_at DESC LIMIT 1",
+            hand_start_id=ids.hand_start_id,
+        )
+        assert len(attempts) == 1
+        latest = attempts[0]
+        assert latest.status in (
+            "complete",
+            "complete_skipped",
+            "failed_transient",
+            "failed_permanent",
+        ), f"unexpected status {latest.status!r}: {latest.status_message}"
+
+        action_rows = _query_rows(
+            bq_client,
+            f"SELECT hand_start_id, street_frame_gcs_paths FROM "
+            f"`{_INTEGRATION_PROJECT}.{_INTEGRATION_DATASET}.hand_actions` "
+            f"WHERE hand_start_id = @hand_start_id",
+            hand_start_id=ids.hand_start_id,
+        )
+        # Phase 5 has no successful zero-row outcome, and failures never write.
+        if latest.status == "complete":
+            assert len(action_rows) == 1
+        else:
+            assert action_rows == []
+    finally:
+        _cleanup_hand_start(bq_client, ids)
+        if video_blob.exists():
+            video_blob.delete()
+        for blob in gcs_client.bucket(hand_actions_bucket).list_blobs(
+            prefix=f"{ids.video_id}/"
+        ):
+            blob.delete()
+
+
+# ---------------------------------------------------------------------------
+# _find_pending_hand_starts — attempt-state selection against real BigQuery.
+#
+# These exercise the CTE's latest-status filter and the consecutive-failures
+# counter, neither of which a mocked client can prove.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_find_pending_hand_starts_no_attempts_selected_zero_count():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    ids = _seed_hand_start(bq_client, uid_tag="p5q")
+    try:
+        results = _find_pending_hand_starts(
+            _INTEGRATION_PROJECT,
+            _INTEGRATION_DATASET,
+            only_hand_start_ids=[ids.hand_start_id],
+            client=bq_client,
+        )
+        assert len(results) == 1
+        assert results[0].consecutive_failures == 0
+        # Hydration from the LEAD-and-duration_seconds fallback.
+        assert results[0].raw_lead_gap_seconds == 60
+        assert results[0].hand_setup_time_seconds == 0
+        assert results[0].fva_time_seconds == 2
+    finally:
+        _cleanup_hand_start(bq_client, ids)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_starts_three_transient_selected_count_three():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    ids = _seed_hand_start(bq_client, uid_tag="p5q")
+    try:
+        for _ in range(3):
+            _write_hand_start_attempt(bq_client, ids.hand_start_id, "failed_transient")
+
+        results = _find_pending_hand_starts(
+            _INTEGRATION_PROJECT,
+            _INTEGRATION_DATASET,
+            only_hand_start_ids=[ids.hand_start_id],
+            client=bq_client,
+        )
+        assert len(results) == 1
+        assert results[0].consecutive_failures == 3
+    finally:
+        _cleanup_hand_start(bq_client, ids)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_starts_transient_then_complete_then_transient_counts_one():
+    """The reset case: the counter is consecutive failures since the last
+    non-failure, not the lifetime total, or a healthy hand parks early."""
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    ids = _seed_hand_start(bq_client, uid_tag="p5q")
+    try:
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "failed_transient")
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "complete")
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "failed_transient")
+
+        results = _find_pending_hand_starts(
+            _INTEGRATION_PROJECT,
+            _INTEGRATION_DATASET,
+            only_hand_start_ids=[ids.hand_start_id],
+            client=bq_client,
+        )
+        assert len(results) == 1
+        assert results[0].consecutive_failures == 1
+    finally:
+        _cleanup_hand_start(bq_client, ids)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_starts_complete_then_transient_then_complete_not_selected():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    ids = _seed_hand_start(bq_client, uid_tag="p5q")
+    try:
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "complete")
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "failed_transient")
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "complete")
+
+        results = _find_pending_hand_starts(
+            _INTEGRATION_PROJECT,
+            _INTEGRATION_DATASET,
+            only_hand_start_ids=[ids.hand_start_id],
+            client=bq_client,
+        )
+        assert results == []
+    finally:
+        _cleanup_hand_start(bq_client, ids)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_starts_latest_parked_not_selected():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    ids = _seed_hand_start(bq_client, uid_tag="p5q")
+    try:
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "failed_transient")
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "failed_transient")
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "failed_parked")
+
+        results = _find_pending_hand_starts(
+            _INTEGRATION_PROJECT,
+            _INTEGRATION_DATASET,
+            only_hand_start_ids=[ids.hand_start_id],
+            client=bq_client,
+        )
+        assert results == []
+    finally:
+        _cleanup_hand_start(bq_client, ids)
