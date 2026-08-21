@@ -59,6 +59,16 @@ FRAME_SETTLE_OFFSET = 0.5
 # whole-hand re-run that failing forces.
 CARD_READ_ATTEMPTS = 3
 
+# Extra scans issued when a street scan contradicts D. The two directions of
+# scan error are not symmetric: a wrong found: true is caught by
+# _street_timestamp_guard, but a wrong found: false truncates the hand, looks
+# legitimate, and had no guard at all — it was visible only because D happened
+# to disagree. Reproduction against a real window showed the miss is stochastic
+# rather than a prompt defect: 3 of 4 runs found the street the first scan had
+# missed. Later-street windows are also the narrowest, so this is the cheapest
+# place in the phase to buy a retry and the most expensive place to lose one.
+SCAN_RETRY_ON_DISAGREEMENT = 1
+
 POSTFLOP_STREETS = ("flop", "turn", "river")
 
 # extract_community_cards_from_frame.md's count rule, mirrored here so a
@@ -275,6 +285,49 @@ def _transient_status(consecutive_failures: int, max_attempts: int) -> str:
     return "failed_parked" if consecutive_failures + 1 >= max_attempts else "failed_transient"
 
 
+async def _scan_for_street(
+    street_name: str,
+    scan_prompt: str,
+    video_gcs_uri: str,
+    scan_start: int,
+    window_end: int,
+    project_id: str,
+    reference_images: list[tuple[bytes, str, str]] | None,
+) -> dict:
+    """Scan for one street's reveal, asking again if the answer contradicts D.
+
+    Only ever called for a street D reported, so a found: false here is a
+    disagreement rather than the ordinary end-of-hand answer — that one never
+    reaches this function, because postflop_streets is built from D's own street
+    list. Retrying every found: false would add a call to nearly every hand for
+    nothing, since found: false is the correct answer on any hand ending before
+    the river.
+
+    D's claim gates only *whether to ask again*, never what the answer is. If
+    every scan says no, E's answer stands: D's list is demonstrably fallible in
+    this direction too, having once reported a flop on a hand that folded out
+    preflop, where E was right to find none.
+    """
+    scan_result: dict = {}
+    for attempt in range(SCAN_RETRY_ON_DISAGREEMENT + 1):
+        scan_result = await asyncio.to_thread(
+            call_gemini_for_clip,
+            scan_prompt.replace("{street_name}", street_name),
+            video_gcs_uri,
+            scan_start,
+            window_end,
+            project_id,
+            user_text=f"Scan this clip and find when the {street_name} cards appear.",
+            reference_images=reference_images,
+            # Retries carry their own label so their cost is greppable apart
+            # from first-attempt scans.
+            label=f"step_e_scan_{street_name}" + ("_retry" if attempt else ""),
+        )
+        if scan_result.get("found"):
+            return scan_result
+    return scan_result
+
+
 async def _read_street_cards(
     frame_prompt: str,
     frame_bytes: bytes,
@@ -338,16 +391,18 @@ async def _run_step_e(
     current_scan_start = hs.fva_time_seconds
 
     for street_name in postflop_streets:
-        scan_result = await asyncio.to_thread(
-            call_gemini_for_clip,
-            scan_prompt.replace("{street_name}", street_name),
+        # A found: false in this loop always contradicts D — see _scan_for_street.
+        # Neither prior_cards nor current_scan_start is touched until a scan has
+        # succeeded, so a retry that succeeds advances them exactly as a
+        # first-attempt success does, and one that fails leaves them untouched.
+        scan_result = await _scan_for_street(
+            street_name,
+            scan_prompt,
             video_gcs_uri,
             current_scan_start,
             window_end,
             project_id,
-            user_text=f"Scan this clip and find when the {street_name} cards appear.",
-            reference_images=reference_images,
-            label=f"step_e_scan_{street_name}",
+            reference_images,
         )
         if not scan_result.get("found"):
             return resolved, street_name
@@ -539,8 +594,10 @@ async def process_hand_start(
         if truncated_at is not None:
             # D and E disagreeing is the one cross-check sequential execution
             # preserves; record it rather than discarding it.
+            scans = SCAN_RETRY_ON_DISAGREEMENT + 1
             status_message += (
-                f"; D reported {truncated_at} but the scan found none — truncated there"
+                f"; D reported {truncated_at} but {scans} scans found none"
+                f" — truncated there"
             )
         # write_hand_actions() is REPLACE (DELETE+INSERT) semantics keyed on
         # hand_start_id, so a post-write attempt-write failure here is safe:

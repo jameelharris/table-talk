@@ -653,7 +653,8 @@ def test_scan_not_found_truncates_streets_and_still_completes():
     clip_results = [
         _d_result(street_names=("preflop", "flop", "turn", "river")),
         _scan(timestamp="02:00"),
-        _scan(found=False),
+        _scan(found=False),   # turn, first attempt
+        _scan(found=False),   # turn, disagreement retry
     ]
     frame_results = [{"new_cards": ["5d", "8d", "As"]}]
 
@@ -661,8 +662,9 @@ def test_scan_not_found_truncates_streets_and_still_completes():
         outcome = _call(_pending())
 
     assert outcome == "complete"
-    # The river scan is never issued once the turn is absent.
-    assert mocks.clip.call_count == 3
+    # D + flop scan + two turn scans. The river is never scanned once the turn
+    # is confirmed absent.
+    assert mocks.clip.call_count == 4
 
     row = _written_row(mocks)
     assert [s["street_name"] for s in row.hand_action_state["streets"]] == ["preflop", "flop"]
@@ -671,7 +673,136 @@ def test_scan_not_found_truncates_streets_and_still_completes():
     # The D/E disagreement is the cross-check sequential execution preserves.
     message = _attempt_row(mocks).status_message
     assert "D reported turn" in message
+    assert "2 scans found none" in message
     assert "truncated" in message
+
+
+# ---------------------------------------------------------------------------
+# Scan retry on D/E disagreement
+#
+# A wrong found: true is caught by _street_timestamp_guard; a wrong found: false
+# truncates the hand and looks legitimate. Reproduction against a real window
+# showed that miss is stochastic — 3 of 4 runs found the street.
+# ---------------------------------------------------------------------------
+
+
+def test_scan_retry_recovers_a_street_the_first_scan_missed():
+    clip_results = [
+        _d_result(street_names=("preflop", "flop", "turn")),
+        _scan(timestamp="02:00"),          # flop
+        _scan(found=False),                # turn, missed
+        _scan(timestamp="02:10"),          # turn, found on retry
+    ]
+    frame_results = [
+        {"new_cards": ["5d", "8d", "As"]},
+        {"new_cards": ["Kh"]},
+    ]
+
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "complete"
+    assert mocks.clip.call_count == 4
+
+    turn_scans = [c for c in mocks.clip.call_args_list if c[0][0] == "SCAN street=turn"]
+    assert len(turn_scans) == 2
+    # The retry is issued with identical arguments, only the label differs.
+    assert turn_scans[0][0] == turn_scans[1][0]
+    assert turn_scans[0][1]["label"] == "step_e_scan_turn"
+    assert turn_scans[1][1]["label"] == "step_e_scan_turn_retry"
+
+    streets = _written_row(mocks).hand_action_state["streets"]
+    assert [s["street_name"] for s in streets] == ["preflop", "flop", "turn"]
+    assert streets[2]["community_cards"] == ["Kh"]
+    assert streets[2]["street_timestamp"] == 130
+    assert "truncated" not in _attempt_row(mocks).status_message
+
+
+def test_scan_retry_gives_up_after_one_extra_attempt():
+    clip_results = [
+        _d_result(street_names=("preflop", "flop", "turn")),
+        _scan(timestamp="02:00"),
+        _scan(found=False),
+        _scan(found=False),
+        _scan(found=False),   # must never be consumed
+    ]
+    frame_results = [{"new_cards": ["5d", "8d", "As"]}]
+
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "complete"
+    assert mocks.clip.call_count == 4   # exactly one retry, not a loop
+    assert [s["street_name"] for s in _written_row(mocks).hand_action_state["streets"]] == [
+        "preflop", "flop",
+    ]
+    assert "2 scans found none" in _attempt_row(mocks).status_message
+
+
+def test_no_retry_when_d_did_not_report_the_street():
+    # D reporting flop only means the turn is never scanned at all, so there is
+    # no found: false to retry. Pinned so the retry cannot leak into the normal
+    # end-of-hand path, where found: false is the correct answer.
+    clip_results = [
+        _d_result(street_names=("preflop", "flop")),
+        _scan(timestamp="02:00"),
+    ]
+    frame_results = [{"new_cards": ["5d", "8d", "As"]}]
+
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "complete"
+    assert mocks.clip.call_count == 2   # D + the flop scan only
+    scanned = {c[0][0] for c in mocks.clip.call_args_list[1:]}
+    assert scanned == {"SCAN street=flop"}
+    assert "truncated" not in _attempt_row(mocks).status_message
+
+
+def test_no_scan_calls_at_all_on_a_preflop_ending_hand():
+    with _patched([_d_result(street_names=("preflop",))]) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "complete"
+    assert mocks.clip.call_count == 1
+    assert mocks.frame.call_count == 0
+
+
+def test_recovered_street_advances_scan_start_and_prior_cards_normally():
+    # A retried success must advance the chain exactly as a first-attempt success
+    # does: the next scan starts at the recovered street's timestamp, and its
+    # cards land in prior_cards.
+    clip_results = [
+        _d_result(street_names=("preflop", "flop", "turn", "river")),
+        _scan(timestamp="02:00"),          # flop -> 120
+        _scan(found=False),                # turn missed
+        _scan(timestamp="02:10"),          # turn recovered -> 130
+        _scan(timestamp="02:20"),          # river -> 140
+    ]
+    frame_results = [
+        {"new_cards": ["5d", "8d", "As"]},
+        {"new_cards": ["Kh"]},
+        {"new_cards": ["2s"]},
+    ]
+
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "complete"
+
+    # The river scan starts at the recovered turn timestamp, not the flop's.
+    river_scan = mocks.clip.call_args_list[4]
+    assert river_scan[0][0] == "SCAN street=river"
+    assert river_scan[0][2] == 130
+
+    # prior_cards reached the river read with all four earlier cards.
+    river_prompt = mocks.frame.call_args_list[2][0][0]
+    assert "(4 prior cards)" in river_prompt
+    assert "- Kh" in river_prompt
+
+    streets = _written_row(mocks).hand_action_state["streets"]
+    assert [s["street_name"] for s in streets] == ["preflop", "flop", "turn", "river"]
+    assert streets[3]["community_cards"] == ["2s"]
 
 
 def test_status_message_records_window_and_streets_on_clean_run():
