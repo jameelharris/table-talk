@@ -76,16 +76,43 @@ Record these actions:
 - Check — no additional chips committed
 - All-in — player commits their full remaining stack
 
-# STREETS WITH NO VOLUNTARY ACTION
+# WHEN A HAND ENDS, AND WHEN CARDS KEEP COMING
 
-If a street has community cards dealt but no voluntary actions occur — because all remaining players are all-in — record the street with an empty actions array:
+Record a street ONLY if its community cards were actually dealt. Two situations
+look similar in the action sequence but are opposite:
+
+**The hand ends — record no further streets.** If every remaining player folds
+to a bet, raise, or all-in, the pot is awarded immediately and NO further cards
+are dealt. This is true no matter which street it happens on, and no matter how
+large the final bet was. A player shoving all-in and everyone folding ends the
+hand exactly as a small bet and a fold would — the all-in is irrelevant if
+nobody calls.
+
+**The hand continues without action — record the streets with empty arrays.**
+If a player is all-in and at least one other player CALLS, the remaining cards
+are dealt out with no further betting. Record each subsequent street with an
+empty actions array.
+
+The distinguishing question is not "was anyone all-in?" It is "did two or more
+players still have live cards after the last action?" If only one player is
+left, the hand is over.
+
+Example — hand ends preflop, do NOT record flop/turn/river:
+
+{
+  "street_name": "preflop",
+  "actions": [
+    {"action_order": 1, "seat_position_label": "SB", "action_type": "all_in", "bet_amount": 58.0},
+    {"action_order": 2, "seat_position_label": "BB", "action_type": "fold", "bet_amount": 0.0}
+  ]
+}
+
+Example — all-in is called, cards run out, DO record the empty streets:
 
 {
   "street_name": "turn",
   "actions": []
 }
-
-Continue recording subsequent streets until no more community cards are dealt.
 
 # WINNING POSITIONS
 
@@ -316,6 +343,21 @@ Example 8 — 3-handed, one player all-in preflop, two players compete on subseq
   "winning_positions": ["BB", "SB"]
 }
 
+Example 9 — Uncalled all-in ends the hand, 5 players. No cards are dealt,
+so no further streets are recorded:
+{
+  "streets": [
+    {
+      "street_name": "preflop",
+      "actions": [
+        {"action_order": 1, "seat_position_label": "SB", "action_type": "all_in", "bet_amount": 58.0},
+        {"action_order": 2, "seat_position_label": "BB", "action_type": "fold", "bet_amount": 0.0}
+      ]
+    }
+  ],
+  "winning_positions": ["SB"]
+}
+
 # OUTPUT FORMAT
 
 Produce a single JSON object. No code fences, no preamble.
@@ -347,5 +389,9 @@ Produce a single JSON object. No code fences, no preamble.
 - Do not wrap output in code fences
 - Do not return "limp" as an action_type — a 1 BB commitment is a call
 - Do not infer winning_positions from the action sequence — return an empty array if you did not observe the pot being awarded
-
+- Do not record a street whose cards were never dealt — if everyone folded to a
+  bet or all-in, the hand ended there
+- Do not record streets after a hand ends just because a player was all-in — an
+  uncalled all-in ends the hand
+   
 Now extract the complete voluntary action sequence from this video clip.
