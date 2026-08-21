@@ -97,3 +97,5 @@ logs/
 # OS / misc
 Thumbs.db
 desktop.ini
+*.ipynb
+.virtual_documents/
