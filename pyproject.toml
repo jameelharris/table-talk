@@ -51,4 +51,5 @@ select = ["E", "F", "I", "W", "UP"]
 dev = [
     "ipykernel>=7.3.0",
     "jupyterlab>=4.6.3",
+    "pillow>=12.3.0",
 ]
