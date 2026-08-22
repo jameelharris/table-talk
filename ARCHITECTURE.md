@@ -18,10 +18,12 @@ clip_manifest table (inventory of 240s windows)
 hand_setups table + clip_processing_attempts table + GCS frame .jpg files
    ↓ [Phase 4: Hand start identification]
 hand_starts table + hand_setup_processing_attempts table + GCS frame .jpg files
-   ↓ [later phases]
+   ↓ [Phase 5: Player actions and community cards]
+hand_actions table + hand_start_processing_attempts table + GCS frame .jpg files
+   ↓ [assembly, then DBT validation]
 ```
 
-`videos` is the only fact table. `clip_manifest`, `hand_setups`, and `hand_starts` are stage tables — a future assembly phase combines them into fact tables. The `*_attempts` tables are state tables. See CLAUDE.md's "Table taxonomy."
+`videos` is the only fact table. `clip_manifest`, `hand_setups`, `hand_starts`, and `hand_actions` are stage tables — a future assembly phase combines them into fact tables. The `*_attempts` tables are state tables. See CLAUDE.md's "Table taxonomy."
 
 This document covers phases that have been built. Later phases will be added as they're designed.
 
@@ -269,6 +271,115 @@ Step C sometimes returns null for a legible card. A single retry reuses the iden
 
 The retry was built before the step-C stack-anchor prompt fix, which largely cured the null-hedging it was catching. It now fires rarely. If a future exhaustive run shows it effectively never fires, reconsider whether it earns its complexity.
 
+## Phase 5: Player actions and community cards
+
+Picks up pending rows from `hand_starts` and produces `hand_actions` rows carrying the complete voluntary action sequence by street, the community cards revealed on each postflop street with the timestamp they appeared, and the winning position(s). Populates no fact tables; `hand_actions` is a stage table for a future assembly phase.
+
+Per hand start: check preconditions, run step D over the whole hand window for the action sequence and winning positions, then step E — for each postflop street D reported, a video scan for the reveal timestamp and a HIGH-resolution frame read for the new cards. E's results merge into D's street list, frames upload to GCS, and one `hand_actions` row is written.
+
+### Production files
+
+- `cli.py` — `tt process-hand-starts` subcommand
+- `hand_action_processing.py` — orchestration: `PendingHandStart` (module-local frozen dataclass), `_find_pending_hand_starts`, `check_preconditions`, `_street_timestamp_guard`, `_scan_for_street`, `_read_street_cards`, `_transient_status`, `_write_attempt`, `process_hand_start` (async, atomic per hand start), `process_pending_hand_starts`
+- `hand_actions_writer.py` — `hand_actions` table writes (replace semantics keyed on `hand_start_id`; `street_frame_gcs_paths` is REPEATED and goes through `ArrayQueryParameter`, never `None`)
+- `hand_start_processing_attempts_writer.py` — `hand_start_processing_attempts` state table writes
+- `reference_images.py` — `load_reference_images`, `STREET_REFERENCE_ORDER`, `reference_image_filename`
+- `prompt_context.py` — extended with `build_action_context` (position, stack and hole cards per seat) and `build_prior_cards_context`
+- `seat_enrichment.py` — extended with `heads_up_label`, the pure SB-is-BTN rule `normalize_heads_up` now rewrites through
+- `prompts/extract_player_actions.md`, `prompts/extract_community_cards.md`, `prompts/extract_community_cards_from_frame.md`
+- `references/{flop,turn,river}_reference.jpeg`
+
+Shares `videos_downloader.py`, `frame_extractor.py`, `frame_uploader.py`, `gemini_caller.py`, `timestamp_utils.py`, `card_normalization.py`, and `bq_utils.py` with Phases 3 and 4.
+
+### Test files
+
+- `test_hand_action_processing.py` (includes opt-in integration tests)
+- `test_hand_actions_writer.py`
+- `test_hand_start_processing_attempts_writer.py`
+- `test_reference_images.py`
+
+Plus additions to `test_prompt_context.py`, `test_seat_enrichment.py`, and `test_gemini_caller.py`.
+
+### BQ tables
+
+- `hand_actions` — stage table, one row per hand start. `hand_action_state` is a JSON column shaped `{"hand_start": {...verbatim from hand_starts}, "streets": [{street_name, street_timestamp, community_cards, actions}], "winning_positions": [...]}`. There is **no `hand_action_id`**: the table is 1:1 with `hand_starts`, so `hand_start_id` is both the primary key and the natural key for replace-semantics writes. A separate id would have been byte-identical to `hand_start_id`, and a `{hand_start_id}_001` chain would compound a suffix per phase.
+- `hand_start_processing_attempts` — state table, one row per processing attempt
+
+### GCS
+
+- `gs://table-talk-497020-hand-actions-dev/{video_id}/{clip_id}/{hand_setup_id}/{street}.jpg`
+
+Named by street rather than index, so the path is self-describing. Up to three per hand; zero for a hand that ended preflop.
+
+### CLI
+
+```
+tt process-hand-starts --project P --dataset D --videos-bucket VB --hand-actions-bucket AB [--video-id ID] [--hand-start-id ID] [--max-concurrent 4] [--max-attempts 3]
+```
+
+### D and E run sequentially
+
+D is one video call over the whole hand window returning the action sequence by street plus `winning_positions`. E resolves each postflop street with a video scan for the reveal timestamp and a HIGH-resolution frame read for the new cards.
+
+E could discover the streets itself — it self-terminates on `found: false` — but running the two concurrently costs real money for no throughput gain. A hand that ends preflop needs zero E calls; under parallelism a flop scan would already have fired. A transient D failure would waste up to six E calls. Throughput is already saturated by hand-level concurrency, so parallelising within a hand buys per-hand latency, which does not compound.
+
+Within E the streets are sequential by necessity: each scan window starts at the previous street's timestamp, and each read's card count is keyed off the accumulated `prior_cards` (0 → 3, 3 → 1, 4 → 1).
+
+### The processing window: skip, not truncate
+
+The bound is the raw LEAD gap capped at `MAX_WINDOW_SECONDS` (240) — a technical ceiling, since a longer window at `fps=1.0` exceeds Gemini's 256-frame limit for a single video part.
+
+Phase 4 truncates at its cap because it only needs the hand's start. Phase 5 needs the whole hand, so truncation would produce a record showing the hand ending early — a silent wrong answer rather than a loud failure. Because `raw_lead_gap_seconds` is known before any Gemini call, a hand exceeding the cap is a precondition skip instead.
+
+A hand genuinely longer than 240 seconds therefore cannot be processed at 1 fps. The options — lower fps, or split the window across two calls and stitch — are real work and out of scope. Zero of 65 corpus hands exceed the cap (max gap 168s, median 34s), so the limit is currently theoretical and the cap guards against pathological gaps rather than filtering routinely.
+
+### Two bounds on the window
+
+`raw_lead_gap_seconds` measures the distance to the *next hand setup*, which is an upper bound on this hand's length rather than the length itself. So the pre-hoc cap has false positives, and more importantly cannot detect a window insufficient for any other reason.
+
+`winning_positions` is the post-hoc companion. D derives it by observing which seat the pot is pushed toward, so an empty array means the window ended before the pot was awarded. The check runs immediately after D returns and before any E call, so a truncated window costs one call rather than seven. The operator prompt requires an unobserved award to return an empty array rather than a guess.
+
+### Null community cards fail the hand
+
+A null community card is categorically more serious than a null hole card: the board is shared, so one unreadable card invalidates the hand for every player. The frame read retries up to `CARD_READ_ATTEMPTS` (3); a residual null fails the hand `failed_transient` with the street named in `status_message`.
+
+`_read_street_cards` raises rather than returning a null-bearing list, so `prior_cards` only ever grows by a fully-read street. The PoC filtered nulls out of the accumulator instead, which left the next read believing there were fewer prior cards than there were and broke the count rule. `_street_cards_unusable` also rejects a wrong-length read, since the null check alone passes an empty list.
+
+### Reference images
+
+Three universal JPEGs showing what flop, turn and river look like in a PokerStars broadcast, versioned with code in `references/`. `call_gemini_for_clip` emits a text part reading `Reference image — {label}:` before each blob, matching the wording `extract_community_cards.md` uses to describe them. That correspondence is what binds each description to its image; `test_reference_image_label_wording_matches_the_scan_prompt` asserts the rendered labels appear verbatim in the prompt file.
+
+That test is **not** an exception to "prompts have no automated tests." It asserts a code-to-prompt *interface* contract, not prompt content or quality. Rewording either side would otherwise unbind the descriptions from the images silently, degrading street detection corpus-wide with no error anywhere. Do not delete it for violating a rule it does not violate.
+
+Ordering comes from `STREET_REFERENCE_ORDER`, never a directory listing — `sorted()` yields flop, river, turn.
+
+### Scan retries fire only on disagreement with D
+
+`_read_street_cards` retried the frame read from the start, but the scan result was accepted on the first attempt — the cheap operation guarded, the expensive failure not. The two directions of scan error are also asymmetric: a wrong `found: true` is caught by `_street_timestamp_guard`, while a wrong `found: false` truncates the hand, looks legitimate, and had no guard at all.
+
+`_scan_for_street` now asks once more on `found: false`. The guard is structural rather than conditional: it is called only from the loop over the streets D reported, so an ordinary end-of-hand `found: false` never reaches it. D's claim gates only whether to ask again, never what the answer is — if both scans say no, E's answer stands.
+
+Motivated by `MPBLfM4mwfE_006_001_001`, an all-in runout where a turn was certainly dealt: D reported it, E's scan missed it, and the hand was silently short two streets. Reproduction against the real stored window found the street in 3 of 4 runs, so the miss is stochastic rather than a prompt defect. Later-street windows are also the narrowest in the phase, so this buys a retry where a missed street is most expensive and a call is cheapest.
+
+### Failure handling
+
+The same five statuses as Phase 4. Two things Phase 4 does not share:
+
+- **Phase 5 has no successful zero-row outcome.** A hand ending preflop still has a preflop street, so `complete` always means exactly one row. Phase 4's uncontested branch has no counterpart here.
+- **Failures never clear existing output.** The orchestrator never calls `write_hand_actions([])`. A stage row may legitimately coexist with a later `failed_transient` or `failed_parked` attempt.
+
+A mid-hand `found: false` from a street scan is **not** a failure — it is how E learns the hand ended. The hand is truncated there, status `complete`, and the disagreement with D is recorded in `status_message`.
+
+### What the corpus run established
+
+A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_starts` guarantees."
+
+- **60 of 60 hands complete.** The first run gave 56 complete, 3 rate-limited transients, and 1 hallucinated flop timestamp caught by `_street_timestamp_guard`. All four resolved on a rerun at `--max-concurrent 2` after the prompt and scan-retry fixes.
+- **Cost is roughly $0.053 per hand** — 2.49M tokens over 204 calls, about $3.20 for the video. Input dominates. Video scans run ~20K tokens, frame reads ~2.4K, and scan cost falls with each street as the window narrows.
+- **One prompt finding.** D over-reported streets on hands that ended preflop: the instruction to record streets with empty action arrays read as applying whenever no postflop action occurred, rather than only when a called all-in means cards keep coming. Reproduced 4/4 before and after the fix.
+- **Three data errors in the 65 `hand_setups` rows** — one all-null stack read, one phantom seat (`_009_005` declared four seats with a three-seat pot), and one misread pot (`_011_002`). Two were filtered by Phase 4's null-stack precondition; the third propagated harmlessly.
+- **The 65-row corpus holds roughly 63 distinct poker hands**, since two rows are clip-boundary fragments. Any integrity check or validation run reasoning from row counts must not expect 65 `hand_actions` rows. The fragment rate is measured on one video only; a materially higher rate on a future video would make the decision not to add a fragment precondition worth revisiting.
+
 ## Cross-cutting
 
 ### Production files
@@ -313,6 +424,24 @@ The counter is consecutive failures since the last non-failure, not lifetime —
 
 Capping the per-video download-failure branch means three consecutive failed downloads of one video park every entity in it: a video-level cause with entity-level effect and video-wide blast radius. Accepted.
 
+### Preconditions run after the per-video download
+
+In both Phase 4 and Phase 5, `check_preconditions` sits inside the per-hand function, downstream of the per-video download in the orchestrator. A hand that skips therefore still pays for its video to be fetched.
+
+This is harmless because the download is amortised across a video's hands: a video with tens of hands, one or two of which skip, pays nothing extra. The "every hand in this video skips" case is an artifact of a test that seeds a single hand, and restructuring the orchestrator to optimise a scenario production does not produce would be speculative work. An integration test covering a precondition skip must therefore still upload a fixture video, or the download's 404 branch fires first and the precondition is never reached.
+
+### What `check_preconditions` is for
+
+It tests presence, not plausibility: whether the phase can do its work with the given input, not whether the input is correct. `MPBLfM4mwfE_011_002` records `pot_size_bb = 0.38` where 1.88 is expected — a misread — but its stacks, seat count and hole cards are fine and Phase 4 processed it correctly. Rejecting it would have discarded a usable hand to protect a field nothing reads.
+
+Validity belongs in the DBT layer, where a failed check is recomputable rather than terminal. A precondition failure is permanent by construction: it writes `complete_skipped` and the entity is never selected again.
+
+### Cost instrumentation
+
+Both `gemini_caller` functions emit one line per call to stderr — model, an optional caller-supplied label, and the prompt, candidate and total token counts. Grep with `gemini_usage`.
+
+Logging happens *before* `_parse_and_validate`, because a response that fails validation — MAX_TOKENS, SAFETY, malformed JSON — is still a billed call, and those are exactly the ones whose cost would otherwise vanish.
+
 ### Frames and orphaned GCS objects
 
 Frames are written to deterministic paths and read only through the paths stored on stage rows. Nothing in the pipeline discovers frames by scanning a bucket, so an unreferenced object is unreachable by construction and cannot corrupt anything downstream.
@@ -331,7 +460,7 @@ Making Phase 3 idempotent makes reprocessing it *safe*, which makes it something
 
 If Phase 3 reprocesses a clip and the new result differs, `hand_setups` is correctly replaced. But `hand_setup_id` is positional (`{clip_id}_{NNN}`), so the same id can come to describe a *different moment*, or disappear entirely when the row count shrinks. Phase 4's existing `hand_starts` rows for those ids keep their `complete` attempts and are never re-triggered. They are not duplicated — they are silently stale, or orphaned against a `hand_setups` row that no longer exists.
 
-There is no cascade tooling today. Phase 5 adds a third layer, which makes this worse before it makes it better; its design should account for cascade or explicitly defer it with a plan.
+There is no cascade tooling today. Phase 5 landed with the cascade **explicitly deferred**. `hand_action_state` embeds a *snapshot* of `hand_start_state`, so reprocessing Phase 3 or Phase 4 leaves `hand_actions` silently stale three layers down rather than two. Cascade tooling remains a follow-up; nothing in Phase 5 solves it.
 
 ### Operational hardening
 
@@ -347,6 +476,36 @@ The two parked-hand fragments (see "Retry caps") are the counterexample in the o
 
 Happy-path validation for Phase 4 was a manual exhaustive CLI run across a full video, not an automated single-sample integration test. The integration tests prove the plumbing; the corpus run proves the extraction.
 
+### BB denomination and chip conservation
+
+`stack_size` and `pot_size_bb` are expressed in big blinds, so the same chips give a smaller number after a level increase and values are not comparable across levels. The broadcast displays no blind level, ante or level clock anywhere on screen, so the level is not observable and can only be inferred.
+
+It can be inferred, though. Summing `stack_size` across players and adding `pot_size_bb` gives a total identical between consecutive `hand_setups` rows to within ±0.2%, across all 64 corpus pairs including seat-count changes from bust-outs. `stack_size` is recorded before forced contributions leave the seats, which is why the pot must be added back. Four pairs depart — at t=585, 1203, 1779 and 2409, roughly every ten minutes, which is a level clock. The distribution is sharply bimodal: same-level pairs at 1.000 ± 0.002, level changes at ≥ 1.14, a gap of about 70× the noise floor.
+
+### Observed extraction errors
+
+Errors cluster in card reading, not action tracking. **Action data has been correct in every hand examined**, across both the PoC and the dev corpus.
+
+**Hole-card errors are suit errors.** Two were found by spot-check across 60 hands: `MPBLfM4mwfE_002_002_001` recorded `AsJc` for an actual `AcJc`, and `MPBLfM4mwfE_009_004_001` recorded `Ah7s` for `Ad7s`. Rank was correct both times, and the seats' screen positions differed, so location is not the cause. Both are the four-colour-deck confusions `extract_hole_cards.md` explicitly warns about — clubs/spades and diamonds/hearts.
+
+Consequence depends entirely on the hand. `_002_002_001` ended preflop, so the wrong suit never collides with anything and the record stays useful. `_009_004_001`'s `Ah` also appears on the flop, correctly recorded — an impossible duplicate, and the hand is unusable.
+
+### Manual correction is a sanctioned path
+
+When DBT flags a duplicate card, the correction belongs in `hand_starts.hand_start_state`, where the bad card originates — not in `hand_actions`, whose copy is an embedded snapshot. Editing the snapshot would leave the two records disagreeing with the upstream one still wrong.
+
+The workflow is: DBT flags, the operator corrects `hand_starts`, appends a retryable attempt row to un-park the hand, and re-runs Phase 5, whose replace semantics overwrite the stale row.
+
+This is the first sanctioned manual data path in the pipeline. A hand-corrected value is currently indistinguishable from an extracted one.
+
+### Zero-action street extraction is a deferred cost lever
+
+Community cards on streets with no voluntary action are analytically inert: once players are all-in the runout decides the winner, but no decisions remain to evaluate. Skipping E once a zero-action street is reached would cut roughly 29% of Phase 5's calls — about $300 on a projected 20K-hand corpus costing ~$1,060.
+
+Not taken, and the reason is observability rather than completeness. E's scan is the only independent check on D's street list: `MPBLfM4mwfE_003_001_001` had D report a flop on a hand where everyone folded preflop, caught only because E searched and found none. On runout hands there is no betting context and nothing else to sanity-check against — precisely where a second observation is most valuable. Skipping would also make a genuine miss indistinguishable from a correctly short hand.
+
+If cost ever forces it, the halves are separable: skip the frame *read* and keep the scan, preserving the cross-check and the timestamp.
+
 ## Known follow-ups
 
 Not blocking any current phase, but accumulated as the project has grown.
@@ -354,13 +513,13 @@ Not blocking any current phase, but accumulated as the project has grown.
 ### Tooling
 
 - **Standing integrity-check tool** — the invariant that caught the duplicate: `hand_starts` row count equals the count of complete-and-not-uncontested hands, and no duplicate natural id in either stage table. The uncontested exclusion is essential; a naive "complete count equals row count" check false-positives on them. Must also tolerate the row-exists-with-failed-status cases described under "Idempotent stage writes." Ship as a CLI subcommand or a documented query.
-- **Hand-level deletion cascade tooling** — see "Cross-phase reprocessing cascade." Becomes acute when Phase 5's tables land.
-- **Cost/token instrumentation** — the PoC tracked cost and token counts per Gemini call; production's `gemini_caller` returns only the parsed dict. Phase 4 is the most expensive phase (two calls per hand, one at HIGH resolution) and Phase 5 will likely be worse. Capture `usage_metadata` before corpus-scale runs.
+- **Hand-level deletion cascade tooling** — see "Cross-phase reprocessing cascade." Now acute: Phase 5's tables have landed.
+- **Ruff baseline** — 189 errors across `src/`, `tests/` and `scripts/`, 164 of them E501 against the configured 100-char limit and the rest auto-fixable imports plus two decorative unused mocks. Ruff is not in CI, which is why they accumulated. With that many standing errors a new one is invisible.
+- **Notebook reproduction harnesses are untracked** — `*.ipynb` is gitignored, while `jupyterlab`, `ipykernel` and `pillow` are dev dependencies precisely because CLAUDE.md's regression guard for prompts is notebook reproduction. The harnesses themselves are not versioned, so each investigation rebuilds them.
 
 ### CLI ergonomics
 
 - **Derive bucket names from a single `--environment` flag** using the `{project}-{purpose}-{environment}` convention Terraform already encodes, instead of the current several flags that must agree. Supersedes the earlier "CLI config defaults" item.
-- **Expose row-level scoping** — `--clip-id` / `--hand-setup-id`, which the orchestrators already support via `only_clip_ids` / `only_hand_setup_ids` but neither CLI surfaces.
 - **CLI silent no-op on unknown `--video-id`** — if the filter matches zero pending rows, the command exits cleanly with a zero count. Should warn that the filter matched nothing.
 - **CLI-layer testing gap** — `tt` commands have no automated tests. Deferred until something forces it.
 
@@ -373,7 +532,6 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 ### Cleanup
 
-- **Retire `build_fva_context`** — dead code since the step-C stack-anchor fix removed the `{fva_context}` substitution. Left in place with its passing test to keep that fix's diff scoped.
 - **Noncurrent-version lifecycle rule on the hand-starts bucket** — versioning plus soft delete means every reprocess leaves noncurrent versions behind. Harmless at dev scale, real at corpus scale. Scope strictly to noncurrent versions.
 - **In-place mutation of `hs.hand_setup_state`** — `normalize_heads_up` and the hole-card matching loop mutate the frozen `PendingHandSetup`'s dict field. Harmless today; a `copy.deepcopy` at assembly would make it clean when next touched.
 - **Writer keyword inconsistency** — `project=` in some writers, `project_id=` in others. Inherited from Phases 1–3 and preserved per-template since. Normalize in a standalone refactor.

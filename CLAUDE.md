@@ -102,14 +102,24 @@ Bucket lifecycle rules must be scoped to noncurrent versions only. Frames are re
 Three kinds of table:
 
 - **Fact tables** hold durable entity records. `videos` is currently the only one.
-- **Stage tables** hold the output of a processing phase, consumed by later phases: `clip_manifest`, `hand_setups`, `hand_starts`. A future assembly phase combines them into fact tables.
-- **State tables** are insert-only logs of processing attempts, one row per attempt, named `*_attempts`: `video_ingestion_attempts`, `clip_processing_attempts`, `hand_setup_processing_attempts`. They carry a server-defaulted `attempted_at`.
+- **Stage tables** hold the output of a processing phase, consumed by later phases: `clip_manifest`, `hand_setups`, `hand_starts`, `hand_actions`. A future assembly phase combines them into fact tables.
+- **State tables** are insert-only logs of processing attempts, one row per attempt, named `*_attempts`: `video_ingestion_attempts`, `clip_processing_attempts`, `hand_setup_processing_attempts`, `hand_start_processing_attempts`. They carry a server-defaulted `attempted_at`.
 
 Each processing phase pairs a stage table with a state table. The current state of an entity is derived: the latest row in its state table by `attempted_at`. No in-flight states are stored; rows are written only after attempts conclude.
 
 **State tables are append-only audit logs.** Never UPDATE a state row and never DELETE one. To reverse a prior outcome, insert a new row that supersedes it. A deletion destroys the record of what actually happened, which is the table's whole purpose.
 
 **Latest status does not tell you whether output exists.** It records what the client believed at the time, which can be wrong — see "Idempotence." Several outcomes are legitimately terminal with zero stage rows, so the presence or absence of output can't be inferred from status either. Both directions of that inference are unsafe.
+
+### Stage blobs nest their upstream verbatim
+
+Each phase's JSON column embeds the prior phase's blob **unchanged** under a named key and adds its own contribution as a sibling. Phase 4's `hand_start_state` is `{"hand_setup": {...verbatim from hand_setups...}, "fva": {...}}`; Phase 5's `hand_action_state` is `{"hand_start": {...verbatim from hand_starts...}, "streets": [...], "winning_positions": [...]}`.
+
+Nesting verbatim rather than flattening makes provenance obvious — any value can be traced to the phase that produced it by its position in the structure — and keeps each phase's contribution separable. The assembly phase flattens; the stage tables do not.
+
+**Every embedded copy is a snapshot taken at write time.** Reprocessing an upstream phase does not update it, so a downstream blob can hold values its source table no longer agrees with. This is the reprocessing-cascade gap, and it compounds one layer per phase. Nothing currently detects it.
+
+Two consequences. A phase reads its own inputs from the upstream *table*, never from a blob nested inside another row. And a manual correction belongs in the table where the value originates, not in a downstream snapshot — correcting the snapshot leaves the two records disagreeing with the upstream one still wrong.
 
 ### Attempt status semantics
 
@@ -140,6 +150,10 @@ The natural key is the entity the phase processes, which is not always the stage
 Replace semantics make stage writes mutating DML, which BigQuery serializes per table rather than running with the concurrency available to INSERT-only writes. This is a throughput constraint, not a correctness one: an aborted transaction surfaces as a write error, is classified retryable, and the retry is safe precisely because the write is idempotent.
 
 `clip_manifest` is written once per video with no state table and has no replace wrapper; Phase 2's retry derives from the absence of output rows, which is the same principle applied through a different mechanism.
+
+**`bq_param_type` covers `str`, `int` and `dict` only.** It has no `float` branch and no `None` branch, and stage writers — unlike state writers — do not filter `None` out of the row dict before building parameters. So a `FLOAT64` column or a NULLABLE scalar cannot be added to a stage table without extending `bq_utils` first: codegen and Terraform both accept them, and the failure surfaces only at the first write. This is why every `hand_actions` column is REQUIRED, and why per-row floats like `bet_amount` live inside the JSON blob, which BigQuery parses server-side and which never reaches `bq_param_type`.
+
+Note `bool` is a subclass of `int`; a BOOL column would need its own branch checked *before* the `int` one, or `True`/`False` maps to `INT64`.
 
 ### Idempotence and self-healing
 
@@ -238,3 +252,7 @@ The principle is enforced by code review — there is no automated check.
 ### Prompts have no automated tests
 
 `prompts/*.md` are versioned with code so prompt changes ride code review, but nothing asserts on their content. The regression guard is reproduction: before changing a prompt, reproduce the exact failing call in a notebook against the real stored frame or video window, and confirm the fix against both the failing case and a control. Theorising about a prompt bug without looking at the actual frame has produced wrong hypotheses more than once.
+
+One narrow exception: a test may assert a **code-to-prompt interface contract** — that a string a Python function constructs appears verbatim in the prompt file that consumes it. `call_gemini_for_clip` labels each reference image `Reference image — {label}:`, and `extract_community_cards.md` describes the images by those exact names; a test asserts the rendered labels appear in the file. Reword either side and the descriptions silently unbind from the images, degrading extraction corpus-wide with no error anywhere.
+
+The line is between asserting a contract and asserting content. A test that checks a substitution slot exists, or that a constructed string matches what the prompt expects, is a contract test and is allowed. A test that asserts what a prompt *says* — its instructions, its examples, its wording — is not.
