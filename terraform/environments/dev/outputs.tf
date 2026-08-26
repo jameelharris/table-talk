@@ -38,6 +38,41 @@ output "video_ingestion_attempts_table_full_id" {
   description = "Fully qualified audit log table ID."
 }
 
+output "tournament_results_bucket_name" {
+  value       = module.tournament_results_bucket.name
+  description = "Name of the tournament-results frames GCS bucket."
+}
+
+output "tournament_results_bucket_url" {
+  value       = module.tournament_results_bucket.url
+  description = "GCS URL of the tournament-results frames bucket."
+}
+
+output "tournament_results_bucket_self_link" {
+  value       = module.tournament_results_bucket.self_link
+  description = "Self-link of the tournament-results frames GCS bucket."
+}
+
+output "tournament_results_table_id" {
+  value       = module.tournament_results_table.table_id
+  description = "BigQuery table ID for the tournament results stage table."
+}
+
+output "tournament_results_table_full_id" {
+  value       = module.tournament_results_table.table_full_id
+  description = "Fully qualified tournament results table ID (project:dataset.table)."
+}
+
+output "tournament_results_processing_attempts_table_id" {
+  value       = module.tournament_results_processing_attempts_table.table_id
+  description = "BigQuery table ID for the payout extraction audit log."
+}
+
+output "tournament_results_processing_attempts_table_full_id" {
+  value       = module.tournament_results_processing_attempts_table.table_full_id
+  description = "Fully qualified payout extraction audit log table ID."
+}
+
 output "hand_setups_bucket_name" {
   value       = module.hand_setups_bucket.name
   description = "Name of the hand-setups frames GCS bucket."

@@ -1,0 +1,45 @@
+[
+  {
+    "name": "video_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Video whose results panel was read. Primary key. Foreign key to videos.video_id; 1:1 with videos. Also the natural key for this table's replace-semantics writes."
+  },
+  {
+    "name": "bounty_type",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Tournament bounty format, derived from whether the results panel carries a Bounty column: 'none' | 'progressive'. Scalar rather than a field inside the blob because Phase 3 queries it to select its extraction prompt. Freezeout ('static') bounty is not modelled — no such event has been observed on this channel. NOT enforced as an enum by BigQuery — validation lives in application code."
+  },
+  {
+    "name": "currency_symbol",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Currency symbol printed on the results panel (e.g. '$'). Every payout and bounty amount in tournament_results_state is denominated in this currency."
+  },
+  {
+    "name": "frame_timestamp_seconds",
+    "type": "INT64",
+    "mode": "REQUIRED",
+    "description": "Offset from start of source video, in whole seconds, of the frame the panel was read from. Which rung of the frame fallback ladder succeeded."
+  },
+  {
+    "name": "frame_gcs_path",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Full gs://... URI to the frame the results panel was read from. Deterministic ({video_id}/results.jpg), so a re-run overwrites rather than orphaning; the ladder rung is deliberately not in the path, since frame_timestamp_seconds records it. Uploaded before this row is written, so a live row's path always resolves. Retained as the manual spot-check evidence for bounty_type, which gates prompt selection for every hand in the video."
+  },
+  {
+    "name": "tournament_results_state",
+    "type": "JSON",
+    "mode": "REQUIRED",
+    "description": "The results panel as read. Structure: {panel: {panel_visible: bool, has_bounty_column: bool, currency_symbol: string, rows: [{rank: int, payout: number|null, payout_marked: bool, bounty: number|null}]}}. Payout and bounty amounts are floats and live here rather than in columns because bq_param_type has no FLOAT64 branch; BigQuery parses this column server-side. payout_marked records a printed asterisk verbatim — its meaning is unknown and nothing in the pipeline interprets it. The upstream videos row has no JSON blob, so unlike other stage tables there is nothing nested here."
+  },
+  {
+    "name": "detected_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "defaultValueExpression": "CURRENT_TIMESTAMP()",
+    "description": "Timestamp when this tournament results row was written. Auto-populated on insert via DEFAULT."
+  }
+]

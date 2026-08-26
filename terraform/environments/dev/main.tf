@@ -64,6 +64,51 @@ module "video_ingestion_attempts_table" {
   deletion_protection = true
 }
 
+module "tournament_results_bucket" {
+  source = "../../modules/gcs_bucket"
+
+  name     = "${var.project_id}-tournament-results-${var.environment}"
+  location = var.region
+  project  = var.project_id
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "tournament_results"
+  }
+}
+
+module "tournament_results_table" {
+  source = "../../modules/bigquery_table"
+
+  dataset_id  = module.bigquery_dataset.dataset_id
+  table_id    = "tournament_results"
+  project     = var.project_id
+  schema      = file("${path.module}/../../../schemas/tournament_results.json")
+  description = "Payout extraction stage table: the tournament prize ladder read from the broadcast's results panel, plus the bounty format derived from whether that panel carries a Bounty column. One row per video. Read by Phase 3 to select its extraction prompt."
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "tournament_results_stage"
+  }
+  deletion_protection = true
+}
+
+module "tournament_results_processing_attempts_table" {
+  source = "../../modules/bigquery_table"
+
+  dataset_id  = module.bigquery_dataset.dataset_id
+  table_id    = "tournament_results_processing_attempts"
+  project     = var.project_id
+  schema      = file("${path.module}/../../../schemas/tournament_results_processing_attempts.json")
+  description = "Append-only audit log of every payout extraction attempt. One row per attempt. Absence of rows for a video_id means it is unprocessed. Joins to videos via video_id."
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "tournament_results_processing_audit"
+  }
+  deletion_protection = true
+}
+
 module "clip_manifest_table" {
   source = "../../modules/bigquery_table"
 

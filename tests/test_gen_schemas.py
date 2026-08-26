@@ -88,3 +88,29 @@ def test_hand_start_processing_attempts_schema_generates_expected_dataclass():
     assert "    status: str" in output
     assert "    status_message: str | None = None" in output
     assert "attempted_at" not in output
+
+
+def test_tournament_results_schema_generates_expected_dataclass():
+    output = generate_dataclass(SCHEMAS_DIR / "tournament_results.json")
+    assert "class TournamentResultsRow:" in output
+    assert "from typing import Any" in output
+    assert "    video_id: str" in output
+    assert "    bounty_type: str" in output
+    assert "    currency_symbol: str" in output
+    assert "    frame_timestamp_seconds: int" in output
+    assert "    frame_gcs_path: str" in output
+    assert "    tournament_results_state: dict[str, Any]" in output
+    assert "detected_at" not in output
+    # Payout and bounty amounts are floats and live inside the JSON blob;
+    # bq_param_type has no FLOAT64 branch, so no scalar column may be one.
+    assert ": float" not in output
+
+
+def test_tournament_results_processing_attempts_schema_generates_expected_dataclass():
+    output = generate_dataclass(SCHEMAS_DIR / "tournament_results_processing_attempts.json")
+    assert "class TournamentResultsProcessingAttemptsRow:" in output
+    assert "    attempt_id: str" in output
+    assert "    video_id: str" in output
+    assert "    status: str" in output
+    assert "    status_message: str | None = None" in output
+    assert "attempted_at" not in output

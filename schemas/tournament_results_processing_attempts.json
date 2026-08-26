@@ -1,0 +1,33 @@
+[
+  {
+    "name": "attempt_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique identifier for this processing attempt. Primary key."
+  },
+  {
+    "name": "video_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Video being processed. Foreign key to videos.video_id."
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Outcome of this attempt: 'complete' | 'complete_skipped' | 'failed_transient' | 'failed_permanent' | 'failed_parked'. 'complete_skipped' means a precondition check failed and no LLM calls were made; it is a terminal success. 'failed_parked' means the retry cap was reached and the video will no longer be selected. 'complete', 'complete_skipped', 'failed_permanent' and 'failed_parked' are all terminal; only 'failed_transient' is re-selected. No in-flight states. NOT enforced as an enum by BigQuery — validation lives in application code."
+  },
+  {
+    "name": "status_message",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Free-form error, skip-reason, or status detail. Typically populated on failure or skip to capture the reason. NULL on success."
+  },
+  {
+    "name": "attempted_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "defaultValueExpression": "CURRENT_TIMESTAMP()",
+    "description": "Timestamp when this attempt was recorded. Auto-populated on insert via DEFAULT."
+  }
+]
