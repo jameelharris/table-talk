@@ -2,3 +2,4 @@
 # Each entry is a YouTube URL (one per line). The ingestion job reconciles
 # this list against BigQuery to determine what to download.
 - https://youtu.be/MPBLfM4mwfE?si=Yy1bW2cyoWPZ907N
+- https://youtu.be/YzKyFMQ1avU?si=fbd2wbXwJTXpVfnx
