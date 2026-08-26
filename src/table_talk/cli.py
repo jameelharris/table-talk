@@ -1,6 +1,7 @@
 # CLI entrypoint. Exposes `tt` command via the [project.scripts] entry
-# in pyproject.toml. Subcommands: `tt ingest`, `tt materialize-clips`,
-# `tt process-clips`, `tt process-hand-setups`, `tt process-hand-starts`.
+# in pyproject.toml. Subcommands: `tt ingest`, `tt extract-payouts`,
+# `tt materialize-clips`, `tt process-clips`, `tt process-hand-setups`,
+# `tt process-hand-starts`.
 
 import argparse
 import asyncio
@@ -14,6 +15,7 @@ from .hand_action_processing import process_pending_hand_starts
 from .hand_setup_processing import process_pending_clips
 from .hand_start_processing import process_pending_hand_setups
 from .ingest import process_manifest
+from .payout_processing import process_pending_videos
 from .reference_images import (
     STREET_REFERENCE_ORDER,
     load_reference_images,
@@ -35,6 +37,14 @@ def main() -> None:
     mat_parser.add_argument("--project", required=True)
     mat_parser.add_argument("--dataset", required=True)
     mat_parser.add_argument("--video-id")
+
+    ep_parser = subparsers.add_parser("extract-payouts")
+    ep_parser.add_argument("--project", required=True)
+    ep_parser.add_argument("--dataset", required=True)
+    ep_parser.add_argument("--videos-bucket", required=True)
+    ep_parser.add_argument("--tournament-results-bucket", required=True)
+    ep_parser.add_argument("--video-id")
+    ep_parser.add_argument("--max-attempts", type=int, default=3)
 
     pc_parser = subparsers.add_parser("process-clips")
     pc_parser.add_argument("--project", required=True)
@@ -98,6 +108,30 @@ def main() -> None:
                 dataset=args.dataset,
                 bq_client=bq_client,
             )
+    elif args.command == "extract-payouts":
+        prompts_dir = Path(__file__).resolve().parents[2] / "prompts"
+
+        extract_results_path = prompts_dir / "extract_results.md"
+        if not extract_results_path.exists():
+            print(
+                "prompts/extract_results.md not found — see README for setup",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        stats = asyncio.run(
+            process_pending_videos(
+                project_id=args.project,
+                dataset=args.dataset,
+                videos_bucket=args.videos_bucket,
+                tournament_results_bucket=args.tournament_results_bucket,
+                extract_results_prompt=extract_results_path.read_text(),
+                video_id=args.video_id,
+                max_attempts=args.max_attempts,
+            )
+        )
+        for key, value in stats.items():
+            print(f"{key}: {value}")
     elif args.command == "process-clips":
         prompts_dir = Path(__file__).resolve().parents[2] / "prompts"
 

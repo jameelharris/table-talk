@@ -12,6 +12,8 @@ The system ingests poker broadcast videos and progressively extracts structured 
 YouTube URL
    ↓ [Phase 1: Video ingestion]
 videos table + GCS .mp4 file
+   ↓ [Payout extraction]
+tournament_results table + tournament_results_processing_attempts table + GCS frame .jpg file
    ↓ [Phase 2: Clip materialization]
 clip_manifest table (inventory of 240s windows)
    ↓ [Phase 3: Hand setup identification]
@@ -23,7 +25,10 @@ hand_actions table + hand_start_processing_attempts table + GCS frame .jpg files
    ↓ [assembly, then DBT validation]
 ```
 
-`videos` is the only fact table. `clip_manifest`, `hand_setups`, `hand_starts`, and `hand_actions` are stage tables — a future assembly phase combines them into fact tables. The `*_attempts` tables are state tables. See CLAUDE.md's "Table taxonomy."
+`videos` is the only fact table. `clip_manifest`, `tournament_results`, `hand_setups`, `hand_starts`, and `hand_actions` are stage tables — a future assembly phase combines them into fact tables. The `*_attempts` tables are state tables. See CLAUDE.md's "Table taxonomy."
+
+Phase numbers are historical labels reflecting the order phases were built, not a strict pipeline ordering. Payout extraction was designed after Phases 1–5 but runs second, so it carries no number rather than renumbering everything downstream of it; the same pragmatism as Phase 1's status vocabulary, where "the naming divergence is historical."
+
 
 This document covers phases that have been built. Later phases will be added as they're designed.
 
@@ -73,6 +78,149 @@ Per-URL failures are caught and recorded in `video_ingestion_attempts` with a st
 Status classification happens in `videos_fetcher.classify_error` based on the yt-dlp exception type and message.
 
 Phase 1 predates the `failed_transient` / `failed_permanent` / `failed_parked` vocabulary used by Phases 3 and 4 and has no retry cap. Its statuses map onto the same three categories (see CLAUDE.md's "Attempt status semantics"); the naming divergence is historical.
+
+## Payout extraction
+
+Reads the tournament results panel from one early frame of a video and lands a single `tournament_results` row carrying the prize ladder and the tournament's bounty format.
+
+Two things downstream needs that nothing else produces. ICM — the analytical premise of the project — is a function of the prize structure, not just the chip distribution, so without the ladder no ICM question is answerable. And Phase 3 selects a different extraction prompt for bounty events, which requires knowing whether the tournament is one. Both read off the same panel, so one Gemini call per video serves both.
+
+The panel sits in the lower-right of the broadcast, is static for the whole video, and reads reliably. It is populated from the start of the replay — screenshot evidence shows a full nine-rank ladder while the chat still reads "Replay resumed" — which is why an early frame suffices.
+
+This phase carries no number. See "Pipeline overview" on why.
+
+### Production files
+
+- `cli.py` — `tt extract-payouts` subcommand
+- `payout_processing.py` — orchestration: `PendingVideo`, `_find_pending_videos`, `check_preconditions`, `_parse_amount`, `_normalize_panel`, `_validate_panel`, `_derive_bounty_type`, `_extract_with_fallback`, `_transient_status`, `_write_attempt`, `process_video`, `process_pending_videos`
+- `tournament_results_writer.py` — `tournament_results` writes, replace semantics on `video_id`
+- `tournament_results_processing_attempts_writer.py` — `tournament_results_processing_attempts` state writes
+- `prompts/extract_results.md` — the single-frame panel read
+
+Reused unchanged: `videos_downloader.py`, `frame_extractor.py`, `frame_uploader.py`, `gemini_caller.py`, `bq_utils.py`.
+
+### Test files
+
+- `test_payout_processing.py`
+- `test_tournament_results_writer.py`
+- `test_tournament_results_processing_attempts_writer.py`
+
+### BQ tables
+
+- `tournament_results` — stage table, one row per video. The first stage table whose upstream is a fact table rather than another stage table, so CLAUDE.md's "stage blobs nest their upstream verbatim" has nothing to nest: `videos` has no JSON column, and `tournament_results_state` is just `{"panel": {...}}`.
+- `tournament_results_processing_attempts` — state table, one row per attempt
+
+Every scalar column is `STRING` or `INT64`. All payout and bounty amounts are floats and live inside the JSON blob, which BigQuery parses server-side and which never reaches `bq_param_type` — the same reason every `hand_actions` column is REQUIRED and non-float. Do not add a `FLOAT64` column here without extending `bq_utils` first; codegen and Terraform both accept one and the failure surfaces only at the first write.
+
+The state table is named after the phase's *output*, not its input. The house convention would give `video_processing_attempts`, which is uselessly generic beside Phase 1's `video_ingestion_attempts`. The deviation is deliberate.
+
+### GCS
+
+- `gs://table-talk-497020-tournament-results-dev/{video_id}/results.jpg` — the frame the results panel was read from; one per video, deterministic path so a re-run overwrites rather than orphaning
+
+The ladder rung is deliberately **not** in the path. `frame_timestamp_seconds` already records which rung won, and a timestamped path would orphan the previous object every time a reprocess succeeded at a different rung. A stable path overwrites cleanly — the same property replace semantics give the BQ row.
+
+The frame is uploaded after the panel validates and before the row is written. Validating first means a permanently-failing video leaves no object behind at all; uploading before the write preserves the one-directional guarantee that a live row's path always resolves.
+
+**Retention was initially deferred, then revisited.** The first cut of this phase treated the frame as a tempfile on the grounds that nothing read it. That was wrong for one reason: `bounty_type` gates prompt selection for every hand in the video, and the frame is its only spot-check evidence. The reconciliation query below identifies *that* a video disagrees with its hands, not which side is wrong — and answering that without the frame means re-downloading 100–200 MB. One object per video is negligible against the ~15 GB the rest of the pipeline holds. This is the same reasoning already recorded under "Frames and orphaned GCS objects."
+
+### CLI
+
+```
+tt extract-payouts --project P --dataset D --videos-bucket VB --tournament-results-bucket TRB [--video-id ID] [--max-attempts 3]
+```
+
+No `--max-concurrent`: one call per video, and the work is dominated by the download.
+
+It must run before `tt process-clips`, which reads `bounty_type`. That ordering is enforced by Phase 3, not by this command, and `tt ingest` deliberately does not chain into it — chaining would entangle two independent failure modes and prevent re-running payout extraction alone after a prompt fix.
+
+### The frame fallback ladder
+
+`[5, 30, 120]` seconds. The panel is up from the start, but an early frame can land on a title card or a transition, so the ladder advances while `panel_visible` is false and fails permanently once exhausted. It costs nothing on the happy path: rung one succeeds and the rest are never extracted. The rung that succeeded is recorded in `frame_timestamp_seconds` and in `status_message`.
+
+Rungs at or beyond the video's `duration_seconds` are skipped. Without that filter ffmpeg fails on every rung of a short video and the video retries to `failed_parked` for a condition that is deterministic and will never resolve.
+
+### Preconditions
+
+One check, and unlike Phases 4 and 5 it runs *before* the download. Those phases accept a post-download check because the download amortises across a video's many hands. Here the entity is the video, so there is nothing to amortise over — a skipping video would pay for its own full 100–200 MB download to produce zero calls — and `duration_seconds` comes from the pending query, so the check needs nothing the download provides. See "Preconditions run after the per-video download" under Cross-cutting.
+
+A video no longer than the first ladder rung writes `complete_skipped`: it was examined and deliberately not processed, with zero LLM calls. That is a terminal success, not a failure — retrying would produce the same skip.
+
+### Deriving `bounty_type`
+
+From `has_bounty_column` alone. Knockout events print an extra Bounty column in the results panel; non-knockout events do not.
+
+**The video title is not a usable signal.** `oWKpfjfEM4c` is a confirmed progressive-knockout event whose title does not say so, and YouTube metadata carries nothing else usable. The panel is the only reliable source, which is why this phase exists rather than a string match at ingest.
+
+A corroborating second signal — seat bounty badges on the poker table in the same frame, cross-checked against the panel — was designed and dropped. This phase runs before Phase 3 and reads an arbitrary early frame with no guarantee the table is even on screen, so the check's most likely firing was a false positive on an unreadable table rather than a real contradiction, and its failure mode was a permanent park on a video that a later rung would have read fine.
+
+The prompt compensates where that check would have helped: `panel_visible` is false if the panel is cut off at any edge or its full header row is not visible. A panel clipped on the right hides the Bounty column, and a hidden Bounty column is indistinguishable from an absent one — so such a frame fails rather than silently classifying a PKO as non-bounty.
+
+`_validate_panel` enforces in code what the prompt can only ask for: a visible panel must carry at least `MIN_LADDER_RANKS` (5) rows and must include rank 1, or it was read partially. Both spike videos returned nine ranks; the floor is inferred from two videos and should be revisited as older or differently-branded broadcasts are ingested.
+
+**Accepted risk.** One panel read drives prompt selection for every hand in the video, with no independent check. It is recoverable — append a retryable attempt row, re-run, and replace semantics overwrite the row — but it is not self-announcing. See "Reconciliation" below.
+
+Freezeout (`static`) bounty is not modelled. No such event has been observed on this channel, and the project does not plan for formats it has not seen. A static event would show identical, unchanging badges at every seat, where a progressive event shows a halving lattice — observed at `MPBLfM4mwfE` as 125 → 187.5 → 281.25, spread across a factor of eleven. If one appears, `bounty_type` gains a value and a discriminator is added then.
+
+### The asterisk is captured raw and interpreted nowhere
+
+Some broadcasts prefix a payout with an asterisk. `payout_marked` records it; nothing in the pipeline reads it.
+
+**What it means is not known.** On `YzKyFMQ1avU` ranks 1–3 are asterisked, and those are exactly the ranks whose payout ratios depart from the flat 1.425 that holds across ranks 4–9 — so the marker correlates with a departure from the published curve. That is a correlation on one video, not a meaning.
+
+No geometric fitting, no schedule reconstruction, no `deal_detected` field. Those belong to downstream analysis, where a larger sample makes the meaning inferable rather than guessable from two videos.
+
+Consequence to be aware of: if marked payouts are not the scheduled ladder, ICM computed on them measures the wrong environment. Downstream ICM work must either exclude marked videos or reconstruct a schedule, and that reconstruction's validity rests on a question that is currently open.
+
+`_normalize_panel` also sets `payout_marked` when a raw payout string carries a leading asterisk. That fallback only fires on the string path — the prompt asks for bare numbers, so on the common path the asterisk never reaches Python. It is belt-and-braces against observed prompt variance (the spike saw the same prompt return `'$406.25'` on one frame and `406.25` on another), **not** a second source and not a cross-check on the model's own answer.
+
+### Failure handling
+
+- `complete` → skip on next run
+- `complete_skipped` → skip; terminal success, precondition failed before any LLM call
+- `failed_transient` → retry on next run (network, GCS, BQ, Vertex 429 after backoff, write errors)
+- `failed_permanent` → skip; malformed JSON, safety block, GCS 404 on the video, panel not visible at any ladder rung, unreadable `currency_symbol`, non-boolean `has_bounty_column`, or a partially-read ladder
+- `failed_parked` → skip; retry cap reached (default 3, `--max-attempts`)
+
+The retry counter counts consecutive failures since the last non-failure, is computed in the pending query and carried on `PendingVideo`, and is never re-queried inside a failure handler — that handler runs precisely when BigQuery may be unreachable. The current failure is not yet counted, so the threshold test is `consecutive_failures + 1 >= max_attempts`.
+
+Anything not recognised falls to the catch-all and is classified transient, including `GeminiTransientError`, which is deliberately not caught by name.
+
+`_validate_panel` runs before the row is built. Every REQUIRED scalar column sourced from the model response must be non-null, because `bq_param_type` has no `None` branch and this phase's stage writer does not filter `None` out of the row dict — a null would raise `TypeError`, classify transient, and retry the video until it parks. Nulls *inside* `tournament_results_state` are fine: BigQuery parses that column server-side.
+
+### Reconciliation
+
+A wrong `bounty_type` is recoverable but not self-announcing, so it has to be looked for:
+
+```sql
+SELECT
+  tr.video_id,
+  tr.bounty_type,
+  COUNT(hs.hand_setup_id) AS hand_setups,
+  COUNTIF((
+    SELECT COUNT(1)
+    FROM UNNEST(JSON_QUERY_ARRAY(hs.hand_setup_state, '$.players')) p
+    WHERE JSON_VALUE(p, '$.bounty') IS NOT NULL
+  ) > 0) AS hand_setups_with_bounty_values
+FROM `{project}.{dataset}.tournament_results` tr
+LEFT JOIN `{project}.{dataset}.hand_setups` hs USING (video_id)
+GROUP BY tr.video_id, tr.bounty_type
+ORDER BY tr.video_id
+```
+
+A discrepancy is `bounty_type = 'progressive'` with zero bounty-bearing hands, or `bounty_type = 'none'` with more than zero. To correct one: append a retryable attempt row for the video, re-run `tt extract-payouts --video-id`, and the row is replaced.
+
+Until per-seat bounty extraction lands, `hand_setup_state.players[].bounty` does not exist, so the last column reads 0 for every video and only the first three are meaningful.
+
+### Known inefficiency, accepted
+
+Extracting one frame requires downloading the whole video from GCS — 100–200 MB for a ~50 minute broadcast — and it happens again when Phase 3 downloads the same video.
+
+The alternatives both couple phases that are currently independent: extracting the frame during `tt ingest` while the file is already local, or seeking into a signed URL. Revisit if ingesting 150 videos makes the wall-clock cost real.
+
+### Stated assumptions
+
+**Panel layout generality rests on two videos.** Position, column structure and legibility held across two different broadcast skins (`MPBLfM4mwfE`, a progressive-knockout event, and `YzKyFMQ1avU`, a non-bounty event). That is enough to build against and not enough to claim for 150 videos. Expect to revisit as older or differently-branded videos are ingested; the `panel_visible` false path, the fallback ladder and `MIN_LADDER_RANKS` are the designed-in tolerance.
 
 ## Phase 2: Clip materialization
 
@@ -388,7 +536,7 @@ A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_st
 - `bq_utils.py` — `bq_param_type` and `build_replace_sql`, shared by writers
 - `timestamp_utils.py` — `parse_timestamp`, shared by orchestrators
 - `_generated/` — codegen output from `scripts/gen_schemas.py`, committed
-- `prompts/*.md` — LLM prompts (`identify_hand.md`, `extract_player_info.md`, `identify_hand_start.md`, `extract_hole_cards.md`), versioned with code so prompt changes ride code review
+- `prompts/*.md` — LLM prompts (`extract_results.md`, `identify_hand.md`, `extract_player_info.md`, `identify_hand_start.md`, `extract_hole_cards.md`), versioned with code so prompt changes ride code review
 
 ### Test files
 
@@ -430,6 +578,8 @@ In both Phase 4 and Phase 5, `check_preconditions` sits inside the per-hand func
 
 This is harmless because the download is amortised across a video's hands: a video with tens of hands, one or two of which skip, pays nothing extra. The "every hand in this video skips" case is an artifact of a test that seeds a single hand, and restructuring the orchestrator to optimise a scenario production does not produce would be speculative work. An integration test covering a precondition skip must therefore still upload a fixture video, or the download's 404 branch fires first and the precondition is never reached.
 
+The amortisation argument is specific to per-hand phases. A phase whose entity *is* the video has nothing to amortise over, so payout extraction checks its precondition ahead of the download instead — a skipping video would otherwise pay for its own full 100–200 MB fetch to produce zero calls, and `duration_seconds` is already on the pending row.
+
 ### What `check_preconditions` is for
 
 It tests presence, not plausibility: whether the phase can do its work with the given input, not whether the input is correct. `MPBLfM4mwfE_011_002` records `pot_size_bb = 0.38` where 1.88 is expected — a misread — but its stacks, seat count and hole cards are fine and Phase 4 processed it correctly. Rejecting it would have discarded a usable hand to protect a field nothing reads.
@@ -451,6 +601,8 @@ Frames are written to deterministic paths and read only through the paths stored
 The guarantee is one-directional: a live row's path always resolves, because uploads precede the row write. What could break it is automated deletion — so the operative rule is not to build any. Bucket lifecycle rules must stay scoped to noncurrent versions; an age-based rule on current versions would delete referenced frames.
 
 Orphans arise from: upload-before-write on permanent failure; Phase 3 batch shrinkage on reprocess (4 rows become 3, the surplus row's frame detaches); Phase 4's uncontested branch clearing a row whose frames remain; and integration-test residue.
+
+Payout extraction adds a narrower case — upload succeeds, the BQ write then fails — but it is self-healing where the others are not: its path is stable per video, so the next successful run overwrites the object rather than leaving a second one. It cannot orphan on a permanent failure at all, because the upload runs only after the panel validates.
 
 Frames are also the manual spot-check evidence for validating extracted JSON against reality, which is a further reason not to delete them.
 
