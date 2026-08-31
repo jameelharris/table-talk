@@ -25,11 +25,26 @@ def _video_row(duration_seconds):
     return mock_row
 
 
+def _payout_row(payout_rows=1, latest_status=None):
+    """One row of the payout-gate query: does this video have a tournament_results
+    row, and what did its last extraction attempt report."""
+    mock_row = MagicMock()
+    mock_row.payout_rows = payout_rows
+    mock_row.latest_status = latest_status
+    return mock_row
+
+
+def _gated(*query_results):
+    """The query sequence for a materialize_clips call that reaches the writer:
+    videos lookup, clip_manifest existence check, then the payout gate."""
+    return _mock_bq(*query_results, [_payout_row()])
+
+
 # --- materialize_clips unit tests ---
 
 
 def test_240s_aligned_video():
-    bq = _mock_bq([_video_row(480)], [])  # videos query, clip_manifest check
+    bq = _gated([_video_row(480)], [])  # videos query, clip_manifest check, payout gate
 
     with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
@@ -42,7 +57,7 @@ def test_240s_aligned_video():
 
 
 def test_non_aligned_video():
-    bq = _mock_bq([_video_row(300)], [])
+    bq = _gated([_video_row(300)], [])
 
     with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
@@ -55,7 +70,7 @@ def test_non_aligned_video():
 
 
 def test_video_shorter_than_240s():
-    bq = _mock_bq([_video_row(60)], [])
+    bq = _gated([_video_row(60)], [])
 
     with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
@@ -68,7 +83,7 @@ def test_video_shorter_than_240s():
 
 def test_long_video_ordinals():
     # 10 clips: 9 full 240s windows + 1 remainder
-    bq = _mock_bq([_video_row(2161)], [])
+    bq = _gated([_video_row(2161)], [])
 
     with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
@@ -122,7 +137,7 @@ def test_idempotence():
 
 
 def test_clip_id_format():
-    bq = _mock_bq([_video_row(300)], [])
+    bq = _gated([_video_row(300)], [])
 
     with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
         materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
@@ -136,9 +151,11 @@ def test_clip_id_format():
 # --- materialize_clips_for_pending_videos unit tests ---
 
 
-def _pending_row(video_id):
+def _pending_row(video_id, has_payouts=True, latest_status=None):
     mock_row = MagicMock()
     mock_row.video_id = video_id
+    mock_row.has_payouts = has_payouts
+    mock_row.latest_status = latest_status
     return mock_row
 
 
@@ -224,7 +241,138 @@ def test_no_only_video_ids_scans_all_pending():
     assert job_config is None
 
 
+# --- payout gate unit tests ---
+#
+# Payout data is a precondition for a hand entering the corpus, so both entry
+# points enforce it. They differ only in how they report: the pending set names
+# and skips, --video-id raises.
+
+
+def test_pending_query_joins_tournament_results():
+    bq = MagicMock()
+    bq.query.return_value = []
+
+    with patch("table_talk.clip_materialization.materialize_clips"):
+        materialize_clips_for_pending_videos(project=PROJECT, dataset=DATASET, bq_client=bq)
+
+    query_str = bq.query.call_args[0][0]
+    assert f"`{PROJECT}.{DATASET}.tournament_results`" in query_str
+    assert f"`{PROJECT}.{DATASET}.tournament_results_processing_attempts`" in query_str
+    # LEFT, not INNER: a payout-less video must be visible-and-skipped rather
+    # than dropped from the result set, because a video that never appears
+    # cannot be reported.
+    assert "LEFT JOIN `test-project.test_dataset.tournament_results` tr" in query_str
+
+
+def test_pending_video_without_payouts_is_skipped_and_named(capsys):
+    pending = [
+        _pending_row("vid_ok"),
+        _pending_row("vid_nopayout", has_payouts=False),
+    ]
+    bq = MagicMock()
+    bq.query.return_value = pending
+
+    with patch("table_talk.clip_materialization.materialize_clips") as mock_mat:
+        materialize_clips_for_pending_videos(project=PROJECT, dataset=DATASET, bq_client=bq)
+
+    assert [c[0][0] for c in mock_mat.call_args_list] == ["vid_ok"]
+
+    out = capsys.readouterr().out
+    assert "Skipped vid_nopayout" in out
+    assert "tt extract-payouts --video-id vid_nopayout" in out
+    # A skip is a normal outcome of a correctly ordered pipeline. Reporting it
+    # as a failure would train operators to ignore it.
+    assert "Failed to materialize" not in out
+    assert "1 videos, 0 failed, 1 skipped" in out
+
+
+@pytest.mark.parametrize(
+    "latest_status,expected",
+    [
+        (None, "no extraction attempt"),
+        ("failed_transient", "failed transiently"),
+        ("failed_permanent", "terminated 'failed_permanent'"),
+        ("failed_parked", "terminated 'failed_parked'"),
+        ("complete_skipped", "terminated 'complete_skipped'"),
+        ("complete", "anomalous"),
+    ],
+)
+def test_skip_reason_distinguishes_never_attempted_from_terminal(
+    latest_status, expected, capsys
+):
+    """The operator's next move differs by cause, so the bare absence of a
+    tournament_results row is not a sufficient message."""
+    bq = MagicMock()
+    bq.query.return_value = [
+        _pending_row("vid_x", has_payouts=False, latest_status=latest_status)
+    ]
+
+    with patch("table_talk.clip_materialization.materialize_clips"):
+        materialize_clips_for_pending_videos(project=PROJECT, dataset=DATASET, bq_client=bq)
+
+    assert expected in capsys.readouterr().out
+
+
+def test_single_video_without_payouts_raises():
+    bq = _mock_bq([_video_row(480)], [], [_payout_row(payout_rows=0)])
+
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
+        with pytest.raises(MaterializeError, match="tt extract-payouts --video-id"):
+            materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
+
+    mock_write.assert_not_called()
+
+
+def test_single_video_payout_parked_names_the_terminal_status():
+    bq = _mock_bq([_video_row(480)], [], [_payout_row(0, latest_status="failed_parked")])
+
+    with pytest.raises(MaterializeError, match="failed_parked"):
+        materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
+
+
+def test_already_materialized_video_is_not_gated():
+    """The gate runs after the idempotence return, so a video materialized
+    before the gate existed does not start erroring. Nothing new is admitted."""
+    existing_clip = MagicMock()
+    bq = _mock_bq([_video_row(480)], [existing_clip])
+
+    with patch("table_talk.clip_materialization.write_clip_manifest_rows") as mock_write:
+        materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
+
+    mock_write.assert_not_called()
+    # Two queries only — the payout gate was never reached.
+    assert bq.query.call_count == 2
+
+
 # --- integration tests ---
+
+
+def _write_payout_row(video_id, *, project, dataset, client, bounty_type="none"):
+    """Seed the tournament_results row the materialization gate requires.
+
+    Uses payout extraction's production writer as a setup utility, per
+    CLAUDE.md's cross-phase convention — never its orchestrator, which would
+    download the video and call Gemini.
+    """
+    from table_talk._generated.tournament_results_row import TournamentResultsRow
+    from table_talk.tournament_results_writer import write_tournament_results
+
+    write_tournament_results(
+        [
+            TournamentResultsRow(
+                video_id=video_id,
+                bounty_type=bounty_type,
+                currency_symbol="$",
+                frame_timestamp_seconds=5,
+                frame_gcs_path=f"gs://table-talk-497020-tournament-results-dev/{video_id}/results.jpg",
+                tournament_results_state={"panel": {"rows": []}},
+            )
+        ],
+        video_id=video_id,
+        project_id=project,
+        dataset=dataset,
+        client=client,
+    )
 
 
 @pytest.mark.integration
@@ -236,6 +384,7 @@ def test_materialize_clips_integration():
     client = bigquery.Client(project=project)
     videos_table = f"{project}.{dataset}.videos"
     manifest_table = f"{project}.{dataset}.clip_manifest"
+    payouts_table = f"{project}.{dataset}.tournament_results"
 
     try:
         write_video_row(
@@ -251,6 +400,7 @@ def test_materialize_clips_integration():
             dataset=dataset,
             client=client,
         )
+        _write_payout_row(video_id, project=project, dataset=dataset, client=client)
 
         materialize_clips(video_id, project=project, dataset=dataset, bq_client=client)
 
@@ -284,22 +434,28 @@ def test_materialize_clips_integration():
         assert len(rows_after) == 2
 
     finally:
-        client.query(
-            f"DELETE FROM `{manifest_table}` WHERE video_id = @video_id",
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ScalarQueryParameter("video_id", "STRING", video_id)]
-            ),
-        ).result()
-        client.query(
-            f"DELETE FROM `{videos_table}` WHERE video_id = @video_id",
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ScalarQueryParameter("video_id", "STRING", video_id)]
-            ),
-        ).result()
+        # Reverse dependency order: clip_manifest and tournament_results both
+        # reference videos.
+        for table in (manifest_table, payouts_table, videos_table):
+            client.query(
+                f"DELETE FROM `{table}` WHERE video_id = @video_id",
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ScalarQueryParameter("video_id", "STRING", video_id)
+                    ]
+                ),
+            ).result()
 
 
 @pytest.mark.integration
-def test_materialize_clips_for_pending_videos_integration():
+def test_materialize_clips_for_pending_videos_integration(capsys):
+    """Also the gate's negative case: video B has no tournament_results row on
+    the first run, so it is named and skipped rather than materialized; adding
+    the row makes the next run materialize it.
+
+    Neither corpus video exercises this — both already have payout rows and are
+    already materialized — so it has to be constructed with uuid-scoped ids.
+    """
     project = "table-talk-497020"
     dataset = "table_talk_dev"
     video_id_a = f"test_{uuid.uuid4().hex[:8]}"
@@ -308,6 +464,17 @@ def test_materialize_clips_for_pending_videos_integration():
     client = bigquery.Client(project=project)
     videos_table = f"{project}.{dataset}.videos"
     manifest_table = f"{project}.{dataset}.clip_manifest"
+    payouts_table = f"{project}.{dataset}.tournament_results"
+
+    def _clip_count(vid):
+        return list(
+            client.query(
+                f"SELECT COUNT(1) AS n FROM `{manifest_table}` WHERE video_id = @video_id",
+                job_config=bigquery.QueryJobConfig(
+                    query_parameters=[bigquery.ScalarQueryParameter("video_id", "STRING", vid)]
+                ),
+            ).result()
+        )[0].n
 
     try:
         for vid, duration in [(video_id_a, 120), (video_id_b, 480)]:
@@ -324,6 +491,8 @@ def test_materialize_clips_for_pending_videos_integration():
                 dataset=dataset,
                 client=client,
             )
+        # A is admissible; B has no payout row yet.
+        _write_payout_row(video_id_a, project=project, dataset=dataset, client=client)
 
         materialize_clips_for_pending_videos(
             project=project,
@@ -332,25 +501,38 @@ def test_materialize_clips_for_pending_videos_integration():
             only_video_ids=[video_id_a, video_id_b],
         )
 
-        for vid, expected_clips in [(video_id_a, 1), (video_id_b, 2)]:
-            rows = list(
-                client.query(
-                    f"SELECT * FROM `{manifest_table}` WHERE video_id = @video_id",
-                    job_config=bigquery.QueryJobConfig(
-                        query_parameters=[bigquery.ScalarQueryParameter("video_id", "STRING", vid)]
-                    ),
-                ).result()
-            )
-            assert len(rows) == expected_clips, f"{vid}: expected {expected_clips} clips, got {len(rows)}"
+        assert _clip_count(video_id_a) == 1
+        assert _clip_count(video_id_b) == 0, "B has no payout row and must not be materialized"
+
+        out = capsys.readouterr().out
+        assert f"Skipped {video_id_b}" in out
+        assert f"tt extract-payouts --video-id {video_id_b}" in out
+
+        # Supplying the payout row admits B on the next run.
+        _write_payout_row(
+            video_id_b, project=project, dataset=dataset, client=client, bounty_type="progressive"
+        )
+        materialize_clips_for_pending_videos(
+            project=project,
+            dataset=dataset,
+            bq_client=client,
+            only_video_ids=[video_id_a, video_id_b],
+        )
+
+        assert _clip_count(video_id_b) == 2
+        assert _clip_count(video_id_a) == 1, "A must not be re-materialized"
 
     finally:
         for vid in (video_id_a, video_id_b):
-            client.query(
-                f"DELETE FROM `{manifest_table}` WHERE video_id = @video_id",
-                job_config=bigquery.QueryJobConfig(
-                    query_parameters=[bigquery.ScalarQueryParameter("video_id", "STRING", vid)]
-                ),
-            ).result()
+            for table in (manifest_table, payouts_table):
+                client.query(
+                    f"DELETE FROM `{table}` WHERE video_id = @video_id",
+                    job_config=bigquery.QueryJobConfig(
+                        query_parameters=[
+                            bigquery.ScalarQueryParameter("video_id", "STRING", vid)
+                        ]
+                    ),
+                ).result()
             client.query(
                 f"DELETE FROM `{videos_table}` WHERE video_id = @video_id",
                 job_config=bigquery.QueryJobConfig(
