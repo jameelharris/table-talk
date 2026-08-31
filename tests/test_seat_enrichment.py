@@ -38,6 +38,29 @@ def test_add_seat_numbers_6_handed():
     assert seat_numbers == [1, 2, 3, 4, 5, 6]
 
 
+def test_add_seat_numbers_carries_bounty_through_untouched():
+    """Phase 3 writes `bounty` onto player objects before enrichment runs.
+    Enrichment injects seat_number and sorts; it must not drop or alter any
+    other field it does not know about."""
+    state = {
+        "total_seat_count": 3,
+        "players": [
+            {"seat_position_label": "UTG", "stack_size": 50.0, "bounty": 281.25},
+            {"seat_position_label": "BB", "stack_size": 100.0, "bounty": 125.0},
+            {"seat_position_label": "SB", "stack_size": 75.0, "bounty": None},
+        ],
+    }
+    add_seat_numbers(state)
+
+    by_label = {p["seat_position_label"]: p for p in state["players"]}
+    assert by_label["UTG"]["bounty"] == 281.25
+    assert by_label["BB"]["bounty"] == 125.0
+    assert by_label["SB"]["bounty"] is None
+    # Sorting moved the players; the bounty must have travelled with its seat.
+    assert state["players"][0]["seat_position_label"] == "BB"
+    assert state["players"][0]["bounty"] == 125.0
+
+
 def test_add_seat_numbers_unknown_label_yields_none():
     state = _make_state(["BB", "WEIRD", "BTN"])
     add_seat_numbers(state)

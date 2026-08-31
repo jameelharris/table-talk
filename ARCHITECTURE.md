@@ -14,7 +14,7 @@ YouTube URL
 videos table + GCS .mp4 file
    ↓ [Payout extraction]
 tournament_results table + tournament_results_processing_attempts table + GCS frame .jpg file
-   ↓ [Phase 2: Clip materialization]
+   ↓ [Phase 2: Clip materialization]  ← GATED: a video with no tournament_results row is skipped
 clip_manifest table (inventory of 240s windows)
    ↓ [Phase 3: Hand setup identification]
 hand_setups table + clip_processing_attempts table + GCS frame .jpg files
@@ -28,6 +28,8 @@ hand_actions table + hand_start_processing_attempts table + GCS frame .jpg files
 `videos` is the only fact table. `clip_manifest`, `tournament_results`, `hand_setups`, `hand_starts`, and `hand_actions` are stage tables — a future assembly phase combines them into fact tables. The `*_attempts` tables are state tables. See CLAUDE.md's "Table taxonomy."
 
 Phase numbers are historical labels reflecting the order phases were built, not a strict pipeline ordering. Payout extraction was designed after Phases 1–5 but runs second, so it carries no number rather than renumbering everything downstream of it; the same pragmatism as Phase 1's status vocabulary, where "the naming divergence is historical."
+
+The arrow from payout extraction into Phase 2 is the pipeline's only hard dependency between phases: it is a gate, not merely an ordering. See "Admissibility: payout data gates the corpus."
 
 
 This document covers phases that have been built. Later phases will be added as they're designed.
@@ -210,7 +212,7 @@ ORDER BY tr.video_id
 
 A discrepancy is `bounty_type = 'progressive'` with zero bounty-bearing hands, or `bounty_type = 'none'` with more than zero. To correct one: append a retryable attempt row for the video, re-run `tt extract-payouts --video-id`, and the row is replaced.
 
-Until per-seat bounty extraction lands, `hand_setup_state.players[].bounty` does not exist, so the last column reads 0 for every video and only the first three are meaningful.
+Per-seat bounty extraction has landed, so the last column is meaningful for any video processed since. It still reads 0 for hands extracted before it — `MPBLfM4mwfE`'s existing 65 rows predate it and read 0 until that video is rebuilt (see "Rebuild, not backfill"). Read a zero on a `progressive` video as "not yet reprocessed" until the rebuild has run, and as a real discrepancy afterwards.
 
 ### Known inefficiency, accepted
 
@@ -229,7 +231,7 @@ Computes 240-second clip windows from a video's duration and writes the manifest
 ### Production files
 
 - `cli.py` — `tt materialize-clips` subcommand
-- `clip_materialization.py` — orchestration: `materialize_clips`, `materialize_clips_for_pending_videos`
+- `clip_materialization.py` — orchestration: `materialize_clips`, `materialize_clips_for_pending_videos`, `_check_payout_gate`, `_payout_gate_reason`
 - `clip_manifest_writer.py` — `clip_manifest` table writes (batched: one DML per video)
 
 ### Test files
@@ -248,25 +250,63 @@ tt materialize-clips --project P --dataset D
 tt materialize-clips --project P --dataset D --video-id VIDEO_ID
 ```
 
-Without `--video-id`: materializes for all videos in `videos` that have no `clip_manifest` rows.
-With `--video-id`: materializes only for the specified video; errors if the video isn't in `videos`.
+Without `--video-id`: materializes for all videos in `videos` that have no `clip_manifest` rows **and** a `tournament_results` row. Videos missing the payout row are named on stdout with the reason and counted as skipped; the run continues and exits zero.
+With `--video-id`: materializes only for the specified video; errors if the video isn't in `videos`, or if it has no `tournament_results` row.
+
+### Admissibility: payout data gates the corpus
+
+A hand without payout context cannot participate in ICM analysis, and a corpus mixing hands that have it with hands that do not cannot be compared — pooled aggregates would be skewed and could support wrong conclusions. Payout data is therefore a **precondition for a hand being admissible to the corpus at all**, not a filter applied at query time.
+
+That places the gate here rather than in Phase 3. If payouts define admissibility, the clips should never exist in the first place, and `clip_manifest` should never hold a row that ought not be processed. Phase 3's pending set is then correct by construction, which is how every other phase in this pipeline already works, and Phase 3 needs no check of its own.
+
+The pending query drives off `videos` and LEFT JOINs `tournament_results` — not the reverse. `videos` is the fact table and the authoritative list of ingested videos; driving off the stage table would make a payout-less video *invisible* to the query rather than visible-and-skipped, and an invisible video cannot be reported. Reporting is the point: a silent no-op looks like success.
+
+Both entry points enforce the gate, because admissibility cannot depend on which code path the operator took. They differ only in how they report. In the pending set a payout-less video is one of many not yet ready, so it is named and skipped and the run continues. With `--video-id` the operator has asserted intent about one specific video, so it raises `MaterializeError` — the same treatment as a video missing from `videos`. In `materialize_clips` the gate runs *after* the existing-clips early return, so a video materialized before the gate existed does not start erroring; nothing new is admitted on that path.
+
+An earlier design put the check in `tt process-clips` and exited non-zero. Two problems, both real. `--video-id` is optional and the normal production invocation has no filter, so one terminally-failed payout extraction would have blocked every subsequent unscoped `process-clips` run corpus-wide. And it treated admissibility as a processing constraint rather than a property of the corpus, leaving `clip_manifest` holding rows that must never be processed and the pending query no longer the truth.
+
+Consequences, accepted:
+
+- **A video that fails payout extraction produces zero poker data**, permanently, until someone revisits it. That is the intent, not an oversight. Its action sequences and cards would have been valid for non-ICM questions, and they are discarded anyway, because a corpus that mixes the two cannot be compared.
+- **Payout extraction reliability is now load-bearing for the whole corpus**, not just for ICM. It is proven on two videos. If the results panel is unreadable on some broadcast format, every video of that format is lost entirely. Revisit `FRAME_FALLBACK_LADDER` if failures cluster once ingesting at volume.
+
+Diagnosis query for an operator asking why a video never materialized — never attempted, terminally failed, and parked all read differently:
+
+```sql
+SELECT v.video_id, a.status, a.status_message
+FROM `{project}.{dataset}.videos` v
+LEFT JOIN `{project}.{dataset}.tournament_results` tr USING (video_id)
+LEFT JOIN (
+  SELECT video_id, status, status_message,
+         ROW_NUMBER() OVER (PARTITION BY video_id ORDER BY attempted_at DESC) AS rn
+  FROM `{project}.{dataset}.tournament_results_processing_attempts`
+) a ON a.video_id = v.video_id AND a.rn = 1
+WHERE tr.video_id IS NULL
+```
 
 ### Failure handling
 
 Per-video failures are logged to stdout only. No attempts table. Retry happens implicitly because failed videos still have no `clip_manifest` rows and remain pending on the next run.
 
-This is intentionally simpler than Phase 1's per-URL attempt tracking. Materialization has narrower failure modes (no external dependencies — just BQ), and the failure cases that exist (invalid `duration_seconds`, missing video row) imply upstream bugs rather than transient errors. If materialization failure modes broaden, revisit this decision.
+This is intentionally simpler than Phase 1's per-URL attempt tracking. Materialization has narrower failure modes (no external dependencies — just BQ), and the failure cases that exist (invalid `duration_seconds`, missing video row) imply upstream bugs rather than transient errors.
+
+A third category now exists alongside those two. **A missing `tournament_results` row is neither an upstream bug nor a transient error** — it is a legitimate not-yet-ready state, resolved by running an upstream command. It is reported as a *skip*, tallied separately from a failure and worded differently, because a video awaiting payout extraction is a normal outcome of a correctly ordered pipeline and reporting it as an error would train operators to ignore it.
+
+No Phase 2 state row records it. The cause is already durably recorded one phase upstream in `tournament_results_processing_attempts`, so a Phase 2 row would record a consequence rather than a cause — which is also why the skip message reads that table to distinguish never-attempted from `failed_transient` from a terminal `complete_skipped` / `failed_permanent` / `failed_parked`. The operator's next move differs in each case.
+
+That said, this category is the reason Phase 2's no-attempts-table justification no longer fully holds: the gate adds a cross-phase dependency the original reasoning did not contemplate. `clip_materialization_attempts` is recorded under Known follow-ups. It does not block anything today and matters at the first large multi-video ingest.
 
 Note that Phase 2's pending check consults the *output* table rather than an attempts table, which is the same principle the idempotent-write pattern applies elsewhere (see "Idempotent stage writes"). Its single batched DML per video means a partial write cannot happen, so it needs no replace wrapper.
 
 ## Phase 3: Hand setup identification
 
-Picks up pending clips from `clip_manifest`, downloads the source video to a per-video local tempfile, calls Gemini 2.5 Pro on each clip to identify hand setup moments, extracts a frame at each moment via ffmpeg, calls Gemini Pro on each frame to extract player info, enriches with deterministic seat metadata, and writes `hand_setups` rows + frame JPEGs to GCS. All work per clip is atomic. Defines hand setup moments only; the first voluntary action is Phase 4 and per-hand action sequences are later.
+Picks up pending clips from `clip_manifest`, downloads the source video to a per-video local tempfile, calls Gemini 2.5 Pro on each clip to identify hand setup moments, extracts a frame at each moment via ffmpeg, calls Gemini Pro on each frame to extract player info, enriches with deterministic seat metadata, and writes `hand_setups` rows + frame JPEGs to GCS. On progressive-knockout videos the frame prompt carries a bounty addendum and each player gains a `bounty`. All work per clip is atomic. Defines hand setup moments only; the first voluntary action is Phase 4 and per-hand action sequences are later.
 
 ### Production files
 
 - `cli.py` — `tt process-clips` subcommand
-- `hand_setup_processing.py` — orchestration: `PendingClip` (module-local frozen dataclass), `_find_pending_clips`, `process_clip` (async, atomic per clip), `process_pending_clips` (per-video sequential outer loop with `asyncio.Semaphore(max_concurrent)` clip-level parallelism), `_transient_status`
+- `hand_setup_processing.py` — orchestration: `PendingClip` (module-local frozen dataclass), `_find_pending_clips`, `process_clip` (async, atomic per clip), `process_pending_clips` (per-video sequential outer loop with `asyncio.Semaphore(max_concurrent)` clip-level parallelism), `_transient_status`, `_player_info_prompt`, `_parse_bounty`
+- `prompts/extract_player_info_bounty_addendum.md` — appended to the base frame prompt when `bounty_type = 'progressive'`
 - `videos_downloader.py` — GCS-to-local download (done once per video, reused across clips); raises `DownloadPermanentError` on GCS 404
 - `frame_extractor.py` — ffmpeg subprocess wrapper; sharpness/saturation filters match the notebook's image-quality settings; accepts `float | int` timestamps
 - `frame_uploader.py` — GCS frame upload
@@ -277,7 +317,9 @@ Picks up pending clips from `clip_manifest`, downloads the source video to a per
 - `timestamp_utils.py` — `parse_timestamp`, shared with Phase 4
 - `bq_utils.py` — `bq_param_type`, `build_replace_sql`, shared across writers
 
-`_find_pending_clips` returns `PendingClip`, not the generated `ClipManifestRow`, because it carries a query-computed `consecutive_failures` that exists in no schema.
+`_find_pending_clips` returns `PendingClip`, not the generated `ClipManifestRow`, because it carries a query-computed `consecutive_failures` that exists in no schema, plus `bounty_type` joined from `tournament_results`.
+
+That join is LEFT, and a null `bounty_type` raises. The materialization gate guarantees no clip reaches `clip_manifest` without a payout row, so a missing one is a broken invariant rather than a data condition to degrade around. An INNER JOIN would encode the same assumption by silently dropping the clip — which is the failure shape the gate exists to prevent.
 
 ### Test files
 
@@ -293,7 +335,7 @@ Picks up pending clips from `clip_manifest`, downloads the source video to a per
 
 ### BQ tables
 
-- `hand_setups` — stage table, one row per detected hand setup, scoped to clip; `hand_setup_state` is a JSON column with `total_seat_count`, `pot_size_bb`, `players` (each enriched with `seat_number`)
+- `hand_setups` — stage table, one row per detected hand setup, scoped to clip; `hand_setup_state` is a JSON column with `total_seat_count`, `pot_size_bb`, `players` (each enriched with `seat_number`, and on progressive videos a `bounty`)
 - `clip_processing_attempts` — state table, one row per processing attempt
 
 ### GCS
@@ -305,6 +347,35 @@ Picks up pending clips from `clip_manifest`, downloads the source video to a per
 ```
 tt process-clips --project P --dataset D --videos-bucket VB --hand-setups-bucket HB [--video-id ID] [--max-concurrent 4] [--max-attempts 3]
 ```
+
+### Per-seat bounty capture
+
+On a progressive knockout each seat carries a badge below the avatar showing the live bounty on that player's head — what an opponent collects for eliminating them. It changes hand to hand as knockouts land, it is the term that makes calling correct in spots where ICM says fold, and nothing else in the pipeline derives it. The results panel's Bounty column that payout extraction captures is not a substitute: it reports realized collections by finishing rank and says nothing about what a player faced at the moment they acted.
+
+`prompts/extract_player_info.md` is unchanged and is sent verbatim to non-bounty videos. For `bounty_type = 'progressive'` a separate fragment is concatenated at call time. Base-plus-addendum rather than two full prompt files, because two near-identical prompts drift and the shared body — the position-assignment procedure — is the part that matters.
+
+**The addendum must ride the incumbent prompt; it cannot be a standalone call.** A standalone bounty probe read the values perfectly but mis-assigned them to seats, worsening with seat count: 4/4 agreement across four reps at three-handed, 2/4 at five-handed (two seats rotated), 3/4 at nine-handed with one rep fully reversed round the button. The values were identical every time; only the label-to-value mapping moved. That is the same misattribution recorded below for the rejected single-seat hole-card retry. A null bounty is a gap; a rotated one silently attributes the chip leader's bounty to a short stack. Riding the incumbent prompt fixes it because the seat is already determined by logic that has been correct corpus-wide.
+
+Two details in the addendum are load-bearing and cost real debugging time:
+
+- **The nesting instruction.** The frame response is wrapped in a `hand_setup` object. An earlier version said "as siblings of the existing fields" without naming the wrapper; the field landed at the wrong level and came back null every time.
+- **The seat-binding sentence** — "the badge belonging to the player whose stack you reported for that seat" — is what fixes assignment, and is the likely cause of the output-token increase below. Do not reword it casually.
+
+Cost, measured on `MPBLfM4mwfE_001_001` nine-handed over three reps each: prompt tokens 2,837 → 3,054 (+8%, the addendum text), total 4,831 → 6,589 (+36%), with output rising ~77% (≈1,994 → ≈3,535). Nine extra fields do not account for 1,500 tokens; that is reasoning about seat assignment. Roughly +$0.016 per hand setup, ≈$1.00 per video, ≈$26 across a 25-video PKO corpus. Small in absolute terms against a projected ~$1,060 for a 20K-hand corpus, but a large proportional jump on this one call — it is not free merely because no new call is made. Nine-handed is the worst case. A tighter phrasing of the seat-binding sentence may buy the same correctness for fewer tokens; optimise after it works, using the reproduce-before-changing harness.
+
+`bounty` is parsed to a float by `_parse_bounty`, which strips `$` and `,`: the same prompt returned `'$406.25'` on one frame and `406.25` on another, so the addendum's "report it as a number" instruction alone is not sufficient. It is deliberately duplicated from `payout_processing._parse_amount` rather than shared — the duplication is a few lines and exact, the two can legitimately diverge (payout values carry a leading asterisk; badge values do not), and a shared module with one member is an abstraction for its own sake. Promote if a third caller appears.
+
+The field is **absent, not null**, on non-bounty videos — nothing asked for it. Neither `schemas/hand_setups.json` nor codegen nor Terraform changes: `hand_setup_state` is a JSON column passed as a `dict`, so `bq_param_type` (which has no float branch) is never reached. Phase 4 nests `hand_setup_state` verbatim, so `bounty` propagates to `hand_starts` and `hand_actions` with no change there, and Phase 4's `check_preconditions` does not inspect it — a null bounty is a gap, not a skip.
+
+**Reference images were considered and cut.** Phase 5's flop/turn/river references solve a *recognition* problem; this is not one — the spike read badge values 12/12 in isolation. They would add tokens to every per-hand call forever, create another code-to-prompt binding, and introduce a hallucination surface on concrete dollar values. They would only earn their place if one prompt had to serve both layouts, and the `bounty_type` gate means it does not.
+
+`test_bounty_addendum_field_names_match_the_base_prompt` asserts that the keys the addendum references — `hand_setup`, `players`, `stack_size` — appear verbatim in `extract_player_info.md`. Like `test_reference_image_label_wording_matches_the_scan_prompt`, it is **not** an exception to "prompts have no automated tests": it asserts a code-to-prompt *interface* contract, not prompt content or quality. Renaming a key in the base would leave the addendum instructing the model to add a field alongside a `stack_size` that no longer exists, degrading extraction corpus-wide with no error anywhere. Do not delete it for violating a rule it does not violate.
+
+Downstream must still *derive* rather than extract two things. Per-seat forced contributions: the ante coefficient is `(pot_size_bb − 1.5) / total_seat_count`, fitted per video by median so a misread pot does not drag it (`MPBLfM4mwfE` fits 0.125 exactly across seat counts 9 through 2). Note it is a **big blind ante** — the total collected is `0.125 × seats`, posted by one player, so `committed[seat]` is 0.5 for the SB, 1.0 plus the full table ante for the BB, and zero for everyone else; do not subtract 0.125 from every stack. And bounty equity: under progressive rules roughly half a collected bounty is banked and half added to the knocker's own head, so capturable equity is about half the displayed badge — inferred from a 125 → 187.5 → 281.25 progression, three data points, and worth confirming before anything depends on it.
+
+**Currency mismatch, unresolved.** Badges and payouts are in dollars; stacks and pots are in big blinds. Nothing bridges them, and any equity computation needs that bridge. It connects to the open blind-level question and it blocks bounty-aware analysis.
+
+**Stated assumptions.** Badge legibility and placement rest on one video — `MPBLfM4mwfE` is the only progressive event ingested, and `oWKpfjfEM4c` is a confirmed second PKO and the obvious next test of whether badge position holds across broadcast skins. And seat assignment is verified *stable*, not verified *correct*: three consistent reps rule out the rotation failure but cannot distinguish three right answers from three consistently wrong ones. The spot-check against the stored frame is the ground truth.
 
 ### Failure handling
 
@@ -614,6 +685,16 @@ If Phase 3 reprocesses a clip and the new result differs, `hand_setups` is corre
 
 There is no cascade tooling today. Phase 5 landed with the cascade **explicitly deferred**. `hand_action_state` embeds a *snapshot* of `hand_start_state`, so reprocessing Phase 3 or Phase 4 leaves `hand_actions` silently stale three layers down rather than two. Cascade tooling remains a follow-up; nothing in Phase 5 solves it.
 
+### Rebuild, not backfill
+
+When a change adds a field to a stage blob, the corpus has to catch up. The rule, which matters at 25 videos and does not at one:
+
+An **additive** change can in principle be backfilled at the phase that owns it. Downstream snapshots merely lack a field they never had, and no phase reads its inputs from a nested blob, so nothing is left disagreeing. A **modifying** change requires a full rebuild.
+
+Per-seat bounty is additive, and a rebuild was still chosen — on economics, not necessity. The corpus is one video at ~$3.20 end to end. Building migration machinery to avoid that optimises against a constraint that does not exist, and the machinery would have to exist and be correct before it saved anything. The rebuild also sidesteps the cascade gap above: Phase 3's clip-mode detection call is stochastic, so a full reprocess can change the number or timing of detected setups, and truncating `hand_setups`, `hand_starts` and `hand_actions` first avoids both the orphan case and the silently-stale case entirely.
+
+Re-detection being stochastic, the row counts are expected to move. Record the new ones; a difference is not a defect. A large move is itself a finding about detection stability.
+
 ### Operational hardening
 
 - GCS Data Access audit logs are enabled at the project level for `storage.googleapis.com` (ADMIN_READ + DATA_READ + DATA_WRITE) so object-level operations are traceable in Cloud Logging. Well under the 50 GiB/month free tier for current workload.
@@ -666,6 +747,7 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 - **Standing integrity-check tool** — the invariant that caught the duplicate: `hand_starts` row count equals the count of complete-and-not-uncontested hands, and no duplicate natural id in either stage table. The uncontested exclusion is essential; a naive "complete count equals row count" check false-positives on them. Must also tolerate the row-exists-with-failed-status cases described under "Idempotent stage writes." Ship as a CLI subcommand or a documented query.
 - **Hand-level deletion cascade tooling** — see "Cross-phase reprocessing cascade." Now acute: Phase 5's tables have landed.
+- **`clip_materialization_attempts`** — Phase 2 remains the only phase without a state table. The justification (narrow failure modes, no external dependencies) no longer fully holds now that the payout gate adds a cross-phase dependency and a legitimate not-yet-ready state that is neither a bug nor a transient error. Deliberately deferred; it matters at the first large multi-video ingest, not at two videos.
 - **Ruff baseline** — 189 errors across `src/`, `tests/` and `scripts/`, 164 of them E501 against the configured 100-char limit and the rest auto-fixable imports plus two decorative unused mocks. Ruff is not in CI, which is why they accumulated. With that many standing errors a new one is invisible.
 - **Notebook reproduction harnesses are untracked** — `*.ipynb` is gitignored, while `jupyterlab`, `ipykernel` and `pillow` are dev dependencies precisely because CLAUDE.md's regression guard for prompts is notebook reproduction. The harnesses themselves are not versioned, so each investigation rebuilds them.
 

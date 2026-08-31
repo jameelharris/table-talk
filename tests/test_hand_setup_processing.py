@@ -15,6 +15,8 @@ from table_talk.videos_downloader import DownloadPermanentError
 from table_talk.hand_setup_processing import (
     PendingClip,
     _find_pending_clips,
+    _parse_bounty,
+    _player_info_prompt,
     _transient_status,
     process_clip,
     process_pending_clips,
@@ -31,6 +33,7 @@ _CLIP = PendingClip(
     clip_start_time=0,
     clip_end_time=240,
     consecutive_failures=0,
+    bounty_type="none",
 )
 
 _PLAYER_INFO = {
@@ -440,15 +443,167 @@ def test_process_clip_seat_enrichment_applied():
 
 
 # ---------------------------------------------------------------------------
+# Per-seat bounty capture
+#
+# The bounty badge is read by an addendum riding the incumbent prompt rather
+# than by a standalone probe. A standalone probe read the values perfectly but
+# mis-assigned them to seats — worsening with seat count, one nine-handed rep
+# fully reversed round the button — which is the same misattribution failure
+# ARCHITECTURE records for the rejected single-seat hole-card retry. A null
+# bounty is a gap; a rotated one silently attributes the chip leader's bounty
+# to a short stack.
+# ---------------------------------------------------------------------------
+
+
+def test_bounty_addendum_field_names_match_the_base_prompt():
+    """The addendum references keys the base prompt defines.
+
+    Rename one in extract_player_info.md and the addendum silently unbinds:
+    the model is told to add a field "alongside stack_size" inside
+    "hand_setup.players" when neither name exists any more, and extraction
+    degrades corpus-wide with no error anywhere.
+
+    This asserts a code-to-prompt *interface* contract, not prompt content or
+    quality, and is permitted under the same narrow exception as
+    test_reference_image_label_wording_matches_the_scan_prompt. Do not delete
+    it for violating a rule it does not violate.
+    """
+    from pathlib import Path
+
+    prompts_dir = Path(__file__).resolve().parents[1] / "prompts"
+    base = (prompts_dir / "extract_player_info.md").read_text(encoding="utf-8")
+    addendum = (prompts_dir / "extract_player_info_bounty_addendum.md").read_text(
+        encoding="utf-8"
+    )
+
+    for key in ("hand_setup", "players", "stack_size"):
+        assert key in base, f"{key!r} missing from extract_player_info.md"
+        assert key in addendum, f"{key!r} missing from the bounty addendum"
+
+
+def test_player_info_prompt_selection():
+    assert _player_info_prompt("BASE", "ADD", "none") == "BASE"
+    assert _player_info_prompt("BASE", "ADD", "progressive") == "BASE\n\nADD"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("$406.25", 406.25),
+    ("$1,359.37", 1359.37),
+    ("1,359.37", 1359.37),
+    (406.25, 406.25),
+    (406, 406.0),
+    (None, None),
+    (True, None),          # bool is a subclass of int; must not read as 1.0
+    ("n/a", None),
+    ("", None),
+    ([], None),
+])
+def test_parse_bounty(raw, expected):
+    assert _parse_bounty(raw) == expected
+
+
+def _run_one_clip_and_capture_frame_prompt(bounty_type, player_info=None):
+    """Run one clip end to end and return (frame_prompt, written_players)."""
+    clip = replace(_CLIP, bounty_type=bounty_type)
+    with (
+        patch("table_talk.hand_setup_processing._find_pending_clips", return_value=[clip]),
+        patch("table_talk.hand_setup_processing.download_video"),
+        patch("table_talk.hand_setup_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_ONE_SETUP),
+        patch("table_talk.hand_setup_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch("table_talk.hand_setup_processing.call_gemini_for_frame",
+              return_value=player_info or _PLAYER_INFO) as mock_frame,
+        patch("table_talk.hand_setup_processing.upload_frame"),
+        patch("table_talk.hand_setup_processing.write_hand_setups") as mock_write,
+        patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row"),
+    ):
+        _run(process_pending_clips(
+            "proj", "ds", "vb", "hb", "BASE PROMPT", "BASE PROMPT", "BOUNTY ADDENDUM",
+        ))
+
+    frame_prompt = mock_frame.call_args[0][0]
+    written_players = mock_write.call_args[0][0][0].hand_setup_state["players"]
+    return frame_prompt, written_players
+
+
+def test_non_bounty_video_sends_the_unmodified_prompt():
+    """Asserted on the prompt string, not just the output: a non-bounty video
+    must be unchanged in every respect."""
+    frame_prompt, players = _run_one_clip_and_capture_frame_prompt("none")
+
+    assert frame_prompt == "BASE PROMPT"
+    assert "BOUNTY ADDENDUM" not in frame_prompt
+    # Absent, not null — nothing asked for it.
+    assert all("bounty" not in p for p in players)
+
+
+def test_progressive_video_sends_base_plus_addendum():
+    frame_prompt, _ = _run_one_clip_and_capture_frame_prompt("progressive")
+
+    assert frame_prompt.startswith("BASE PROMPT")
+    assert "BOUNTY ADDENDUM" in frame_prompt
+
+
+def test_progressive_bounties_are_normalised_to_floats():
+    """The same prompt returned '$406.25' on one frame and 406.25 on another,
+    so the numeric instruction alone is not sufficient."""
+    player_info = {
+        "hand_setup": {
+            "total_seat_count": 3,
+            "pot_size_bb": 1.5,
+            "players": [
+                {"seat_position_label": "BB", "stack_size": 40.0, "bounty": "$1,359.37"},
+                {"seat_position_label": "SB", "stack_size": 60.0, "bounty": 406.25},
+                {"seat_position_label": "BTN", "stack_size": 20.0, "bounty": None},
+            ],
+        }
+    }
+    _, players = _run_one_clip_and_capture_frame_prompt("progressive", player_info)
+
+    by_label = {p["seat_position_label"]: p for p in players}
+    assert by_label["BB"]["bounty"] == 1359.37
+    assert by_label["SB"]["bounty"] == 406.25
+    assert by_label["BTN"]["bounty"] is None
+    # Seat enrichment must carry bounty through untouched.
+    assert by_label["BB"]["seat_number"] == 1
+    assert by_label["SB"]["seat_number"] == 2
+
+
+def test_find_pending_clips_raises_when_payout_row_is_missing():
+    """The materialization gate guarantees the row exists, so its absence is a
+    broken invariant. An inner join would express the same assumption by
+    silently dropping the clip — the failure shape the gate exists to prevent.
+    """
+    row = MagicMock()
+    row.clip_id = "vid_a_001"
+    row.video_id = "vid_a"
+    row.clip_start_time = 0
+    row.clip_end_time = 240
+    row.consecutive_failures = 0
+    row.bounty_type = None
+
+    with pytest.raises(RuntimeError, match="tt extract-payouts --video-id vid_a"):
+        _find_pending_clips("proj", "ds", client=_mock_bq_client([row]))
+
+
+def test_find_pending_clips_joins_tournament_results():
+    mock_client = _mock_bq_client()
+    _find_pending_clips("proj", "ds", client=mock_client)
+
+    query = mock_client.query.call_args[0][0]
+    assert "tournament_results" in query
+    assert "tr.bounty_type" in query
+
+
+# ---------------------------------------------------------------------------
 # process_pending_clips — dispatch logic
 # ---------------------------------------------------------------------------
 
 
 def test_process_pending_clips_dispatch():
     clips = [
-        PendingClip("vid_a_001", "vid_a", 0, 240, 0),
-        PendingClip("vid_a_002", "vid_a", 240, 480, 0),
-        PendingClip("vid_b_001", "vid_b", 0, 240, 0),
+        PendingClip("vid_a_001", "vid_a", 0, 240, 0, "none"),
+        PendingClip("vid_a_002", "vid_a", 240, 480, 0, "none"),
+        PendingClip("vid_b_001", "vid_b", 0, 240, 0, "none"),
     ]
 
     with (
@@ -457,7 +612,7 @@ def test_process_pending_clips_dispatch():
         patch("table_talk.hand_setup_processing.process_clip", new_callable=AsyncMock, return_value="complete") as mock_process,
     ):
         stats = _run(process_pending_clips(
-            "proj", "ds", "vbucket", "hbucket", "id_prompt", "ep_prompt",
+            "proj", "ds", "vbucket", "hbucket", "id_prompt", "ep_prompt", "addendum",
         ))
 
     # One download per video
@@ -481,7 +636,7 @@ def test_process_pending_clips_scope_params_propagated():
         patch("table_talk.hand_setup_processing.process_clip", new_callable=AsyncMock, return_value="complete"),
     ):
         _run(process_pending_clips(
-            "proj", "ds", "vb", "hb", "ip", "ep",
+            "proj", "ds", "vb", "hb", "ip", "ep", "addendum",
             only_clip_ids=["c1"], only_video_ids=["v1"],
         ))
 
@@ -493,7 +648,7 @@ def test_process_pending_clips_scope_params_propagated():
 
 
 def test_process_pending_clips_download_failure_marks_clips_failed():
-    clips = [PendingClip("vid_a_001", "vid_a", 0, 240, 0)]
+    clips = [PendingClip("vid_a_001", "vid_a", 0, 240, 0, "none")]
 
     with (
         patch("table_talk.hand_setup_processing._find_pending_clips", return_value=clips),
@@ -503,7 +658,7 @@ def test_process_pending_clips_download_failure_marks_clips_failed():
         patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
     ):
         stats = _run(process_pending_clips(
-            "proj", "ds", "vb", "hb", "ip", "ep",
+            "proj", "ds", "vb", "hb", "ip", "ep", "addendum",
         ))
 
     mock_process.assert_not_called()
@@ -516,7 +671,7 @@ def test_process_pending_clips_download_failure_marks_clips_failed():
 
 
 def test_process_pending_clips_download_failure_parks_at_cap():
-    clips = [PendingClip("vid_a_001", "vid_a", 0, 240, 2)]
+    clips = [PendingClip("vid_a_001", "vid_a", 0, 240, 2, "none")]
 
     with (
         patch("table_talk.hand_setup_processing._find_pending_clips", return_value=clips),
@@ -526,7 +681,7 @@ def test_process_pending_clips_download_failure_parks_at_cap():
         patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
     ):
         stats = _run(process_pending_clips(
-            "proj", "ds", "vb", "hb", "ip", "ep", max_attempts=3,
+            "proj", "ds", "vb", "hb", "ip", "ep", "addendum", max_attempts=3,
         ))
 
     mock_process.assert_not_called()
@@ -537,8 +692,8 @@ def test_process_pending_clips_download_failure_parks_at_cap():
 
 def test_process_pending_clips_download_not_found_marks_clips_permanent():
     clips = [
-        PendingClip("vid_a_001", "vid_a", 0, 240, 0),
-        PendingClip("vid_a_002", "vid_a", 240, 480, 0),
+        PendingClip("vid_a_001", "vid_a", 0, 240, 0, "none"),
+        PendingClip("vid_a_002", "vid_a", 240, 480, 0, "none"),
     ]
     with (
         patch("table_talk.hand_setup_processing._find_pending_clips", return_value=clips),
@@ -547,7 +702,7 @@ def test_process_pending_clips_download_not_found_marks_clips_permanent():
         patch("table_talk.hand_setup_processing.process_clip", new_callable=AsyncMock) as mock_process,
         patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
     ):
-        stats = _run(process_pending_clips("proj", "ds", "vb", "hb", "ip", "ep"))
+        stats = _run(process_pending_clips("proj", "ds", "vb", "hb", "ip", "ep", "addendum"))
 
     mock_process.assert_not_called()
     assert stats["clips_processed"] == 2
@@ -592,6 +747,7 @@ async def _integration_body():
     clip_ref = f"{project}.{dataset}.clip_manifest"
     attempts_ref = f"{project}.{dataset}.clip_processing_attempts"
     hand_setups_ref = f"{project}.{dataset}.hand_setups"
+    payouts_ref = f"{project}.{dataset}.tournament_results"
 
     # Generate a small test video via ffmpeg (lavfi testsrc, 60 seconds)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -632,10 +788,16 @@ async def _integration_body():
         dataset=dataset,
         client=bq_client,
     )
+    # The pending query joins tournament_results for bounty_type. In production
+    # the materialization gate guarantees this row precedes any clip.
+    _write_payout_row(bq_client, video_id, project, dataset)
 
     prompts_dir = __import__("pathlib").Path(__file__).resolve().parents[1] / "prompts"
     identify_hand_prompt = (prompts_dir / "identify_hand.md").read_text()
     extract_player_info_prompt = (prompts_dir / "extract_player_info.md").read_text()
+    bounty_addendum = (
+        prompts_dir / "extract_player_info_bounty_addendum.md"
+    ).read_text()
 
     try:
         stats = await process_pending_clips(
@@ -645,6 +807,7 @@ async def _integration_body():
             hand_setups_bucket=hand_setups_bucket,
             identify_hand_prompt=identify_hand_prompt,
             extract_player_info_prompt=extract_player_info_prompt,
+            extract_player_info_bounty_addendum=bounty_addendum,
             only_clip_ids=[clip_id],
         )
 
@@ -690,6 +853,7 @@ async def _integration_body():
             (hand_setups_ref, "clip_id", clip_id),
             (attempts_ref, "clip_id", clip_id),
             (clip_ref, "clip_id", clip_id),
+            (payouts_ref, "video_id", video_id),
             (videos_ref, "video_id", video_id),
         ]:
             col_type = "STRING"
@@ -718,6 +882,37 @@ _PENDING_QUERY_PROJECT = "table-talk-497020"
 _PENDING_QUERY_DATASET = "table_talk_dev"
 
 
+def _write_payout_row(bq_client, video_id, project, dataset, bounty_type="none"):
+    """Seed the tournament_results row the pending query joins for bounty_type.
+
+    Payout extraction's production writer used as a setup utility, per
+    CLAUDE.md's cross-phase convention. In production the materialization gate
+    guarantees this row exists before any clip does; these tests write
+    clip_manifest rows directly, so they must supply it themselves.
+    """
+    from table_talk._generated.tournament_results_row import TournamentResultsRow
+    from table_talk.tournament_results_writer import write_tournament_results
+
+    write_tournament_results(
+        [
+            TournamentResultsRow(
+                video_id=video_id,
+                bounty_type=bounty_type,
+                currency_symbol="$",
+                frame_timestamp_seconds=5,
+                frame_gcs_path=(
+                    f"gs://table-talk-497020-tournament-results-dev/{video_id}/results.jpg"
+                ),
+                tournament_results_state={"panel": {"rows": []}},
+            )
+        ],
+        video_id=video_id,
+        project_id=project,
+        dataset=dataset,
+        client=bq_client,
+    )
+
+
 def _seed_clip_for_pending_query(bq_client):
     from table_talk.clip_manifest_writer import ClipManifestRow as CMRow, write_clip_manifest_rows
 
@@ -730,6 +925,9 @@ def _seed_clip_for_pending_query(bq_client):
         project=_PENDING_QUERY_PROJECT,
         dataset=_PENDING_QUERY_DATASET,
         client=bq_client,
+    )
+    _write_payout_row(
+        bq_client, video_id, _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET
     )
     return clip_id
 
@@ -755,6 +953,7 @@ def _cleanup_pending_query_clip_fixture(bq_client, clip_id):
 
     clip_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.clip_manifest"
     attempts_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.clip_processing_attempts"
+    payouts_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.tournament_results"
     for table in (attempts_ref, clip_ref):
         bq_client.query(
             f"DELETE FROM `{table}` WHERE clip_id = @val",
@@ -762,6 +961,15 @@ def _cleanup_pending_query_clip_fixture(bq_client, clip_id):
                 query_parameters=[bq.ScalarQueryParameter("val", "STRING", clip_id)]
             ),
         ).result()
+    # tournament_results is keyed on video_id, which the clip_id is prefixed with.
+    bq_client.query(
+        f"DELETE FROM `{payouts_ref}` WHERE video_id = @val",
+        job_config=bq.QueryJobConfig(
+            query_parameters=[
+                bq.ScalarQueryParameter("val", "STRING", clip_id.rsplit("_", 1)[0])
+            ]
+        ),
+    ).result()
 
 
 @pytest.mark.integration

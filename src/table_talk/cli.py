@@ -151,8 +151,17 @@ def main() -> None:
             )
             sys.exit(1)
 
+        bounty_addendum_path = prompts_dir / "extract_player_info_bounty_addendum.md"
+        if not bounty_addendum_path.exists():
+            print(
+                "prompts/extract_player_info_bounty_addendum.md not found — see README for setup",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         identify_hand_prompt = identify_hand_path.read_text()
         extract_player_info_prompt = extract_player_info_path.read_text()
+        extract_player_info_bounty_addendum = bounty_addendum_path.read_text()
         only_video_ids = [args.video_id] if args.video_id else None
         only_clip_ids = [args.clip_id] if args.clip_id else None
 
@@ -164,6 +173,7 @@ def main() -> None:
                 hand_setups_bucket=args.hand_setups_bucket,
                 identify_hand_prompt=identify_hand_prompt,
                 extract_player_info_prompt=extract_player_info_prompt,
+                extract_player_info_bounty_addendum=extract_player_info_bounty_addendum,
                 max_concurrent=args.max_concurrent,
                 only_video_ids=only_video_ids,
                 only_clip_ids=only_clip_ids,

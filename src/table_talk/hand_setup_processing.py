@@ -35,6 +35,43 @@ class PendingClip:
     clip_start_time: int
     clip_end_time: int
     consecutive_failures: int
+    bounty_type: str
+
+
+def _player_info_prompt(base: str, addendum: str, bounty_type: str) -> str:
+    """The base prompt for non-bounty videos, base + addendum for progressive ones.
+
+    Base-plus-addendum rather than two full prompt files: two near-identical
+    prompts drift, and the shared body — the position-assignment procedure — is
+    the part that matters.
+    """
+    return f"{base}\n\n{addendum}" if bounty_type == "progressive" else base
+
+
+def _parse_bounty(value: object) -> float | None:
+    """Normalise a bounty badge to a float, or None if unreadable.
+
+    The addendum asks for a bare number, but the spike observed the same prompt
+    returning '$406.25' on one frame and 406.25 on another, so this parses
+    defensively rather than relying on it.
+
+    Deliberately duplicated from payout_processing._parse_amount rather than
+    shared: the duplication is a few lines and exact, the two can legitimately
+    diverge (payout values carry a leading asterisk that the other strips;
+    badge values do not), and a shared module with one member is the
+    abstraction CLAUDE.md's simplicity rule warns against. Promote if a third
+    caller appears.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        return float(value.strip().replace("$", "").replace(",", ""))
+    except ValueError:
+        return None
 
 
 def _find_pending_clips(
@@ -50,6 +87,13 @@ def _find_pending_clips(
     A clip is pending if it has never been attempted or its latest attempt
     status is 'failed_transient'. Clips with 'complete', 'failed_permanent',
     or 'failed_parked' are excluded.
+
+    `bounty_type` is joined from tournament_results to select the extraction
+    prompt. The join is LEFT rather than INNER, and a null raises: the
+    materialization gate guarantees no clip reaches clip_manifest without a
+    payout row, so a missing one is a broken invariant, not a data condition to
+    degrade around. An inner join would express the same assumption by silently
+    dropping the clip, which is the failure shape the gate exists to prevent.
 
     Production callers leave the scope params as None. Integration tests pass
     uuid-scoped lists to constrain the blast radius per CLAUDE.md.
@@ -87,9 +131,13 @@ def _find_pending_clips(
           FROM attempt_marks
           GROUP BY clip_id
         )
-        SELECT m.*, COALESCE(a.consecutive_failures, 0) AS consecutive_failures
+        SELECT
+          m.*,
+          COALESCE(a.consecutive_failures, 0) AS consecutive_failures,
+          tr.bounty_type
         FROM `{project_id}.{dataset}.clip_manifest` m
         LEFT JOIN attempt_state a USING (clip_id)
+        LEFT JOIN `{project_id}.{dataset}.tournament_results` tr ON tr.video_id = m.video_id
         WHERE (a.latest_status IS NULL OR a.latest_status = 'failed_transient')
           {clip_filter}
           {video_filter}
@@ -97,16 +145,25 @@ def _find_pending_clips(
     """
     job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
     rows = list(client.query(query, job_config=job_config).result())
-    return [
-        PendingClip(
-            clip_id=row.clip_id,
-            video_id=row.video_id,
-            clip_start_time=row.clip_start_time,
-            clip_end_time=row.clip_end_time,
-            consecutive_failures=row.consecutive_failures,
+    clips = []
+    for row in rows:
+        if row.bounty_type is None:
+            raise RuntimeError(
+                f"clip {row.clip_id} (video {row.video_id}) has no tournament_results row; "
+                f"the materialization gate should have prevented this. Run "
+                f"`tt extract-payouts --video-id {row.video_id}`."
+            )
+        clips.append(
+            PendingClip(
+                clip_id=row.clip_id,
+                video_id=row.video_id,
+                clip_start_time=row.clip_start_time,
+                clip_end_time=row.clip_end_time,
+                consecutive_failures=row.consecutive_failures,
+                bounty_type=row.bounty_type,
+            )
         )
-        for row in rows
-    ]
+    return clips
 
 
 def _transient_status(consecutive_failures: int, max_attempts: int) -> str:
@@ -200,11 +257,18 @@ async def process_clip(
                 )
                 await asyncio.to_thread(upload_frame, temp_path, frame_gcs_path, project_id)
                 inner = player_info.get("hand_setup", {})
+                players = inner.get("players", [])
+                # Touched only where the key is present, so `bounty` stays
+                # absent — not null — on non-bounty videos, where nothing asked
+                # for it.
+                for player in players:
+                    if "bounty" in player:
+                        player["bounty"] = _parse_bounty(player["bounty"])
                 hand_setup_state = {
                     "hand_setup_time_seconds": ts,
                     "total_seat_count": inner.get("total_seat_count"),
                     "pot_size_bb": inner.get("pot_size_bb"),
-                    "players": inner.get("players", []),
+                    "players": players,
                 }
                 add_seat_numbers(hand_setup_state)
                 normalize_heads_up(hand_setup_state)
@@ -264,6 +328,7 @@ async def process_pending_clips(
     hand_setups_bucket: str,
     identify_hand_prompt: str,
     extract_player_info_prompt: str,
+    extract_player_info_bounty_addendum: str,
     max_concurrent: int = 4,
     only_clip_ids: list[str] | None = None,
     only_video_ids: list[str] | None = None,
@@ -274,6 +339,9 @@ async def process_pending_clips(
 
     Videos are processed sequentially (one on disk at a time). Clips within
     each video are processed concurrently up to max_concurrent.
+
+    Prompt selection happens here rather than in process_clip, which stays
+    ignorant of bounty and keeps taking one already-composed prompt string.
     """
     clips = _find_pending_clips(
         project_id, dataset, only_clip_ids=only_clip_ids, only_video_ids=only_video_ids
@@ -346,7 +414,11 @@ async def process_pending_clips(
                         hand_setups_bucket,
                         videos_bucket,
                         identify_hand_prompt,
-                        extract_player_info_prompt,
+                        _player_info_prompt(
+                            extract_player_info_prompt,
+                            extract_player_info_bounty_addendum,
+                            c.bounty_type,
+                        ),
                         max_attempts=max_attempts,
                     )
 
