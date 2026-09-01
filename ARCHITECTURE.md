@@ -180,7 +180,7 @@ Consequence to be aware of: if marked payouts are not the scheduled ladder, ICM 
 
 - `complete` → skip on next run
 - `complete_skipped` → skip; terminal success, precondition failed before any LLM call
-- `failed_transient` → retry on next run (network, GCS, BQ, Vertex 429 after backoff, write errors)
+- `failed_transient` → retry on next run (network, GCS, BQ, Vertex 429 after backoff exhausts, write errors)
 - `failed_permanent` → skip; malformed JSON, safety block, GCS 404 on the video, panel not visible at any ladder rung, unreadable `currency_symbol`, non-boolean `has_bounty_column`, or a partially-read ladder
 - `failed_parked` → skip; retry cap reached (default 3, `--max-attempts`)
 
@@ -310,7 +310,7 @@ Picks up pending clips from `clip_manifest`, downloads the source video to a per
 - `videos_downloader.py` — GCS-to-local download (done once per video, reused across clips); raises `DownloadPermanentError` on GCS 404
 - `frame_extractor.py` — ffmpeg subprocess wrapper; sharpness/saturation filters match the notebook's image-quality settings; accepts `float | int` timestamps
 - `frame_uploader.py` — GCS frame upload
-- `gemini_caller.py` — Vertex AI Gemini Pro caller (clip-mode video + frame-mode image), with truncated exponential backoff retry on `ResourceExhausted` (429): 5 attempts, full jitter, delays capped at 60s. `user_text` is required on both callers so no phase can silently inherit another's user turn.
+- `gemini_caller.py` — Vertex AI Gemini Pro caller (clip-mode video + frame-mode image), with truncated exponential backoff retry on HTTP 429: 5 attempts, full jitter, delays capped at 60s. The retry and the transient/permanent split key on the **status code** across both exception families the stack raises — `google.genai.errors.APIError` and `google.api_core.exceptions` — never on the exception class; see "The 429 backoff that never fired." `user_text` is required on both callers so no phase can silently inherit another's user turn.
 - `hand_setups_writer.py` — `hand_setups` table writes (batched DML with replace semantics keyed on `clip_id`; JSON column passed as `dict` directly to `ScalarQueryParameter(type="JSON")` — single-encoded)
 - `seat_enrichment.py` — deterministic `SEAT_NUMBER_MAP` (BB=1, SB=2, BTN=3, CO=4, HJ=5, LJ=6, UTG+2=7, UTG+1=8, UTG=9); `add_seat_numbers` injects + sorts players; `normalize_heads_up` rewrites SB→BTN when `total_seat_count == 2`
 - `clip_processing_attempts_writer.py` — `clip_processing_attempts` state table writes
@@ -327,7 +327,7 @@ That join is LEFT, and a null `bounty_type` raises. The materialization gate gua
 - `test_videos_downloader.py`
 - `test_frame_extractor.py`
 - `test_frame_uploader.py`
-- `test_gemini_caller.py` (includes retry-on-429 unit tests with patched sleep)
+- `test_gemini_caller.py` (includes retry-on-429 unit tests with patched sleep, covering **both** exception families — covering only `api_core` is what let the broken backoff ship green)
 - `test_hand_setups_writer.py` (includes no-double-encoding regression test on wire value, and replace-semantics integration tests)
 - `test_seat_enrichment.py`
 - `test_timestamp_utils.py`
@@ -388,7 +388,7 @@ Per-clip outcomes are recorded in `clip_processing_attempts`. The latest attempt
 
 Classification:
 
-- Vertex 429 after retry exhaustion → `failed_transient` (most 429s never surface — they're absorbed silently by backoff)
+- Vertex 429 after retry exhaustion → `failed_transient` (see "The 429 backoff that never fired" — until that fix, *every* 429 surfaced)
 - Other network / GCS / BQ errors → `failed_transient`
 - Malformed JSON from LLM → `failed_permanent`
 - LLM-returned timestamp outside `[clip_start_time, clip_end_time]` → `failed_permanent` (hallucination guard)
@@ -594,6 +594,7 @@ A mid-hand `found: false` from a street scan is **not** a failure — it is how 
 A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_starts` guarantees."
 
 - **60 of 60 hands complete.** The first run gave 56 complete, 3 rate-limited transients, and 1 hallucinated flop timestamp caught by `_street_timestamp_guard`. All four resolved on a rerun at `--max-concurrent 2` after the prompt and scan-retry fixes.
+  - The 3 rate-limited transients are real — they are still in `hand_start_processing_attempts`, carrying `429 RESOURCE_EXHAUSTED` status messages. The *explanation* was wrong: lowering concurrency worked because it avoided provoking 429s, not because it gave the backoff room to work. No backoff ran. See "The 429 backoff that never fired."
 - **Cost is roughly $0.053 per hand** — 2.49M tokens over 204 calls, about $3.20 for the video. Input dominates. Video scans run ~20K tokens, frame reads ~2.4K, and scan cost falls with each street as the window narrows.
 - **One prompt finding.** D over-reported streets on hands that ended preflop: the instruction to record streets with empty action arrays read as applying whenever no postflop action occurred, rather than only when a called all-in means cards keep coming. Reproduced 4/4 before and after the fix.
 - **Three data errors in the 65 `hand_setups` rows** — one all-null stack read, one phantom seat (`_009_005` declared four seats with a three-seat pot), and one misread pot (`_011_002`). Two were filtered by Phase 4's null-stack precondition; the third propagated harmlessly.
@@ -694,6 +695,25 @@ An **additive** change can in principle be backfilled at the phase that owns it.
 Per-seat bounty is additive, and a rebuild was still chosen — on economics, not necessity. The corpus is one video at ~$3.20 end to end. Building migration machinery to avoid that optimises against a constraint that does not exist, and the machinery would have to exist and be correct before it saved anything. The rebuild also sidesteps the cascade gap above: Phase 3's clip-mode detection call is stochastic, so a full reprocess can change the number or timing of detected setups, and truncating `hand_setups`, `hand_starts` and `hand_actions` first avoids both the orphan case and the silently-stale case entirely.
 
 Re-detection being stochastic, the row counts are expected to move. Record the new ones; a difference is not a defect. A large move is itself a finding about detection stability.
+
+### The 429 backoff that never fired
+
+`gemini_caller._call_with_retry` shipped catching `google.api_core.exceptions.ResourceExhausted`. The client is `google-genai`, which raises `google.genai.errors.ClientError` with `code == 429` instead. The two families share no ancestry — `genai`'s `APIError` is rooted at plain `Exception` and is not even a `GoogleAPIError` — so the `except` never matched. The backoff loop never ran once.
+
+Every 429 therefore escaped the caller uncaught, fell through the orchestrators' catch-all, and recorded `failed_transient`. Nothing was lost: replace semantics and the pending query cover it. But a whole run cycle was burned where a jittered five-second sleep would have done, and each one counted toward the retry cap.
+
+The evidence is in the attempts tables, not the logs: nine 429s, six in `clip_processing_attempts` and three in `hand_start_processing_attempts`, each with a `status_message` beginning `429 RESOURCE_EXHAUSTED. {'error': ...}` — the `str(ClientError)` format, reachable only if the exception escaped classification. Zero were ever absorbed. (Grepping the root `*.log` files for `429` finds only token counts like `prompt_tokens=2429`.)
+
+Two consequences beyond the retry, from the same root cause:
+
+- **A `genai` 4xx classified transient.** `_PERMANENT_EXC` listed only `api_core` types, so a bad request or auth failure escaped uncaught too and retried three times before parking — with a status that misrepresented why. The attempts table is the audit record, and it was recording the wrong category.
+- **`ServerError` landed on `failed_transient` correctly, but by accident** — via the catch-all rather than by classification.
+
+**The fix keys on the status code, not the exception class.** `ClientError` covers every 4xx including 429, so mapping the class wholesale to permanent would have re-broken the retry, and would have made 429's retryability depend on `_call_with_retry` having filtered it out first. `_genai_status_code` reads `code` or `status_code` (the spelling has moved across SDK versions) and never parses the message — a message mentioning 429 for an unrelated reason must not trigger a retry. An unreadable status classifies transient, matching the "anything not recognised is transient" convention.
+
+**The `api_core` tuples stay.** They are not dead: `google-cloud-storage` genuinely raises them, which is why `videos_downloader.py` is correct as written and was never affected. The two-family handling is deliberate, not redundancy to simplify away.
+
+The lesson generalises past this module: the mocked tests were green throughout, because every one injected `api_exc.ResourceExhausted` by hand. A test that constructs the exception itself only ever proves the handler matches the test's own assumption. The one place the real error surface was reachable — the integration test — exercised only the happy path.
 
 ### Operational hardening
 

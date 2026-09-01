@@ -6,12 +6,16 @@ from unittest.mock import MagicMock, call, patch
 
 import google.api_core.exceptions as api_exc
 import pytest
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from table_talk.gemini_caller import (
     GeminiPermanentError,
     GeminiTransientError,
     _RETRY_MAX_ATTEMPTS,
+    _classify_genai_error,
+    _genai_status_code,
+    _is_rate_limited,
     call_gemini_for_clip,
     call_gemini_for_frame,
 )
@@ -557,6 +561,172 @@ def test_retry_backoff_timing():
         assert 0.0 <= duration <= max_delay, (
             f"sleep {i}: expected [0, {max_delay}], got {duration}"
         )
+
+
+# --- google.genai error family ---
+#
+# The SDK is google-genai, which raises google.genai.errors.ClientError /
+# ServerError. Those share no ancestry with google.api_core.exceptions, so
+# every test above that injects api_exc.ResourceExhausted exercises a path the
+# real client never takes. That is why the 429 backoff shipped broken and
+# stayed broken: the tests were green against the wrong exception family.
+#
+# These tests inject what the SDK actually raises.
+
+
+def _genai_error(status, reason="RESOURCE_EXHAUSTED"):
+    """An error shaped exactly as google.genai raises it."""
+    return genai_errors.ClientError(
+        status, {"error": {"code": status, "status": reason, "message": "test"}}
+    )
+
+
+def _failing_client(*side_effects):
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = list(side_effects)
+    return mock_client
+
+
+def test_genai_429_is_retried_then_succeeds():
+    """Regression guard for the original bug.
+
+    Against the pre-fix _call_with_retry this fails: the ClientError is not a
+    ResourceExhausted, so the except never matches, no sleep happens, and the
+    raw ClientError escapes uncaught. If this test ever passes both before and
+    after a change to the retry path, it has stopped guarding anything.
+    """
+    mock_client_inst = _failing_client(_genai_error(429), _make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
+            result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
+
+    assert result == {"ok": True}
+    mock_sleep.assert_called_once()
+    assert mock_client_inst.models.generate_content.call_count == 2
+
+
+def test_genai_429_exhaustion_raises_transient():
+    mock_client_inst = _failing_client(*([_genai_error(429)] * _RETRY_MAX_ATTEMPTS))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep"):
+            with pytest.raises(GeminiTransientError, match="retries exhausted"):
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
+
+    assert mock_client_inst.models.generate_content.call_count == _RETRY_MAX_ATTEMPTS
+
+
+def test_genai_400_is_not_retried_and_is_permanent():
+    """A non-429 4xx must reach the permanent classification, not the retry.
+
+    Before the fix this escaped uncaught to the orchestrators' catch-all and
+    recorded failed_transient — burning the retry cap on something that can
+    never succeed, then parking with a status that misrepresents why.
+    """
+    mock_client_inst = _failing_client(_genai_error(400, "INVALID_ARGUMENT"))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
+            with pytest.raises(GeminiPermanentError):
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
+
+    mock_sleep.assert_not_called()
+    mock_client_inst.models.generate_content.assert_called_once()
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_genai_other_4xx_are_permanent(status):
+    mock_client_inst = _failing_client(_genai_error(status, "DENIED"))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep"):
+            with pytest.raises(GeminiPermanentError):
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
+
+
+def test_genai_5xx_is_transient_and_not_retried():
+    """ServerError already ended up transient via the orchestrators' catch-all.
+    It is now classified rather than falling through to it."""
+    err = genai_errors.ServerError(503, {"error": {"code": 503, "status": "UNAVAILABLE"}})
+    mock_client_inst = _failing_client(err)
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
+            with pytest.raises(GeminiTransientError):
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
+
+    mock_sleep.assert_not_called()
+    mock_client_inst.models.generate_content.assert_called_once()
+
+
+def test_genai_429_retried_on_clip_caller_too():
+    """Both callers share _call_with_retry; neither may regress alone."""
+    mock_client_inst = _failing_client(_genai_error(429), _make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
+        result = _call_clip(mock_client_inst)
+
+    assert result == {"ok": True}
+    mock_sleep.assert_called_once()
+
+
+# --- status extraction and rate-limit predicate ---
+
+
+class _StatusCodeOnlyError(genai_errors.APIError):
+    """A genai error exposing `status_code` instead of `code`.
+
+    google-genai 2.7.0 exposes `code`, but the spelling has moved across
+    versions, so the extractor tries both. No object in the installed SDK
+    reaches that branch, hence this stub.
+    """
+
+    def __init__(self, status_code):
+        self.status_code = status_code
+
+
+def test_genai_status_code_reads_code_attribute():
+    assert _genai_status_code(_genai_error(429)) == 429
+    assert _genai_status_code(_genai_error(400, "INVALID_ARGUMENT")) == 400
+
+
+def test_genai_status_code_falls_back_to_status_code_attribute():
+    assert _genai_status_code(_StatusCodeOnlyError(429)) == 429
+
+
+def test_genai_status_code_returns_none_when_unreadable():
+    assert _genai_status_code(Exception("no status here")) is None
+
+    non_int = _genai_error(429)
+    non_int.code = "429"  # a string, not an int — must not be trusted
+    assert _genai_status_code(non_int) is None
+
+
+def test_unreadable_genai_status_classifies_transient():
+    """Matches the orchestrators' 'anything not recognised is transient' rule:
+    an unclassifiable failure must stay retryable rather than be discarded."""
+    unreadable = _genai_error(429)
+    unreadable.code = None
+    assert isinstance(_classify_genai_error(unreadable), GeminiTransientError)
+
+
+@pytest.mark.parametrize("exc,expected", [
+    (api_exc.ResourceExhausted("rate limited"), True),
+    (_genai_error(429), True),
+    (_genai_error(400, "INVALID_ARGUMENT"), False),
+    (api_exc.PermissionDenied("forbidden"), False),
+])
+def test_is_rate_limited(exc, expected):
+    assert _is_rate_limited(exc) is expected
+
+
+def test_rate_limit_detection_does_not_read_the_message():
+    """A message mentioning 429 for an unrelated reason must not be retried —
+    substring matching would turn a permanent failure into three wasted calls."""
+    misleading = _genai_error(400, "INVALID_ARGUMENT")
+    misleading.args = ("400 INVALID_ARGUMENT. token budget 429 exceeded",)
+    assert _is_rate_limited(misleading) is False
 
 
 # --- integration test ---

@@ -1,6 +1,17 @@
 # Vertex AI Gemini caller for Phase 3 clip and frame analysis.
 # Stateless primitive — creates a fresh client per call, no shared state.
-# Error classification mirrors google.api_core.exceptions HTTP semantics.
+#
+# Two exception families reach this module and they share no ancestry. The
+# client is google-genai, which raises google.genai.errors.APIError subclasses
+# (ClientError for 4xx, ServerError for 5xx) rooted at plain Exception. The
+# google.api_core.exceptions types are kept because other Google libraries in
+# the stack still raise them — google-cloud-storage genuinely does.
+#
+# This distinction is load-bearing. The retry below originally caught only
+# api_core.ResourceExhausted, which google-genai never raises, so the 429
+# backoff never fired once. Anything classifying a Gemini failure must handle
+# genai_errors.APIError and key on the HTTP status code, not the class:
+# ClientError spans 429 and 400 alike.
 
 import json
 import random
@@ -10,6 +21,7 @@ import time
 
 import google.api_core.exceptions as api_exc
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 _MODEL = "gemini-2.5-pro"
@@ -45,12 +57,59 @@ _PERMANENT_EXC = (
 )
 
 
+def _genai_status_code(exc: Exception) -> int | None:
+    """HTTP status from a google.genai error, or None if it cannot be read.
+
+    The attribute name has moved across SDK versions — 2.7.0 exposes `code`
+    only — so both spellings are tried. Deliberately no message parsing: a
+    message containing "429" for an unrelated reason would otherwise retry a
+    permanent failure. The isinstance check matters for the same reason; a
+    string "429" is not a status this code should act on.
+    """
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """True only for a genuine HTTP 429, from either exception family."""
+    if isinstance(exc, api_exc.ResourceExhausted):
+        return True
+    return _genai_status_code(exc) == 429
+
+
+def _classify_genai_error(exc: genai_errors.APIError) -> Exception:
+    """Map a google.genai APIError onto this module's transient/permanent split.
+
+    Keyed on the status code rather than the exception class. ClientError
+    covers every 4xx including 429, so classifying by class would make 429's
+    retryability depend on _call_with_retry having filtered it out first —
+    exactly the kind of implicit coupling that let the original bug hide.
+
+    An unreadable status classifies transient, matching the orchestrators'
+    "anything not recognised is transient" convention: an unclassifiable
+    failure should stay retryable rather than be discarded.
+    """
+    status = _genai_status_code(exc)
+    if status is not None and 400 <= status < 500 and status != 429:
+        return GeminiPermanentError(str(exc))
+    return GeminiTransientError(str(exc))
+
+
 def _call_with_retry(fn):
-    """Call fn() with truncated exponential backoff + full jitter on HTTP 429."""
+    """Call fn() with truncated exponential backoff + full jitter on HTTP 429.
+
+    Catches both exception families and retries only a genuine 429. Anything
+    else is re-raised untouched for the caller to classify.
+    """
     for attempt in range(_RETRY_MAX_ATTEMPTS):
         try:
             return fn()
-        except api_exc.ResourceExhausted:
+        except (api_exc.ResourceExhausted, genai_errors.APIError) as exc:
+            if not _is_rate_limited(exc):
+                raise
             if attempt == _RETRY_MAX_ATTEMPTS - 1:
                 raise GeminiTransientError(
                     "rate limited by Vertex AI (429); retries exhausted"
@@ -164,6 +223,8 @@ def call_gemini_for_clip(
         raise GeminiTransientError(str(exc)) from exc
     except _PERMANENT_EXC as exc:
         raise GeminiPermanentError(str(exc)) from exc
+    except genai_errors.APIError as exc:
+        raise _classify_genai_error(exc) from exc
 
     _log_usage(response, label)
     return _parse_and_validate(response)
@@ -202,6 +263,8 @@ def call_gemini_for_frame(
         raise GeminiTransientError(str(exc)) from exc
     except _PERMANENT_EXC as exc:
         raise GeminiPermanentError(str(exc)) from exc
+    except genai_errors.APIError as exc:
+        raise _classify_genai_error(exc) from exc
 
     _log_usage(response, label)
     return _parse_and_validate(response)
