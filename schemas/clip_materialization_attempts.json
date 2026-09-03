@@ -1,0 +1,33 @@
+[
+  {
+    "name": "attempt_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique identifier for this materialization attempt. Primary key."
+  },
+  {
+    "name": "video_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Video being materialized. Foreign key to videos.video_id."
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Outcome of this attempt: 'complete' | 'blocked_upstream' | 'failed_transient' | 'failed_permanent' | 'failed_parked'. 'complete' is a terminal success. 'blocked_upstream' means the video has no tournament_results row yet; it is retryable and is deliberately excluded from the consecutive-failure count, because the blocking condition is upstream and not the video's fault. 'failed_transient' is retryable and counted toward the retry cap. 'failed_permanent' (invalid duration_seconds, or no videos row) and 'failed_parked' (retry cap reached) are terminal failures. Only 'blocked_upstream' and 'failed_transient' are re-selected. No in-flight states. NOT enforced as an enum by BigQuery - validation lives in application code."
+  },
+  {
+    "name": "status_message",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Free-form error, block-reason, or status detail. Typically populated on failure or when blocked upstream, to capture the reason. NULL on success."
+  },
+  {
+    "name": "attempted_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "defaultValueExpression": "CURRENT_TIMESTAMP()",
+    "description": "Timestamp when this attempt was recorded. Auto-populated on insert via DEFAULT."
+  }
+]

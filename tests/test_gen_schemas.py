@@ -114,3 +114,13 @@ def test_tournament_results_processing_attempts_schema_generates_expected_datacl
     assert "    status: str" in output
     assert "    status_message: str | None = None" in output
     assert "attempted_at" not in output
+
+
+def test_clip_materialization_attempts_schema_generates_expected_dataclass():
+    output = generate_dataclass(SCHEMAS_DIR / "clip_materialization_attempts.json")
+    assert "class ClipMaterializationAttemptsRow:" in output
+    assert "    attempt_id: str" in output
+    assert "    video_id: str" in output
+    assert "    status: str" in output
+    assert "    status_message: str | None = None" in output
+    assert "attempted_at" not in output

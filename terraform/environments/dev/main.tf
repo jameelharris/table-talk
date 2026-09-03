@@ -125,6 +125,22 @@ module "clip_manifest_table" {
   deletion_protection = true
 }
 
+module "clip_materialization_attempts_table" {
+  source = "../../modules/bigquery_table"
+
+  dataset_id  = module.bigquery_dataset.dataset_id
+  table_id    = "clip_materialization_attempts"
+  project     = var.project_id
+  schema      = file("${path.module}/../../../schemas/clip_materialization_attempts.json")
+  description = "Append-only audit log of every clip materialization attempt. One row per attempt. The latest status per video_id drives Phase 2's pending set; absence of rows means the video has never been materialized. Joins to videos via video_id."
+  labels = {
+    environment = var.environment
+    managed_by  = "terraform"
+    purpose     = "clip_materialization_audit"
+  }
+  deletion_protection = true
+}
+
 module "clip_processing_attempts_table" {
   source = "../../modules/bigquery_table"
 

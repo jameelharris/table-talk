@@ -167,3 +167,13 @@ output "hand_start_processing_attempts_table_full_id" {
   value       = module.hand_start_processing_attempts_table.table_full_id
   description = "Fully qualified hand start processing attempts table ID."
 }
+
+output "clip_materialization_attempts_table_id" {
+  value       = module.clip_materialization_attempts_table.table_id
+  description = "BigQuery table ID for the clip materialization audit log."
+}
+
+output "clip_materialization_attempts_table_full_id" {
+  value       = module.clip_materialization_attempts_table.table_full_id
+  description = "Fully qualified clip materialization audit log table ID."
+}
