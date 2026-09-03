@@ -263,6 +263,7 @@ def test_write_hand_starts_integration():
         )
         write_clip_manifest_rows(
             [ClipManifestRow(clip_id=clip_id, video_id=video_id, clip_start_time=0, clip_end_time=300)],
+            video_id=video_id,
             project=project,
             dataset=dataset,
             client=client,
@@ -391,6 +392,7 @@ def test_write_hand_starts_integration_zero_row_deletes_existing():
         )
         write_clip_manifest_rows(
             [ClipManifestRow(clip_id=clip_id, video_id=video_id, clip_start_time=0, clip_end_time=300)],
+            video_id=video_id,
             project=project,
             dataset=dataset,
             client=client,

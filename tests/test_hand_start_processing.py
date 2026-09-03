@@ -1111,6 +1111,7 @@ async def _integration_body():
     )
     write_clip_manifest_rows(
         [CMRow(clip_id=clip_id, video_id=video_id, clip_start_time=0, clip_end_time=60)],
+        video_id=video_id,
         project=project,
         dataset=dataset,
         client=bq_client,

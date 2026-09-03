@@ -1153,6 +1153,7 @@ def _seed_hand_start(bq_client, *, hand_setup_time_seconds=0, duration_seconds=6
                 clip_end_time=duration_seconds,
             )
         ],
+        video_id=video_id,
         project=_INTEGRATION_PROJECT,
         dataset=_INTEGRATION_DATASET,
         client=bq_client,

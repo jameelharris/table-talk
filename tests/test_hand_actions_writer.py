@@ -303,6 +303,7 @@ def _seed_upstream(client, project, dataset, video_id, clip_id, hand_setup_id, h
     )
     write_clip_manifest_rows(
         [ClipManifestRow(clip_id=clip_id, video_id=video_id, clip_start_time=0, clip_end_time=300)],
+        video_id=video_id,
         project=project,
         dataset=dataset,
         client=client,
