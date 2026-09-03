@@ -125,11 +125,15 @@ Two consequences. A phase reads its own inputs from the upstream *table*, never 
 
 Status values vary by phase, but every status falls into one of three categories, and new statuses must declare which:
 
-- **Terminal success** — the entity is done; never re-selected. (`complete`, `complete_skipped`)
+- **Terminal success** — the entity is done; never re-selected. (`complete`, `complete_skipped`, `complete_uncontested`)
 - **Terminal failure** — the entity cannot complete; never re-selected. (`failed_permanent`, `failed_parked`, Phase 1's `failed_terminal`)
 - **Retryable** — re-selected on the next run. (`failed_transient`, Phase 1's `failed_transient_predownload` / `failed_transient_postdownload`)
 
 `complete_skipped` is for precondition failures caught before any LLM call — the entity was examined and deliberately not processed. It is a success, not a failure: retrying would produce the same skip.
+
+`complete_uncontested` (Phase 4) is for a correct extraction whose correct answer is that there is nothing to extract — every player folds to the BB, so there is no voluntary chip commitment to identify. Like a skip it is a success, not a failure: retrying would produce the same answer, and `failed_transient` would retry it forever.
+
+The three terminal successes differ in whether output exists. `complete` is success *with* output; `complete_skipped` and `complete_uncontested` are successes with zero stage rows, each for a stated structural reason. That the two zero-row statuses share a `complete_*` shape is an observation about the vocabulary as it stands, not a rule — a future status should be named for what it means, and the shared shape only records that this category has more than one member.
 
 Pending queries select entities whose latest status is retryable or absent. Adding a status means deciding its category and updating the pending query if it is retryable.
 

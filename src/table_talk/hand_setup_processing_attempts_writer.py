@@ -17,6 +17,7 @@ from .bq_utils import bq_param_type
 VALID_STATUSES: frozenset[str] = frozenset({
     "complete",
     "complete_skipped",
+    "complete_uncontested",
     "failed_transient",
     "failed_permanent",
     "failed_parked",

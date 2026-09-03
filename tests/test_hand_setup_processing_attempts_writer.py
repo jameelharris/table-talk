@@ -99,6 +99,10 @@ def test_complete_skipped_is_a_valid_status():
     assert "complete_skipped" in VALID_STATUSES
 
 
+def test_complete_uncontested_is_a_valid_status():
+    assert "complete_uncontested" in VALID_STATUSES
+
+
 def test_failed_parked_is_a_valid_status():
     assert "failed_parked" in VALID_STATUSES
 

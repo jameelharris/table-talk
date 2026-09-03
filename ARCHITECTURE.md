@@ -457,25 +457,26 @@ The null-stack check deliberately skips the **whole hand** when any single playe
 
 ### Failure handling
 
-- `complete` → skip
+- `complete` → skip; exactly one `hand_starts` row was written
 - `complete_skipped` → skip (precondition failure, no LLM call made)
+- `complete_uncontested` → skip (correct extraction, nothing to extract)
 - `failed_transient` → retry on next run
 - `failed_permanent` → skip (no retry)
 - `failed_parked` → skip (no retry); retry cap reached
 
 Three non-happy-path outcomes are distinguished deliberately, because they are not one bucket:
 
-- **Uncontested** (`found: false`, `reason: "uncontested"`) — all fold to the BB, no voluntary chip commitment. A correctly-detected, stable poker outcome. Classified `complete` with zero rows. Retrying would produce the same answer, and classifying it `failed_transient` would retry it forever.
+- **Uncontested** (`found: false`, `reason: "uncontested"`) — all fold to the BB, no voluntary chip commitment. A correctly-detected, stable poker outcome. Classified `complete_uncontested` with zero rows. Retrying would produce the same answer, and classifying it `failed_transient` would retry it forever. It carries its own status rather than sharing `complete` so that "this hand produced a row" is answerable from status alone, instead of resting on free text in `status_message`.
 - **No first voluntary commitment found** (`found: false`, other reason) — a detection failure under the assumption that every hand setup has an identifiable hand start. `failed_transient`; a retry might succeed.
 - **No second action found** (`found: true`, null `second_action_timestamp`) — likewise `failed_transient`.
 
 The hallucination guard runs on the FVA timestamp *before* the second-action check, so a hallucinated FVA is classified `failed_permanent` even on a hand that also lacks a second action.
 
-All three write zero `hand_starts` rows. The uncontested branch calls the writer with an empty list, which clears any row from a prior run.
+All three write zero `hand_starts` rows. The `complete_uncontested` branch calls the writer with an empty list, which clears any row from a prior run.
 
 ### What `hand_starts` guarantees, and what it does not
 
-Established by exhaustive validation of 65 hands in video `MPBLfM4mwfE` (60 `complete` with rows, 1 uncontested, 2 `complete_skipped`, 2 `failed_transient`). The two `failed_transient` rows are now understood to be duplicate clip-boundary fragments of hands captured elsewhere in the corpus (see "Retry caps"), so the corpus holds roughly 63 distinct hands and there are no unexplained failures in it. Downstream phases must treat all of the following as **normal input**, not defects:
+Established by exhaustive validation of 65 hands in video `MPBLfM4mwfE` (60 `complete` with rows, 1 `complete_uncontested`, 2 `complete_skipped`, 2 `failed_transient`; the uncontested hand predates the status and carries a historical `complete` row, superseded on reprocessing). The two `failed_transient` rows are now understood to be duplicate clip-boundary fragments of hands captured elsewhere in the corpus (see "Retry caps"), so the corpus holds roughly 63 distinct hands and there are no unexplained failures in it. Downstream phases must treat all of the following as **normal input**, not defects:
 
 - **Eligible-seat hole cards may be `null`** in a `complete` record (4 of 65 observed). Most were on folded players and inconsequential. One was on a live player and is **frame-limited** — a six-time reproduction against the stored frame returned null every time while the adjacent seat read correctly, so the card is genuinely not legible at the FVA moment. More retries would not recover it.
 - **Non-null hole cards may be wrong.** One hand returned `4d4s` for a seat holding `9s7d` — a hallucination, not a null. It landed on a folded seat, but the failure mode is real. `status_message` enumerates residual nulls and has **no signal** for wrong-but-non-null cards, so neither Phase 5 nor DBT can use status to filter bad data. The only mitigation would be consensus reads, which the pipeline does not do.
@@ -624,11 +625,11 @@ Four hands in the same batch took the same outage; only this one duplicated, bec
 
 **Why the attempts table cannot be the source of truth.** A state row records what the client *believed*. The outage made that belief wrong. Any write-time check against the attempts table inherits the same wrong belief and permits the duplicate anyway. The output table is the only authoritative record.
 
-**Why a `NOT EXISTS` guard on the pending query is wrong.** Four outcomes are legitimately terminal with zero stage rows — Phase 3's "no hand setups detected," Phase 4's `complete_skipped`, Phase 4's uncontested branch, and Phase 4's two zero-row `failed_transient` branches. An output-existence filter would mark them permanently pending.
+**Why a `NOT EXISTS` guard on the pending query is wrong.** Four outcomes are legitimately terminal with zero stage rows — Phase 3's "no hand setups detected," Phase 4's `complete_skipped`, Phase 4's `complete_uncontested`, and Phase 4's two zero-row `failed_transient` branches. An output-existence filter would mark them permanently pending.
 
 **Consequences accepted.** Replace semantics make stage writes mutating DML, which BigQuery serializes per table (~2 concurrent, rest queued) rather than the fine-grained path available to INSERT-only writes. Safe at the current `max_concurrent=4` with videos processed sequentially; a real constraint if concurrency rises. A transaction aborted under contention surfaces as a write error, classifies retryable, and retries safely — the failure mode degrades into the mechanism.
 
-**Implications for integrity checks.** A stage row can coexist with a latest attempt of `failed_transient` (via the outage path) or `failed_parked` (a hand that completed, later failed three times, and parked). Failures never delete existing output, so both states are legitimate and must not be flagged as anomalies. Conversely, a `complete` attempt does not imply a row exists — uncontested and skipped hands are `complete` with zero rows by design.
+**Implications for integrity checks.** A stage row can coexist with a latest attempt of `failed_transient` (via the outage path) or `failed_parked` (a hand that completed, later failed three times, and parked). Failures never delete existing output, so both states are legitimate and must not be flagged as anomalies. The converse inference is now available for Phase 4 but only in one direction: a latest `complete` does imply exactly one `hand_starts` row, because the zero-row terminal successes carry their own statuses (`complete_skipped`, `complete_uncontested`). That does not invert — a missing row does not imply a non-`complete` status, and a present row does not imply a `complete` one, per the preceding paragraph. It also does not generalise: other phases' `complete` still spans zero-row outcomes.
 
 ### Retry caps
 
@@ -765,7 +766,7 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 ### Tooling
 
-- **Standing integrity-check tool** — the invariant that caught the duplicate: `hand_starts` row count equals the count of complete-and-not-uncontested hands, and no duplicate natural id in either stage table. The uncontested exclusion is essential; a naive "complete count equals row count" check false-positives on them. Must also tolerate the row-exists-with-failed-status cases described under "Idempotent stage writes." Ship as a CLI subcommand or a documented query.
+- **Standing integrity-check tool** — the invariant that caught the duplicate: `hand_starts` row count equals the count of `complete` hands, and no duplicate natural id in either stage table. The uncontested exclusion this item used to warn about is no longer a special case: uncontested hands carry `complete_uncontested`, so filtering on `status = 'complete'` excludes them by construction. Historical rows written before that status existed still sit on `complete`, so a check run against pre-rebuild data needs the old exclusion. Must also tolerate the row-exists-with-failed-status cases described under "Idempotent stage writes." Ship as a CLI subcommand or a documented query.
 - **Hand-level deletion cascade tooling** — see "Cross-phase reprocessing cascade." Now acute: Phase 5's tables have landed.
 - **`clip_materialization_attempts`** — Phase 2 remains the only phase without a state table. The justification (narrow failure modes, no external dependencies) no longer fully holds now that the payout gate adds a cross-phase dependency and a legitimate not-yet-ready state that is neither a bug nor a transient error. Deliberately deferred; it matters at the first large multi-video ingest, not at two videos.
 - **Ruff baseline** — 189 errors across `src/`, `tests/` and `scripts/`, 164 of them E501 against the configured 100-char limit and the rest auto-fixable imports plus two decorative unused mocks. Ruff is not in CI, which is why they accumulated. With that many standing errors a new one is invisible.

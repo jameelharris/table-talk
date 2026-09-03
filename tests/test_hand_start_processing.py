@@ -631,7 +631,7 @@ def test_process_hand_setup_complete_skipped():
 # ---------------------------------------------------------------------------
 
 
-def test_process_hand_setup_uncontested_is_complete_zero_rows():
+def test_process_hand_setup_uncontested_is_complete_uncontested_zero_rows():
     result = {"found": False, "reason": "uncontested"}
     with (
         patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=result),
@@ -645,13 +645,13 @@ def test_process_hand_setup_uncontested_is_complete_zero_rows():
             "identify prompt", "extract prompt",
         ))
 
-    assert outcome == "complete"
+    assert outcome == "complete_uncontested"
     mock_extract.assert_not_called()
     mock_write_starts.assert_called_once_with(
         [], hand_setup_id="clip_001_001", project_id="proj", dataset="ds"
     )
     attempt_row = mock_write_attempt.call_args[0][0]
-    assert attempt_row.status == "complete"
+    assert attempt_row.status == "complete_uncontested"
     assert "uncontested" in attempt_row.status_message
 
 
@@ -862,7 +862,7 @@ def test_process_hand_setup_gemini_permanent_error_unaffected_by_cap():
     assert mock_attempt.call_args[0][0].status == "failed_permanent"
 
 
-def test_process_hand_setup_complete_unaffected_by_cap():
+def test_process_hand_setup_complete_uncontested_unaffected_by_cap():
     result = {"found": False, "reason": "uncontested"}
     with (
         patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=result),
@@ -876,9 +876,9 @@ def test_process_hand_setup_complete_unaffected_by_cap():
             max_attempts=3,
         ))
 
-    assert outcome == "complete"
+    assert outcome == "complete_uncontested"
     attempt_row = mock_write_attempt.call_args[0][0]
-    assert attempt_row.status == "complete"
+    assert attempt_row.status == "complete_uncontested"
 
 
 # ---------------------------------------------------------------------------
@@ -887,9 +887,9 @@ def test_process_hand_setup_complete_unaffected_by_cap():
 
 
 def test_process_hand_setup_no_hand_starts_row_unless_complete_with_row():
-    """Non-complete outcomes never call write_hand_starts; uncontested (complete,
-    zero rows) calls it with an empty list to clear any stale row from a prior
-    run."""
+    """Non-complete outcomes never call write_hand_starts; uncontested
+    (complete_uncontested, zero rows) calls it with an empty list to clear any
+    stale row from a prior run."""
     scenarios = [
         ({"found": False, "reason": "uncontested"}, True),
         ({"found": False, "reason": "no_first_voluntary_commitment_found"}, False),
@@ -1171,15 +1171,19 @@ async def _integration_body():
 
         latest = attempt_rows[0]
         # Lavfi fixture has no poker content. Gemini's response is stochastic:
-        #   - complete: hand judged uncontested (or, less likely, a spurious detection)
+        #   - complete_uncontested: hand judged uncontested (the likely answer)
+        #   - complete: a spurious detection (unlikely, but legitimate)
         #   - failed_transient: no_first_voluntary_commitment_found / no_second_action_found
-        # Both prove the orchestration chain ran end-to-end correctly.
-        assert latest.status in ("complete", "failed_transient"), (
+        # All prove the orchestration chain ran end-to-end correctly.
+        assert latest.status in (
+            "complete", "complete_uncontested", "complete_skipped", "failed_transient"
+        ), (
             f"Unexpected status {latest.status!r}: {latest.status_message}"
         )
 
-        # Atomicity invariant: no hand_starts row unless status is complete
-        # AND a real detection was made (uncontested is complete with zero rows).
+        # Atomicity invariant, asserted per status. Each terminal success now
+        # names its own row count, so this can no longer pass for the wrong
+        # reason the way a single "not complete => zero rows" check did.
         hand_start_count = list(bq_client.query(
             f"SELECT COUNT(*) AS n FROM `{hand_starts_ref}` WHERE hand_setup_id = @hand_setup_id",
             job_config=bq.QueryJobConfig(
@@ -1187,7 +1191,14 @@ async def _integration_body():
             ),
         ).result())[0].n
 
-        if latest.status != "complete":
+        # failed_* is deliberately unconstrained: the outage path described in
+        # ARCHITECTURE's "Idempotent stage writes" legitimately leaves a row
+        # under a failed status.
+        if latest.status == "complete":
+            assert hand_start_count == 1, (
+                f"Atomicity violation: status=complete but {hand_start_count} hand_starts rows exist"
+            )
+        elif latest.status in ("complete_uncontested", "complete_skipped"):
             assert hand_start_count == 0, (
                 f"Atomicity violation: status={latest.status} but {hand_start_count} hand_starts rows exist"
             )
@@ -1379,6 +1390,32 @@ def test_find_pending_hand_setups_complete_then_transient_then_complete_not_sele
         _write_pending_query_attempt(bq_client, hand_setup_id, "complete")
         _write_pending_query_attempt(bq_client, hand_setup_id, "failed_transient")
         _write_pending_query_attempt(bq_client, hand_setup_id, "complete")
+
+        results = _find_pending_hand_setups(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_hand_setup_ids=[hand_setup_id], client=bq_client,
+        )
+        assert results == [], f"Expected entity to be excluded, got {results}"
+    finally:
+        _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_setups_latest_complete_uncontested_not_selected():
+    """complete_uncontested is a terminal success and must never be re-selected.
+
+    The regression this guards: if the pending query ever deny-listed
+    'complete' literally instead of allow-listing 'failed_transient', an
+    uncontested hand would be permanently pending and would burn a step-A
+    Gemini call on every run for a hand that by definition can never produce
+    a hand_starts row.
+    """
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    video_id, hand_setup_id = _seed_hand_setup_for_pending_query(bq_client)
+    try:
+        _write_pending_query_attempt(bq_client, hand_setup_id, "complete_uncontested")
 
         results = _find_pending_hand_setups(
             _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,

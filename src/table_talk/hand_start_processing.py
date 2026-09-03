@@ -61,7 +61,8 @@ def _find_pending_hand_setups(
 
     A hand_setup is pending if it has never been attempted or its latest
     attempt status is 'failed_transient'. hand_setups with 'complete',
-    'complete_skipped', 'failed_permanent', or 'failed_parked' are excluded.
+    'complete_skipped', 'complete_uncontested', 'failed_permanent', or
+    'failed_parked' are excluded.
 
     Production callers leave the scope params as None. Integration tests pass
     uuid-scoped lists to constrain the blast radius per CLAUDE.md.
@@ -252,10 +253,10 @@ async def process_hand_setup(
 
         if not clip_result.get("found"):
             if clip_result.get("reason") == "uncontested":
-                status_message = "complete: uncontested — no voluntary chip commitment"
+                status_message = "complete_uncontested: no voluntary chip commitment"
                 write_hand_starts([], hand_setup_id=hs.hand_setup_id, project_id=project_id, dataset=dataset)
-                _write_attempt(hs.hand_setup_id, "complete", status_message, project_id=project_id, dataset=dataset)
-                return "complete"
+                _write_attempt(hs.hand_setup_id, "complete_uncontested", status_message, project_id=project_id, dataset=dataset)
+                return "complete_uncontested"
             status = _transient_status(hs.consecutive_failures, max_attempts)
             status_message = f"{status}: {clip_result.get('reason', 'not found')}"
             _write_attempt(hs.hand_setup_id, status, status_message, project_id=project_id, dataset=dataset)
@@ -458,6 +459,7 @@ async def process_pending_hand_setups(
         "hand_setups_processed": 0,
         "hand_setups_complete": 0,
         "hand_setups_complete_skipped": 0,
+        "hand_setups_complete_uncontested": 0,
         "hand_setups_failed_transient": 0,
         "hand_setups_failed_permanent": 0,
         "hand_setups_failed_parked": 0,
