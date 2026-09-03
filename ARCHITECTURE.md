@@ -14,8 +14,8 @@ YouTube URL
 videos table + GCS .mp4 file
    ↓ [Payout extraction]
 tournament_results table + tournament_results_processing_attempts table + GCS frame .jpg file
-   ↓ [Phase 2: Clip materialization]  ← GATED: a video with no tournament_results row is skipped
-clip_manifest table (inventory of 240s windows)
+   ↓ [Phase 2: Clip materialization]  ← GATED: a video with no tournament_results row is recorded blocked_upstream
+clip_manifest table + clip_materialization_attempts table (inventory of 240s windows)
    ↓ [Phase 3: Hand setup identification]
 hand_setups table + clip_processing_attempts table + GCS frame .jpg files
    ↓ [Phase 4: Hand start identification]
@@ -231,27 +231,32 @@ Computes 240-second clip windows from a video's duration and writes the manifest
 ### Production files
 
 - `cli.py` — `tt materialize-clips` subcommand
-- `clip_materialization.py` — orchestration: `materialize_clips`, `materialize_clips_for_pending_videos`, `_check_payout_gate`, `_payout_gate_reason`
-- `clip_manifest_writer.py` — `clip_manifest` table writes (batched: one DML per video)
+- `clip_materialization.py` — orchestration: `materialize_clips`, `materialize_clips_for_pending_videos`, `_find_pending_videos`, `_find_video`, `_materialize_one`, `_payout_gate_reason`, `PendingVideo`
+- `clip_manifest_writer.py` — `clip_manifest` table writes (batched: one replace DML per video)
+- `clip_materialization_attempts_writer.py` — `clip_materialization_attempts` table writes
 
 ### Test files
 
 - `test_clip_materialization.py`
 - `test_clip_manifest_writer.py`
+- `test_clip_materialization_attempts_writer.py`
 
 ### BQ tables
 
-- `clip_manifest` — stage table, clip windows per video (immutable per row)
+- `clip_manifest` — stage table, clip windows per video (replaced per video on rewrite)
+- `clip_materialization_attempts` — state table, one row per materialization attempt
 
 ### CLI
 
 ```
-tt materialize-clips --project P --dataset D
-tt materialize-clips --project P --dataset D --video-id VIDEO_ID
+tt materialize-clips --project P --dataset D [--max-attempts N]
+tt materialize-clips --project P --dataset D --video-id VIDEO_ID [--max-attempts N]
 ```
 
-Without `--video-id`: materializes for all videos in `videos` that have no `clip_manifest` rows **and** a `tournament_results` row. Videos missing the payout row are named on stdout with the reason and counted as skipped; the run continues and exits zero.
-With `--video-id`: materializes only for the specified video; errors if the video isn't in `videos`, or if it has no `tournament_results` row.
+`--max-attempts` defaults to 3, matching the other processing subcommands.
+
+Without `--video-id`: materializes for all videos in `videos` whose latest `clip_materialization_attempts` status is absent, `failed_transient`, or `blocked_upstream`. Videos missing the payout row are named on stdout with the reason and recorded `blocked_upstream`; the run continues and exits zero. Prints the standard stats block: `videos_processed`, `videos_complete`, `videos_blocked_upstream`, `videos_failed_transient`, `videos_failed_permanent`, `videos_failed_parked`.
+With `--video-id`: materializes the specified video **whatever its latest status** — deliberate reprocessing is the point of this entry point — and raises on any non-`complete` outcome, after recording it.
 
 ### Admissibility: payout data gates the corpus
 
@@ -261,7 +266,9 @@ That places the gate here rather than in Phase 3. If payouts define admissibilit
 
 The pending query drives off `videos` and LEFT JOINs `tournament_results` — not the reverse. `videos` is the fact table and the authoritative list of ingested videos; driving off the stage table would make a payout-less video *invisible* to the query rather than visible-and-skipped, and an invisible video cannot be reported. Reporting is the point: a silent no-op looks like success.
 
-Both entry points enforce the gate, because admissibility cannot depend on which code path the operator took. They differ only in how they report. In the pending set a payout-less video is one of many not yet ready, so it is named and skipped and the run continues. With `--video-id` the operator has asserted intent about one specific video, so it raises `MaterializeError` — the same treatment as a video missing from `videos`. In `materialize_clips` the gate runs *after* the existing-clips early return, so a video materialized before the gate existed does not start erroring; nothing new is admitted on that path.
+Both entry points enforce the gate, because admissibility cannot depend on which code path the operator took. They differ only in how they report. In the pending set a payout-less video is one of many not yet ready, so it is named and recorded `blocked_upstream` and the run continues. With `--video-id` the operator has asserted intent about one specific video, so the same row is written and then `MaterializeError` is raised — the same treatment as a video missing from `videos`.
+
+Both read `has_payouts` from their own opening query, which is what makes each path safe on its own terms rather than by convention. An earlier design had the gate re-query inside a helper *after* an existing-clips early return, so that a video materialized before the gate existed would not start erroring. Both halves of that are gone: the early return was removed when Phase 2 gained a state table (see "Failure handling"), and the backfilled `complete` rows are what now keep already-materialized videos out of the pending set.
 
 An earlier design put the check in `tt process-clips` and exited non-zero. Two problems, both real. `--video-id` is optional and the normal production invocation has no filter, so one terminally-failed payout extraction would have blocked every subsequent unscoped `process-clips` run corpus-wide. And it treated admissibility as a processing constraint rather than a property of the corpus, leaving `clip_manifest` holding rows that must never be processed and the pending query no longer the truth.
 
@@ -286,17 +293,41 @@ WHERE tr.video_id IS NULL
 
 ### Failure handling
 
-Per-video failures are logged to stdout only. No attempts table. Retry happens implicitly because failed videos still have no `clip_manifest` rows and remain pending on the next run.
+Phase 2 pairs `clip_manifest` with `clip_materialization_attempts`, like every other phase. Pending videos are those whose latest attempt status is absent, `failed_transient`, or `blocked_upstream`.
 
-This is intentionally simpler than Phase 1's per-URL attempt tracking. Materialization has narrower failure modes (no external dependencies — just BQ), and the failure cases that exist (invalid `duration_seconds`, missing video row) imply upstream bugs rather than transient errors.
+Five statuses:
 
-A third category now exists alongside those two. **A missing `tournament_results` row is neither an upstream bug nor a transient error** — it is a legitimate not-yet-ready state, resolved by running an upstream command. It is reported as a *skip*, tallied separately from a failure and worded differently, because a video awaiting payout extraction is a normal outcome of a correctly ordered pipeline and reporting it as an error would train operators to ignore it.
+| status | category | when |
+|---|---|---|
+| `complete` | terminal success | clips written |
+| `blocked_upstream` | retryable, **not counted toward the cap** | no `tournament_results` row |
+| `failed_transient` | retryable, counted | BQ or write error |
+| `failed_permanent` | terminal failure | invalid `duration_seconds`, or no `videos` row |
+| `failed_parked` | terminal failure | retry cap reached (`--max-attempts`, default 3) |
 
-No Phase 2 state row records it. The cause is already durably recorded one phase upstream in `tournament_results_processing_attempts`, so a Phase 2 row would record a consequence rather than a cause — which is also why the skip message reads that table to distinguish never-attempted from `failed_transient` from a terminal `complete_skipped` / `failed_permanent` / `failed_parked`. The operator's next move differs in each case.
+**A missing `tournament_results` row is neither an upstream bug nor a transient error** — it is a legitimate not-yet-ready state, resolved by running an upstream command. `blocked_upstream` records it: retryable, so the video is re-selected once payouts land, but deliberately outside the `failed%` prefix the consecutive-failure counter matches on, so a video behind a slow payout extraction cannot park for a condition that is not its fault. It is worded and tallied as a block rather than a failure, because a video awaiting payout extraction is a normal outcome of a correctly ordered pipeline and reporting it as an error would train operators to ignore it.
 
-That said, this category is the reason Phase 2's no-attempts-table justification no longer fully holds: the gate adds a cross-phase dependency the original reasoning did not contemplate. `clip_materialization_attempts` is recorded under Known follow-ups. It does not block anything today and matters at the first large multi-video ingest.
+The Phase 2 row records the *consequence*; the cause stays durably recorded one phase upstream. That is why the message reads `tournament_results_processing_attempts` to distinguish never-attempted from `failed_transient` from a terminal `complete_skipped` / `failed_permanent` / `failed_parked` — the operator's next move differs in each case — and why the same reason is stored in `status_message` rather than only printed.
 
-Note that Phase 2's pending check consults the *output* table rather than an attempts table, which is the same principle the idempotent-write pattern applies elsewhere (see "Idempotent stage writes"). Its single batched DML per video means a partial write cannot happen, so it needs no replace wrapper.
+**Every path writes exactly one attempt row.** Both entry points funnel through one internal function that never raises and returns its status, which is what keeps the property from depending on which entry point ran. Note the direction of the risk: because the pending predicate is "absent or retryable," a video that writes no row keeps its prior status and is therefore still selected. A missed row does not strand a video — it stops the retry cap advancing, so a deterministically broken video would retry forever rather than parking.
+
+`consecutive_failures` is computed in the opening query and carried on `PendingVideo`, never re-read in a failure handler. The `--video-id` path reads it the same way, up front, for the same reason: the handler runs precisely when BigQuery may be unreachable, so a read there would fail too and the natural fallback would silently defeat the cap for every video an outage touches.
+
+#### Why this replaced the original no-attempts-table design
+
+The exception was defensible when it was made: materialization had narrow failure modes and no external dependencies beyond BQ, its failure cases implied upstream bugs rather than transient errors, and retry fell out of a failed video still having no `clip_manifest` rows. Three things changed.
+
+- **The payout gate** added a cross-phase dependency, and a state that is neither a bug nor a transient error, which the original two-category reasoning did not contemplate.
+- **Scale.** One video failing silently among five is noticeable; among forty it is not. There was no record of which videos failed or how often, and no cap, so a video with a genuinely bad `duration_seconds` retried forever.
+- **The cascade.** Marking a phase pending means appending a retryable attempt row. With no attempts table Phase 2 could not be marked, so a reprocessing cascade could not reach above Phase 3 — and a payout re-run, which changes `bounty_type` and therefore Phase 3's prompt, had no downstream state to mark at all.
+
+Two consequences followed, and neither could land separately from the change.
+
+**The existing-clips early return was removed.** It had quietly become load-bearing: it was the only thing preventing a duplicate write once pending-ness stopped deriving from output absence. But keeping it would have defeated the cascade entirely — marking a video pending does nothing if the run then skips every video that already has rows. Removing it is the point of the change, not a side effect of it.
+
+**`clip_manifest` gained replace semantics**, keyed on `video_id`. Its single-batched-DML atomicity argument still holds; the "retry derives from the absence of output rows" half does not. A video with `blocked_upstream` or `failed_transient` is now re-selected *while it already has rows*, a state that could not previously arise, and a bare INSERT on top of them would produce duplicate clip windows for one video with every one of them feeding Phase 3. Phase 2 stopped being an exception in both ways at once: it gained a state table, and it now uses the same write pattern as every other stage.
+
+Existing videos were materialized before the table existed, so `complete` rows were backfilled for them as a one-off. That is a stage-consistent record of what actually happened, not a rewrite of history, and it keeps the pending query clean rather than carrying a migration guard forever.
 
 ## Phase 3: Hand setup identification
 
@@ -768,7 +799,6 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 - **Standing integrity-check tool** — the invariant that caught the duplicate: `hand_starts` row count equals the count of `complete` hands, and no duplicate natural id in either stage table. The uncontested exclusion this item used to warn about is no longer a special case: uncontested hands carry `complete_uncontested`, so filtering on `status = 'complete'` excludes them by construction. Historical rows written before that status existed still sit on `complete`, so a check run against pre-rebuild data needs the old exclusion. Must also tolerate the row-exists-with-failed-status cases described under "Idempotent stage writes." Ship as a CLI subcommand or a documented query.
 - **Hand-level deletion cascade tooling** — see "Cross-phase reprocessing cascade." Now acute: Phase 5's tables have landed.
-- **`clip_materialization_attempts`** — Phase 2 remains the only phase without a state table. The justification (narrow failure modes, no external dependencies) no longer fully holds now that the payout gate adds a cross-phase dependency and a legitimate not-yet-ready state that is neither a bug nor a transient error. Deliberately deferred; it matters at the first large multi-video ingest, not at two videos.
 - **Ruff baseline** — 189 errors across `src/`, `tests/` and `scripts/`, 164 of them E501 against the configured 100-char limit and the rest auto-fixable imports plus two decorative unused mocks. Ruff is not in CI, which is why they accumulated. With that many standing errors a new one is invisible.
 - **Notebook reproduction harnesses are untracked** — `*.ipynb` is gitignored, while `jupyterlab`, `ipykernel` and `pillow` are dev dependencies precisely because CLAUDE.md's regression guard for prompts is notebook reproduction. The harnesses themselves are not versioned, so each investigation rebuilds them.
 

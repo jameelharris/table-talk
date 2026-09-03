@@ -37,6 +37,7 @@ def main() -> None:
     mat_parser.add_argument("--project", required=True)
     mat_parser.add_argument("--dataset", required=True)
     mat_parser.add_argument("--video-id")
+    mat_parser.add_argument("--max-attempts", type=int, default=3)
 
     ep_parser = subparsers.add_parser("extract-payouts")
     ep_parser.add_argument("--project", required=True)
@@ -98,16 +99,20 @@ def main() -> None:
                     project=args.project,
                     dataset=args.dataset,
                     bq_client=bq_client,
+                    max_attempts=args.max_attempts,
                 )
             except MaterializeError as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 sys.exit(1)
         else:
-            materialize_clips_for_pending_videos(
+            stats = materialize_clips_for_pending_videos(
                 project=args.project,
                 dataset=args.dataset,
                 bq_client=bq_client,
+                max_attempts=args.max_attempts,
             )
+            for key, value in stats.items():
+                print(f"{key}: {value}")
     elif args.command == "extract-payouts":
         prompts_dir = Path(__file__).resolve().parents[2] / "prompts"
 

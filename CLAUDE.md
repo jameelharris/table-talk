@@ -103,9 +103,9 @@ Three kinds of table:
 
 - **Fact tables** hold durable entity records. `videos` is currently the only one.
 - **Stage tables** hold the output of a processing phase, consumed by later phases: `clip_manifest`, `hand_setups`, `hand_starts`, `hand_actions`. A future assembly phase combines them into fact tables.
-- **State tables** are insert-only logs of processing attempts, one row per attempt, named `*_attempts`: `video_ingestion_attempts`, `clip_processing_attempts`, `hand_setup_processing_attempts`, `hand_start_processing_attempts`. They carry a server-defaulted `attempted_at`.
+- **State tables** are insert-only logs of processing attempts, one row per attempt, named `*_attempts`: `video_ingestion_attempts`, `tournament_results_processing_attempts`, `clip_materialization_attempts`, `clip_processing_attempts`, `hand_setup_processing_attempts`, `hand_start_processing_attempts`. They carry a server-defaulted `attempted_at`.
 
-Each processing phase pairs a stage table with a state table. The current state of an entity is derived: the latest row in its state table by `attempted_at`. No in-flight states are stored; rows are written only after attempts conclude.
+Each processing phase pairs a stage table with a state table — Phase 2 was the last exception and no longer is. The current state of an entity is derived: the latest row in its state table by `attempted_at`. No in-flight states are stored; rows are written only after attempts conclude.
 
 **State tables are append-only audit logs.** Never UPDATE a state row and never DELETE one. To reverse a prior outcome, insert a new row that supersedes it. A deletion destroys the record of what actually happened, which is the table's whole purpose.
 
@@ -127,11 +127,17 @@ Status values vary by phase, but every status falls into one of three categories
 
 - **Terminal success** — the entity is done; never re-selected. (`complete`, `complete_skipped`, `complete_uncontested`)
 - **Terminal failure** — the entity cannot complete; never re-selected. (`failed_permanent`, `failed_parked`, Phase 1's `failed_terminal`)
-- **Retryable** — re-selected on the next run. (`failed_transient`, Phase 1's `failed_transient_predownload` / `failed_transient_postdownload`)
+- **Retryable** — re-selected on the next run. (`failed_transient`, `blocked_upstream`, Phase 1's `failed_transient_predownload` / `failed_transient_postdownload`)
 
 `complete_skipped` is for precondition failures caught before any LLM call — the entity was examined and deliberately not processed. It is a success, not a failure: retrying would produce the same skip.
 
 `complete_uncontested` (Phase 4) is for a correct extraction whose correct answer is that there is nothing to extract — every player folds to the BB, so there is no voluntary chip commitment to identify. Like a skip it is a success, not a failure: retrying would produce the same answer, and `failed_transient` would retry it forever.
+
+`blocked_upstream` (Phase 2) is for an entity a cross-phase dependency is not yet ready for — a video with no `tournament_results` row. It is not a failure and not a success: the work has not been attempted, and it will be once the upstream command runs.
+
+It is a fourth shape, distinct from the three terminal successes: **retryable but excluded from the retry cap.** The blocking condition is not the entity's fault, and a video sitting behind a slow payout extraction would otherwise park after three runs for a condition it cannot influence. The exclusion is not a special case in the counter — it falls out of the naming. The consecutive-failure count is computed with `MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL))`, a prefix match on the failure family, so a status named outside that family resets the counter rather than advancing it. A new status that must not count toward the cap should be named the same way rather than adding an exclusion clause.
+
+Do not overload `failed_transient` for this. The two are both retryable, but conflating them makes the cap fire on a healthy entity.
 
 The three terminal successes differ in whether output exists. `complete` is success *with* output; `complete_skipped` and `complete_uncontested` are successes with zero stage rows, each for a stated structural reason. That the two zero-row statuses share a `complete_*` shape is an observation about the vocabulary as it stands, not a rule — a future status should be named for what it means, and the shared shape only records that this category has more than one member.
 
@@ -153,7 +159,7 @@ The natural key is the entity the phase processes, which is not always the stage
 
 Replace semantics make stage writes mutating DML, which BigQuery serializes per table rather than running with the concurrency available to INSERT-only writes. This is a throughput constraint, not a correctness one: an aborted transaction surfaces as a write error, is classified retryable, and the retry is safe precisely because the write is idempotent.
 
-`clip_manifest` is written once per video with no state table and has no replace wrapper; Phase 2's retry derives from the absence of output rows, which is the same principle applied through a different mechanism.
+`clip_manifest` keys its replace on `video_id`, the video being materialized, not on `clip_id`. It was the last stage table written with a bare INSERT, on the reasoning that one batched DML per video made a partial write impossible and that retry derived from the absence of output rows. The second half stopped being true when Phase 2 gained `clip_materialization_attempts`: pending-ness now comes from attempt status, so a video with a retryable outcome is re-selected *while it already has rows*, and a bare INSERT would append a duplicate set of clip windows for Phase 3 to consume.
 
 **`bq_param_type` covers `str`, `int` and `dict` only.** It has no `float` branch and no `None` branch, and stage writers — unlike state writers — do not filter `None` out of the row dict before building parameters. So a `FLOAT64` column or a NULLABLE scalar cannot be added to a stage table without extending `bq_utils` first: codegen and Terraform both accept them, and the failure surfaces only at the first write. This is why every `hand_actions` column is REQUIRED, and why per-row floats like `bet_amount` live inside the JSON blob, which BigQuery parses server-side and which never reaches `bq_param_type`.
 
