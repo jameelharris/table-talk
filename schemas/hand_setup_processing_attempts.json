@@ -15,7 +15,7 @@
     "name": "status",
     "type": "STRING",
     "mode": "REQUIRED",
-    "description": "Outcome of this attempt: 'complete' | 'complete_skipped' | 'failed_transient' | 'failed_permanent'. 'complete_skipped' means a precondition check failed and no LLM calls were made; no hand_starts row is written for this status. No in-flight states. NOT enforced as an enum by BigQuery — validation lives in application code."
+    "description": "Outcome of this attempt: 'complete' | 'complete_skipped' | 'complete_uncontested' | 'failed_transient' | 'failed_permanent' | 'failed_parked'. 'complete' writes exactly one hand_starts row. 'complete_skipped' means a precondition check failed and no LLM calls were made; 'complete_uncontested' means the hand was correctly extracted and had no voluntary chip commitment to identify — both are terminal successes that write zero hand_starts rows. No in-flight states. NOT enforced as an enum by BigQuery — validation lives in application code."
   },
   {
     "name": "status_message",
