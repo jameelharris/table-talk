@@ -147,6 +147,8 @@ class MarkPlan:
 
     stage: str
     entity_table: str  # what --id refers to
+    entity_noun: str  # the same thing in prose, for the report
+    phase_label: str  # the phase consuming it, from integrity.PHASES
     entities: list[tuple[str, str | None]]  # (id, current_status)
     deletes: list[tuple[str, int]]  # (table, row_count), child before parent
     marks: list[tuple[str, int]]  # (attempts_table, row_count)
@@ -386,12 +388,24 @@ def resolve(
 # --- plan (pure) ---
 
 
+def _entity_noun(key_column: str) -> str:
+    """The prose name of the entity a phase consumes: `hand_setup_id` -> "hand setup".
+
+    Derived from `key_column` rather than mapped per stage so a new phase cannot
+    acquire a stage entry without one.
+    """
+    return key_column.removesuffix("_id").replace("_", " ")
+
+
 def build_plan(stage: str, resolution: _Resolution) -> MarkPlan:
     """Pure given query results, so `--dry-run` and the real run share it."""
+    spec = _SPEC[stage]
     marks = [(table, len(ids)) for table, ids in resolution.mark_ids]
     return MarkPlan(
         stage=stage,
-        entity_table=_SPEC[stage].input_table,
+        entity_table=spec.input_table,
+        entity_noun=_entity_noun(spec.key_column),
+        phase_label=spec.label,
         entities=[(e.entity_id, e.latest_status) for e in resolution.entities],
         deletes=list(resolution.delete_counts),
         marks=marks,
@@ -528,10 +542,16 @@ def format_plan(plan: MarkPlan, *, dry_run: bool) -> str:
     mark_heading = "WOULD MARK PENDING" if dry_run else "MARKED PENDING"
 
     count = len(plan.entities)
-    noun = "entity" if count == 1 else "entities"
+    noun = plan.entity_noun if count == 1 else f"{plan.entity_noun}s"
     # Naming the entity type is what makes passing a hand_setup_id where a
-    # clip_id belongs fail visibly rather than silently marking nothing.
-    head = f"Rebuilding {plan.stage}. Marking {count} {plan.entity_table} {noun} pending"
+    # clip_id belongs fail visibly rather than silently marking nothing. It is
+    # the entity that gets named and not its table: the input table is untouched
+    # by a mark, so "Marking 13 clip_manifest entities" read as though
+    # `clip_manifest` itself were about to be modified.
+    head = (
+        f"Rebuilding {plan.stage}. Marking {count} {noun} pending "
+        f"({plan.phase_label} consumes {plan.entity_noun}s)"
+    )
 
     lines = []
     if count == 0:

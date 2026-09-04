@@ -493,9 +493,29 @@ def test_ids_collapse_to_a_histogram_above_the_threshold():
     assert "complete" in out
 
 
-def test_report_names_the_entity_type():
-    out = format_plan(_plan_with(1), dry_run=True)
-    assert "Rebuilding hand_starts. Marking 1 hand_setups entity pending" in out
+def test_report_names_the_entity_type_not_its_table():
+    """The head line names what gets marked, and a table is not what gets marked.
+
+    `Marking 13 clip_manifest entities` read as though `clip_manifest` were
+    about to be modified; nothing in a mark touches an input table.
+    """
+    head = format_plan(_plan_with(1), dry_run=True).splitlines()[0]
+    assert head.startswith(
+        "Rebuilding hand_starts. Marking 1 hand setup pending "
+        "(Phase 4 consumes hand setups)"
+    )
+    assert "hand_setups" not in head
+
+
+def test_report_pluralises_the_entity_noun():
+    plan, _, _ = _run(
+        "hand_setups",
+        entities=[(f"vid001_{i:03d}", "complete", 1) for i in range(13)],
+        dry_run=True,
+    )
+    head = format_plan(plan, dry_run=True).splitlines()[0]
+    assert "Marking 13 clips pending (Phase 3 consumes clips)" in head
+    assert "clip_manifest" not in head
 
 
 def test_zero_row_entities_are_reported_as_by_design():
