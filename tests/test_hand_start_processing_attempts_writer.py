@@ -11,6 +11,7 @@ from table_talk.hand_start_processing_attempts_writer import (
     HandStartProcessingAttemptsRow,
     HandStartProcessingAttemptsWriteError,
     write_hand_start_processing_attempt_row,
+    write_hand_start_processing_attempt_rows,
 )
 
 
@@ -198,3 +199,78 @@ def test_write_hand_start_processing_attempt_row_integration():
                 ]
             ),
         ).result()
+
+
+# --- batched writes ---
+#
+# The plural sibling, used by `tt mark-pending` to append one command's marks in
+# one INSERT. State tables are append-only, so this is a bare INSERT — there is
+# no DELETE and no transaction.
+
+_MARK_MESSAGE = "mark-pending: rebuilding hand_actions"
+
+
+def _batch_row(index, status="failed_transient", status_message=_MARK_MESSAGE):
+    return HandStartProcessingAttemptsRow(
+        attempt_id=f"attempt_{index:03d}",
+        hand_start_id=f"dQw4w9WgXcQ_001_001_{index:03d}",
+        status=status,
+        status_message=status_message,
+    )
+
+
+def test_batch_emits_one_insert_with_a_tuple_per_row():
+    mock_client, mock_job = _mock_client()
+
+    write_hand_start_processing_attempt_rows(
+        [_batch_row(0), _batch_row(1)], project="proj", dataset="ds", client=mock_client
+    )
+
+    mock_client.query.assert_called_once()
+    args, kwargs = mock_client.query.call_args
+    query_str = args[0]
+    assert query_str.startswith("INSERT INTO")
+    assert "proj.ds.hand_start_processing_attempts" in query_str
+    assert query_str.split("VALUES", 1)[1].count("(") == 2
+    param_names = {p.name for p in kwargs["job_config"].query_parameters}
+    assert "hand_start_id_0" in param_names
+    assert "hand_start_id_1" in param_names
+    assert "attempted_at" not in query_str
+    mock_job.result.assert_called_once()
+
+
+def test_batch_empty_list_is_a_noop():
+    mock_client, _ = _mock_client()
+
+    write_hand_start_processing_attempt_rows([], project="proj", dataset="ds", client=mock_client)
+
+    mock_client.query.assert_not_called()
+
+
+def test_batch_invalid_status_raises_before_bq_call():
+    mock_client, _ = _mock_client()
+
+    with pytest.raises(HandStartProcessingAttemptsWriteError, match="Invalid status"):
+        write_hand_start_processing_attempt_rows(
+            [_batch_row(0), _batch_row(1, status="not_a_real_status")],
+            project="proj",
+            dataset="ds",
+            client=mock_client,
+        )
+
+    mock_client.query.assert_not_called()
+
+
+def test_batch_rows_disagreeing_on_columns_raise():
+    # One INSERT carries one column list, and None-valued fields are omitted.
+    mock_client, _ = _mock_client()
+
+    with pytest.raises(HandStartProcessingAttemptsWriteError, match="disagree on columns"):
+        write_hand_start_processing_attempt_rows(
+            [_batch_row(0), _batch_row(1, status_message=None)],
+            project="proj",
+            dataset="ds",
+            client=mock_client,
+        )
+
+    mock_client.query.assert_not_called()

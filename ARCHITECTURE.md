@@ -639,6 +639,7 @@ A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_st
 - `cli.py` — entry point for all `tt` commands; one subcommand per phase, plus `check-integrity`
 - `bq_utils.py` — `bq_param_type` and `build_replace_sql`, shared by writers
 - `integrity.py` — the read-only corpus audit behind `tt check-integrity`
+- `mark_pending.py` — the reprocessing cascade behind `tt mark-pending`
 - `timestamp_utils.py` — `parse_timestamp`, shared by orchestrators
 - `_generated/` — codegen output from `scripts/gen_schemas.py`, committed
 - `prompts/*.md` — LLM prompts (`extract_results.md`, `identify_hand.md`, `extract_player_info.md`, `identify_hand_start.md`, `extract_hole_cards.md`), versioned with code so prompt changes ride code review
@@ -647,6 +648,7 @@ A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_st
 
 - `test_smoke.py` — version sanity check
 - `test_integrity.py` — the integrity checks
+- `test_mark_pending.py` — the reprocessing cascade
 
 ### Idempotent stage writes
 
@@ -687,6 +689,36 @@ Phase 1 and `videos` are out of scope. Not because fact tables do not exist — 
 **Deliberately not covered.** Anything that deletes — read-only is the design, and the no-delete-flag rule below is unchanged. Progress reporting, which is a different question with a different answer shape. GCS objects. And cross-phase content staleness, which nothing detects today; the eventual answer is a content hash of the upstream row stored downstream, making a mismatch a one-column comparison, but that is a schema change to two tables and its own piece of work.
 
 The first run against the pre-rebuild corpus returns exactly one finding: `MPBLfM4mwfE_010_002`, `complete` with zero `hand_starts` rows. Its `status_message` reads "complete: uncontested — no voluntary chip commitment", written 2026-08-03 before `complete_uncontested` existed. It is a true reading of the current state, it resolves itself when the rebuild appends a superseding `complete_uncontested` row, and no legacy tolerance was added — permanently weakening a check to hide a temporary artifact is the wrong trade.
+
+### Reprocessing and the mark-pending cascade
+
+`tt mark-pending` is the sanctioned way to make a finished entity eligible for reprocessing. It appends a retryable attempt row to the named stage's state table and to every stage downstream of it, and deletes the downstream stage rows that reprocessing would otherwise leave stale. `mark_pending.py` holds the cascade; `--dry-run` prints the same plan the real run executes, from the same code path.
+
+It replaces a hand-written INSERT. Deleting a stage table's rows does not cause a phase to re-run — pending queries key on latest attempt status, and an output-existence guard is rejected because several outcomes are legitimately terminal with zero rows — so reprocessing has always required appending an attempt row by hand, per phase, against ids the operator worked out themselves.
+
+**The dependency graph is not the pipeline order.**
+
+```
+tournament_results --+
+                     +--> hand_setups --> hand_starts --> hand_actions
+clip_manifest -------+
+```
+
+Two stages feed `hand_setups` and neither feeds the other: materialization is arithmetic on `duration_seconds`, so re-reading the payout panel cannot change a clip window. `--stage tournament_results` therefore skips `clip_manifest` entirely. This is an explicit adjacency map rather than a position in the `PHASES` tuple, because deriving it positionally would reintroduce the link — and that is not merely wasteful: deleting `clip_manifest` destroys clip ids and briefly orphans `hand_setups`. A unit test guards it.
+
+**Deletes are downstream-only; the named stage's own rows are never touched.** Replace semantics overwrite those on the next run, and a DELETE up front would leave an entity with zero rows if processing then failed — the same reasoning that puts the DELETE at write time inside a stage writer. Deletes run child-before-parent and before any mark, so a delete that fails partway leaves nothing pending against a partially-cleared downstream.
+
+**Stages are named for what gets rebuilt**, which is the phase's output table, because that is how an operator thinks. Naming them by input would make `--stage videos` ambiguous between payout extraction and materialization. The consequence is an off-by-one against the attempts tables, which are named for the entity a phase *consumes* — `hand_setup_processing_attempts` belongs to the phase producing `hand_starts`. `mark_pending.py` reuses `integrity.PHASES` for exactly this reason: anchoring on the input table makes the off-by-one disappear in code rather than in prose. Every run also echoes its interpretation ("Rebuilding hand_starts. Marking 65 hand_setups entities pending"), so passing an id of the wrong kind fails visibly instead of silently marking nothing.
+
+**Marks below the named stage are partly speculative, and this is expected.** `--stage hand_setups` appends `hand_setup_processing_attempts` rows for ids that re-detection may not reproduce. Harmless: every pending query joins to its input table, so an attempt row for a vanished entity selects nothing — the same property that makes `check-integrity` anchor on input tables.
+
+**A mark costs one retry slot.** Marks are written as `failed_transient`, the only retryable status every phase shares. It is inside the `failed%` family, so a mark appended after a `complete` leaves the entity at `consecutive_failures = 1` and it gets `max_attempts - 1` real attempts before parking. Pass `--max-attempts 4` on a rebuild run if the full three matter. `blocked_upstream` was not reused: it exists only in Phase 2 and means something specific.
+
+Marks carry `status_message = "mark-pending: rebuilding {stage}"`. That string is the only trace distinguishing a synthetic mark from a real failure, and it matters — an audit reader must not read a deliberate reprocess as a rate-limit incident.
+
+**`--video-id` is mandatory, single, and there is no all-videos mode.** This makes terminal entities eligible again, which costs real money when the phases run; an accidental corpus-wide invocation at 150 videos would be a large unintended expense. `--id` and `--status` narrow within the video. No status is excluded by default: whether a `failed_permanent` is recoverable is context-dependent — a malformed-JSON response may well be fixed by a prompt change, while the two clip-boundary fragments can never complete — so the dry-run reports the status composition and the operator decides. An unnarrowed run scopes its deletes by `video_id` alone, which additionally sweeps orphaned downstream rows that an id list could never reach, since an orphan's parent is by definition not in the entity set.
+
+`videos` is not a valid stage. Re-running Phase 1 is re-acquisition, not reprocessing: it re-downloads from YouTube, may get a different encode, and Phase 1's status vocabulary predates the common one. Replacing a source file is a delete-and-re-ingest operation, rare enough not to build for.
 
 ### Retry caps
 
@@ -732,19 +764,21 @@ The guarantee is one-directional: a live row's path always resolves, because upl
 
 Orphans arise from: upload-before-write on permanent failure; Phase 3 batch shrinkage on reprocess (4 rows become 3, the surplus row's frame detaches); Phase 4's uncontested branch clearing a row whose frames remain; and integration-test residue.
 
-Those are all path *abandonment*. Path *reuse* is a separate case and is not an orphan at all. Ids are positional — `{clip_id}_{NNN}` — so re-detection can reassign a `hand_setup_id` to a different moment and overwrite its frame, leaving a surviving downstream row's path resolving to an image of a different hand. Nothing is unreferenced, so no cleanup addresses it; it is a row-consistency problem, handled by a reprocessing cascade delete rather than by anything in this section. `tt check-integrity` does not detect it either — an id that survives re-detection has a parent and a plausible row count. Keep the won't-fix on cleanup regardless: not building automated deletion is the only thing preserving the guarantee that a live row's path always resolves.
+Those are all path *abandonment*. Path *reuse* is a separate case and is not an orphan at all. Ids are positional — `{clip_id}_{NNN}` — so re-detection can reassign a `hand_setup_id` to a different moment and overwrite its frame, leaving a surviving downstream row's path resolving to an image of a different hand. Nothing is unreferenced, so no cleanup addresses it; it is a row-consistency problem, handled by `tt mark-pending`'s cascade delete rather than by anything in this section. `tt check-integrity` does not detect it either — an id that survives re-detection has a parent and a plausible row count. Keep the won't-fix on cleanup regardless: not building automated deletion is the only thing preserving the guarantee that a live row's path always resolves.
 
 Payout extraction adds a narrower case — upload succeeds, the BQ write then fails — but it is self-healing where the others are not: its path is stable per video, so the next successful run overwrites the object rather than leaving a second one. It cannot orphan on a permanent failure at all, because the upload runs only after the panel validates.
 
 Frames are also the manual spot-check evidence for validating extracted JSON against reality, which is a further reason not to delete them.
 
-### Cross-phase reprocessing cascade (known gap)
+### Cross-phase reprocessing cascade (substantially closed)
 
-Making Phase 3 idempotent makes reprocessing it *safe*, which makes it something an operator would actually do — which surfaces a gap.
+Making Phase 3 idempotent makes reprocessing it *safe*, which makes it something an operator would actually do — which surfaced this gap.
 
-If Phase 3 reprocesses a clip and the new result differs, `hand_setups` is correctly replaced. But `hand_setup_id` is positional (`{clip_id}_{NNN}`), so the same id can come to describe a *different moment*, or disappear entirely when the row count shrinks. Phase 4's existing `hand_starts` rows for those ids keep their `complete` attempts and are never re-triggered. They are not duplicated — they are silently stale, or orphaned against a `hand_setups` row that no longer exists.
+If Phase 3 reprocesses a clip and the new result differs, `hand_setups` is correctly replaced. But `hand_setup_id` is positional (`{clip_id}_{NNN}`), so the same id can come to describe a *different moment*, or disappear entirely when the row count shrinks. Phase 4's existing `hand_starts` rows for those ids keep their `complete` attempts and are never re-triggered. They are not duplicated — they are silently stale, or orphaned against a `hand_setups` row that no longer exists. `hand_action_state` embeds a *snapshot* of `hand_start_state`, so the same reprocess leaves `hand_actions` stale three layers down rather than two.
 
-There is no cascade tooling today. Phase 5 landed with the cascade **explicitly deferred**. `hand_action_state` embeds a *snapshot* of `hand_start_state`, so reprocessing Phase 3 or Phase 4 leaves `hand_actions` silently stale three layers down rather than two. Cascade tooling remains a follow-up; nothing in Phase 5 solves it.
+**What `tt mark-pending` closes.** Reprocessing *through the tool* no longer leaves orphans or stale downstream rows: marking a stage deletes every downstream stage's rows for the affected entities and marks every downstream phase pending, so the next `tt process-*` run rebuilds them from the new upstream. See "Reprocessing and the mark-pending cascade."
+
+**What remains open.** Two things. Reprocessing that bypasses the tool — a direct `tt process-clips --clip-id X` still replaces `hand_setups` and leaves Phase 4 and 5 untouched, exactly as before. And **content staleness**: an id that survives re-detection but comes to describe a different moment. There is no orphan, the counts reconcile, and `tt check-integrity` passes, because an id with a parent and a plausible row count looks correct from every angle the audit has. Nothing detects it today; see the follow-up under Tooling.
 
 ### Rebuild, not backfill
 
@@ -807,7 +841,7 @@ Consequence depends entirely on the hand. `_002_002_001` ended preflop, so the w
 
 When DBT flags a duplicate card, the correction belongs in `hand_starts.hand_start_state`, where the bad card originates — not in `hand_actions`, whose copy is an embedded snapshot. Editing the snapshot would leave the two records disagreeing with the upstream one still wrong.
 
-The workflow is: DBT flags, the operator corrects `hand_starts`, appends a retryable attempt row to un-park the hand, and re-runs Phase 5, whose replace semantics overwrite the stale row.
+The workflow is: DBT flags, the operator corrects `hand_starts.hand_start_state`, runs `tt mark-pending --video-id V --stage hand_actions --id <that hand start>` to append the retryable attempt row, and re-runs Phase 5, whose replace semantics overwrite the stale row. This is the most likely everyday use of `mark-pending`; before it existed the attempt row was a hand-written INSERT.
 
 This is the first sanctioned manual data path in the pipeline. A hand-corrected value is currently indistinguishable from an extracted one.
 
@@ -825,7 +859,7 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 ### Tooling
 
-- **Hand-level deletion cascade tooling** — see "Cross-phase reprocessing cascade." Now acute: Phase 5's tables have landed.
+- **Cross-phase content staleness is undetected** — the residual half of the reprocessing cascade gap, now that `tt mark-pending` has closed the orphan and stale-row halves. A `hand_setup_id` that survives re-detection at a shifted moment leaves downstream rows describing a different hand, with no orphan and reconciling counts. The eventual answer is a content hash of the upstream row stored downstream, making a mismatch a one-column comparison — a schema change to two tables. **Spike the cheaper option first:** `hand_start_state.hand_setup` is already a verbatim copy of the parent blob, so a `TO_JSON_STRING` comparison may detect this today with no schema change, if BigQuery's JSON normalisation is consistent enough to make equal blobs compare equal. Two queries answer it: one same-row comparison that should return no differences, and one cross-row that should return differences. A spike, not a spec.
 - **Ruff baseline** — 189 errors across `src/`, `tests/` and `scripts/`, 164 of them E501 against the configured 100-char limit and the rest auto-fixable imports plus two decorative unused mocks. Ruff is not in CI, which is why they accumulated. With that many standing errors a new one is invisible.
 - **Notebook reproduction harnesses are untracked** — `*.ipynb` is gitignored, while `jupyterlab`, `ipykernel` and `pillow` are dev dependencies precisely because CLAUDE.md's regression guard for prompts is notebook reproduction. The harnesses themselves are not versioned, so each investigation rebuilds them.
 

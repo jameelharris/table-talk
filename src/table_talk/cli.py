@@ -1,7 +1,7 @@
 # CLI entrypoint. Exposes `tt` command via the [project.scripts] entry
 # in pyproject.toml. Subcommands: `tt ingest`, `tt extract-payouts`,
 # `tt materialize-clips`, `tt process-clips`, `tt process-hand-setups`,
-# `tt process-hand-starts`, `tt check-integrity`.
+# `tt process-hand-starts`, `tt check-integrity`, `tt mark-pending`.
 
 import argparse
 import asyncio
@@ -16,6 +16,7 @@ from .hand_setup_processing import process_pending_clips
 from .hand_start_processing import process_pending_hand_setups
 from .ingest import process_manifest
 from .integrity import format_report, run_integrity_checks
+from .mark_pending import STAGES, MarkPendingError, format_plan, mark_pending
 from .payout_processing import process_pending_videos
 from .reference_images import (
     STREET_REFERENCE_ORDER,
@@ -85,6 +86,18 @@ def main() -> None:
     # default is None, which scopes corpus-wide; an explicitly empty list would
     # scope to nothing, which is why downstream tests are `is not None`.
     ci_parser.add_argument("--video-id", action="append", dest="video_ids")
+
+    mp_parser = subparsers.add_parser("mark-pending")
+    mp_parser.add_argument("--project", required=True)
+    mp_parser.add_argument("--dataset", required=True)
+    # Mandatory, single, and there is no all-videos mode. This makes terminal
+    # entities eligible again, which costs real money when the phases run; an
+    # accidental corpus-wide invocation would be a large unintended expense.
+    mp_parser.add_argument("--video-id", required=True)
+    mp_parser.add_argument("--stage", required=True, choices=STAGES)
+    mp_parser.add_argument("--id", action="append", dest="ids")
+    mp_parser.add_argument("--status", action="append", dest="statuses")
+    mp_parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
 
@@ -297,6 +310,22 @@ def main() -> None:
             client=bigquery.Client(project=args.project),
         )
         print(format_report(report))
+    elif args.command == "mark-pending":
+        try:
+            plan = mark_pending(
+                stage=args.stage,
+                video_id=args.video_id,
+                project=args.project,
+                dataset=args.dataset,
+                only_ids=args.ids,
+                only_statuses=args.statuses,
+                dry_run=args.dry_run,
+                client=bigquery.Client(project=args.project),
+            )
+        except MarkPendingError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(format_plan(plan, dry_run=args.dry_run))
     else:
         parser.print_help()
         sys.exit(1)

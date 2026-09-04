@@ -13,6 +13,7 @@ from table_talk.clip_materialization_attempts_writer import (
     VALID_STATUSES,
     ClipMaterializationAttemptsWriteError,
     write_clip_materialization_attempt_row,
+    write_clip_materialization_attempt_rows,
 )
 
 
@@ -229,3 +230,78 @@ def test_write_attempt_row_integration_appends_rather_than_replacing():
             assert skew < timedelta(seconds=30)
     finally:
         _cleanup(client, project, dataset, video_id)
+
+
+# --- batched writes ---
+#
+# The plural sibling, used by `tt mark-pending` to append one command's marks in
+# one INSERT. State tables are append-only, so this is a bare INSERT — there is
+# no DELETE and no transaction.
+
+_MARK_MESSAGE = "mark-pending: rebuilding clip_manifest"
+
+
+def _batch_row(index, status="failed_transient", status_message=_MARK_MESSAGE):
+    return ClipMaterializationAttemptsRow(
+        attempt_id=f"attempt_{index:03d}",
+        video_id=f"dQw4w9WgXcQ_{index:03d}",
+        status=status,
+        status_message=status_message,
+    )
+
+
+def test_batch_emits_one_insert_with_a_tuple_per_row():
+    mock_client, mock_job = _mock_client()
+
+    write_clip_materialization_attempt_rows(
+        [_batch_row(0), _batch_row(1)], project="proj", dataset="ds", client=mock_client
+    )
+
+    mock_client.query.assert_called_once()
+    args, kwargs = mock_client.query.call_args
+    query_str = args[0]
+    assert query_str.startswith("INSERT INTO")
+    assert "proj.ds.clip_materialization_attempts" in query_str
+    assert query_str.split("VALUES", 1)[1].count("(") == 2
+    param_names = {p.name for p in kwargs["job_config"].query_parameters}
+    assert "video_id_0" in param_names
+    assert "video_id_1" in param_names
+    assert "attempted_at" not in query_str
+    mock_job.result.assert_called_once()
+
+
+def test_batch_empty_list_is_a_noop():
+    mock_client, _ = _mock_client()
+
+    write_clip_materialization_attempt_rows([], project="proj", dataset="ds", client=mock_client)
+
+    mock_client.query.assert_not_called()
+
+
+def test_batch_invalid_status_raises_before_bq_call():
+    mock_client, _ = _mock_client()
+
+    with pytest.raises(ClipMaterializationAttemptsWriteError, match="Invalid status"):
+        write_clip_materialization_attempt_rows(
+            [_batch_row(0), _batch_row(1, status="not_a_real_status")],
+            project="proj",
+            dataset="ds",
+            client=mock_client,
+        )
+
+    mock_client.query.assert_not_called()
+
+
+def test_batch_rows_disagreeing_on_columns_raise():
+    # One INSERT carries one column list, and None-valued fields are omitted.
+    mock_client, _ = _mock_client()
+
+    with pytest.raises(ClipMaterializationAttemptsWriteError, match="disagree on columns"):
+        write_clip_materialization_attempt_rows(
+            [_batch_row(0), _batch_row(1, status_message=None)],
+            project="proj",
+            dataset="ds",
+            client=mock_client,
+        )
+
+    mock_client.query.assert_not_called()
