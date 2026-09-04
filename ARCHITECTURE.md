@@ -636,8 +636,9 @@ A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_st
 
 ### Production files
 
-- `cli.py` — entry point for all `tt` commands; one subcommand per phase
+- `cli.py` — entry point for all `tt` commands; one subcommand per phase, plus `check-integrity`
 - `bq_utils.py` — `bq_param_type` and `build_replace_sql`, shared by writers
+- `integrity.py` — the read-only corpus audit behind `tt check-integrity`
 - `timestamp_utils.py` — `parse_timestamp`, shared by orchestrators
 - `_generated/` — codegen output from `scripts/gen_schemas.py`, committed
 - `prompts/*.md` — LLM prompts (`extract_results.md`, `identify_hand.md`, `extract_player_info.md`, `identify_hand_start.md`, `extract_hole_cards.md`), versioned with code so prompt changes ride code review
@@ -645,6 +646,7 @@ A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_st
 ### Test files
 
 - `test_smoke.py` — version sanity check
+- `test_integrity.py` — the integrity checks
 
 ### Idempotent stage writes
 
@@ -661,6 +663,30 @@ Four hands in the same batch took the same outage; only this one duplicated, bec
 **Consequences accepted.** Replace semantics make stage writes mutating DML, which BigQuery serializes per table (~2 concurrent, rest queued) rather than the fine-grained path available to INSERT-only writes. Safe at the current `max_concurrent=4` with videos processed sequentially; a real constraint if concurrency rises. A transaction aborted under contention surfaces as a write error, classifies retryable, and retries safely — the failure mode degrades into the mechanism.
 
 **Implications for integrity checks.** A stage row can coexist with a latest attempt of `failed_transient` (via the outage path) or `failed_parked` (a hand that completed, later failed three times, and parked). Failures never delete existing output, so both states are legitimate and must not be flagged as anomalies. The converse inference is now available for Phase 4 but only in one direction: a latest `complete` does imply exactly one `hand_starts` row, because the zero-row terminal successes carry their own statuses (`complete_skipped`, `complete_uncontested`). That does not invert — a missing row does not imply a non-`complete` status, and a present row does not imply a `complete` one, per the preceding paragraph. It also does not generalise: other phases' `complete` still spans zero-row outcomes.
+
+### Corpus integrity checks
+
+`tt check-integrity` is a read-only audit across the corpus. It deletes nothing, writes nothing, and always exits zero — findings are not command failures, because an audit you hesitate to run is an audit you do not run. `integrity.py` holds the checks as pure query builders plus a runner; it consults BigQuery and returns findings, composing no primitives.
+
+It is the complement of a scoped `--dry-run`, not an overlap. A dry-run answers "if I proceed, what changes?" for entities you named; this answers "is anything currently wrong?" for everything. A stale row from a reprocess weeks ago never surfaces in a dry-run unless that entity happens to be named again.
+
+**Scope is correctness, not progress.** A video part-way through the pipeline is incomplete, not inconsistent — `YzKyFMQ1avU`'s 68 stage rows with no Phase 4 or 5 output report clean. Conflating unprocessed with wrong would make the tool noisy from its first run, which is how an audit tool gets ignored.
+
+Three checks: orphaned stage rows (anti-join against the parent table), duplicate natural ids (`GROUP BY ... HAVING COUNT(*) > 1`, the invariant that caught the 2026-08-03 duplicate), and status versus row count. The third is per entity, never a count comparison — an aggregate delta of 3 at 150 videos is a research project, a named id is actionable, and the ~63-distinct-hands caveat above makes corpus row-count equality meaningless anyway.
+
+**Arity differs by phase; there is no single "complete means one row" rule.** Phase 2's `complete` produces one clip per 240s window, so `>= 1`. Phase 3 has no invariant at all. Phases 4, 5 and payout extraction are exactly one. The report names the invariant per phase rather than implying one rule.
+
+**Phase 3's absence from the status/row check is a property of the phase, not a gap in the tool.** A clip that legitimately detects zero hand setups is `complete` with zero rows, so row count cannot be predicted from status. The report states this rather than silently omitting the phase.
+
+**Failure statuses are unconstrained everywhere,** and this falls out of omission rather than an exclusion clause: a status absent from a phase's arity map is simply not checked, and the failure statuses are never listed. This is the false positive most likely to be introduced, since it would fire on exactly the incident the tool exists to catch — see the outage path above. A contract test binds each arity map to its writer's `VALID_STATUSES`, so a new status that is neither constrained nor deliberately exempt fails loudly rather than silently going unchecked.
+
+Each phase is anchored on its **input** table rather than its attempts table, which makes the stage-to-attempts off-by-one tractable: an attempts table sits between the entity a phase consumes and the rows it produces, and is named for the former. Two things follow. Every input table carries `video_id` while `clip_processing_attempts`, `hand_setup_processing_attempts` and `hand_start_processing_attempts` do not, so this is what makes `--video-id` scoping possible at all. And an attempt row whose entity no longer exists — Phase 3 re-detection shrinkage — drops out rather than being flagged, which is correct: state tables are append-only audit logs and a superseded entity's history is not an anomaly.
+
+Phase 1 and `videos` are out of scope. Not because fact tables do not exist — `videos` plainly does — but because `video_ingestion_attempts` predates the common status vocabulary and `videos` has no parent, leaving a duplicate `video_id` as the only applicable check. `tournament_results` *is* covered by the duplicate and status/row checks, and skipped only in the orphan check, since its parent is `videos`.
+
+**Deliberately not covered.** Anything that deletes — read-only is the design, and the no-delete-flag rule below is unchanged. Progress reporting, which is a different question with a different answer shape. GCS objects. And cross-phase content staleness, which nothing detects today; the eventual answer is a content hash of the upstream row stored downstream, making a mismatch a one-column comparison, but that is a schema change to two tables and its own piece of work.
+
+The first run against the pre-rebuild corpus returns exactly one finding: `MPBLfM4mwfE_010_002`, `complete` with zero `hand_starts` rows. Its `status_message` reads "complete: uncontested — no voluntary chip commitment", written 2026-08-03 before `complete_uncontested` existed. It is a true reading of the current state, it resolves itself when the rebuild appends a superseding `complete_uncontested` row, and no legacy tolerance was added — permanently weakening a check to hide a temporary artifact is the wrong trade.
 
 ### Retry caps
 
@@ -705,6 +731,8 @@ Frames are written to deterministic paths and read only through the paths stored
 The guarantee is one-directional: a live row's path always resolves, because uploads precede the row write. What could break it is automated deletion — so the operative rule is not to build any. Bucket lifecycle rules must stay scoped to noncurrent versions; an age-based rule on current versions would delete referenced frames.
 
 Orphans arise from: upload-before-write on permanent failure; Phase 3 batch shrinkage on reprocess (4 rows become 3, the surplus row's frame detaches); Phase 4's uncontested branch clearing a row whose frames remain; and integration-test residue.
+
+Those are all path *abandonment*. Path *reuse* is a separate case and is not an orphan at all. Ids are positional — `{clip_id}_{NNN}` — so re-detection can reassign a `hand_setup_id` to a different moment and overwrite its frame, leaving a surviving downstream row's path resolving to an image of a different hand. Nothing is unreferenced, so no cleanup addresses it; it is a row-consistency problem, handled by a reprocessing cascade delete rather than by anything in this section. `tt check-integrity` does not detect it either — an id that survives re-detection has a parent and a plausible row count. Keep the won't-fix on cleanup regardless: not building automated deletion is the only thing preserving the guarantee that a live row's path always resolves.
 
 Payout extraction adds a narrower case — upload succeeds, the BQ write then fails — but it is self-healing where the others are not: its path is stable per video, so the next successful run overwrites the object rather than leaving a second one. It cannot orphan on a permanent failure at all, because the upload runs only after the panel validates.
 
@@ -797,7 +825,6 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 ### Tooling
 
-- **Standing integrity-check tool** — the invariant that caught the duplicate: `hand_starts` row count equals the count of `complete` hands, and no duplicate natural id in either stage table. The uncontested exclusion this item used to warn about is no longer a special case: uncontested hands carry `complete_uncontested`, so filtering on `status = 'complete'` excludes them by construction. Historical rows written before that status existed still sit on `complete`, so a check run against pre-rebuild data needs the old exclusion. Must also tolerate the row-exists-with-failed-status cases described under "Idempotent stage writes." Ship as a CLI subcommand or a documented query.
 - **Hand-level deletion cascade tooling** — see "Cross-phase reprocessing cascade." Now acute: Phase 5's tables have landed.
 - **Ruff baseline** — 189 errors across `src/`, `tests/` and `scripts/`, 164 of them E501 against the configured 100-char limit and the rest auto-fixable imports plus two decorative unused mocks. Ruff is not in CI, which is why they accumulated. With that many standing errors a new one is invisible.
 - **Notebook reproduction harnesses are untracked** — `*.ipynb` is gitignored, while `jupyterlab`, `ipykernel` and `pillow` are dev dependencies precisely because CLAUDE.md's regression guard for prompts is notebook reproduction. The harnesses themselves are not versioned, so each investigation rebuilds them.

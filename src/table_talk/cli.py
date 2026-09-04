@@ -1,7 +1,7 @@
 # CLI entrypoint. Exposes `tt` command via the [project.scripts] entry
 # in pyproject.toml. Subcommands: `tt ingest`, `tt extract-payouts`,
 # `tt materialize-clips`, `tt process-clips`, `tt process-hand-setups`,
-# `tt process-hand-starts`.
+# `tt process-hand-starts`, `tt check-integrity`.
 
 import argparse
 import asyncio
@@ -15,6 +15,7 @@ from .hand_action_processing import process_pending_hand_starts
 from .hand_setup_processing import process_pending_clips
 from .hand_start_processing import process_pending_hand_setups
 from .ingest import process_manifest
+from .integrity import format_report, run_integrity_checks
 from .payout_processing import process_pending_videos
 from .reference_images import (
     STREET_REFERENCE_ORDER,
@@ -76,6 +77,14 @@ def main() -> None:
     pha_parser.add_argument("--hand-start-id")
     pha_parser.add_argument("--max-concurrent", type=int, default=4)
     pha_parser.add_argument("--max-attempts", type=int, default=3)
+
+    ci_parser = subparsers.add_parser("check-integrity")
+    ci_parser.add_argument("--project", required=True)
+    ci_parser.add_argument("--dataset", required=True)
+    # Repeated, unlike every other subcommand's single-valued --video-id. The
+    # default is None, which scopes corpus-wide; an explicitly empty list would
+    # scope to nothing, which is why downstream tests are `is not None`.
+    ci_parser.add_argument("--video-id", action="append", dest="video_ids")
 
     args = parser.parse_args()
 
@@ -277,6 +286,17 @@ def main() -> None:
         )
         for key, value in stats.items():
             print(f"{key}: {value}")
+    elif args.command == "check-integrity":
+        # Always exits zero. Findings are not command failures — an audit you
+        # hesitate to run is an audit you do not run. If a nonzero exit is ever
+        # wanted in CI, that is a wrapper's job.
+        report = run_integrity_checks(
+            project=args.project,
+            dataset=args.dataset,
+            only_video_ids=args.video_ids,
+            client=bigquery.Client(project=args.project),
+        )
+        print(format_report(report))
     else:
         parser.print_help()
         sys.exit(1)
