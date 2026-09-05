@@ -212,7 +212,7 @@ ORDER BY tr.video_id
 
 A discrepancy is `bounty_type = 'progressive'` with zero bounty-bearing hands, or `bounty_type = 'none'` with more than zero. To correct one: append a retryable attempt row for the video, re-run `tt extract-payouts --video-id`, and the row is replaced.
 
-Per-seat bounty extraction has landed, so the last column is meaningful for any video processed since. It still reads 0 for hands extracted before it — `MPBLfM4mwfE`'s existing 65 rows predate it and read 0 until that video is rebuilt (see "Rebuild, not backfill"). Read a zero on a `progressive` video as "not yet reprocessed" until the rebuild has run, and as a real discrepancy afterwards.
+Per-seat bounty extraction has landed and `MPBLfM4mwfE` has since been rebuilt, so the last column is meaningful for it. Read a zero on a `progressive` video as "not yet reprocessed" while a video ingested before the addendum landed is still awaiting its rebuild, and as a real discrepancy once the rebuild has run.
 
 ### Known inefficiency, accepted
 
@@ -376,7 +376,7 @@ That join is LEFT, and a null `bounty_type` raises. The materialization gate gua
 ### CLI
 
 ```
-tt process-clips --project P --dataset D --videos-bucket VB --hand-setups-bucket HB [--video-id ID] [--max-concurrent 4] [--max-attempts 3]
+tt process-clips --project P --dataset D --videos-bucket VB --hand-setups-bucket HB [--video-id ID] [--clip-id ID] [--max-concurrent 4] [--max-attempts 3]
 ```
 
 ### Per-seat bounty capture
@@ -405,6 +405,23 @@ The field is **absent, not null**, on non-bounty videos — nothing asked for it
 Downstream must still *derive* rather than extract two things. Per-seat forced contributions: the ante coefficient is `(pot_size_bb − 1.5) / total_seat_count`, fitted per video by median so a misread pot does not drag it (`MPBLfM4mwfE` fits 0.125 exactly across seat counts 9 through 2). Note it is a **big blind ante** — the total collected is `0.125 × seats`, posted by one player, so `committed[seat]` is 0.5 for the SB, 1.0 plus the full table ante for the BB, and zero for everyone else; do not subtract 0.125 from every stack. And bounty equity: under progressive rules roughly half a collected bounty is banked and half added to the knocker's own head, so capturable equity is about half the displayed badge — inferred from a 125 → 187.5 → 281.25 progression, three data points, and worth confirming before anything depends on it.
 
 **Currency mismatch, unresolved.** Badges and payouts are in dollars; stacks and pots are in big blinds. Nothing bridges them, and any equity computation needs that bridge. It connects to the open blind-level question and it blocks bounty-aware analysis.
+
+**Validated in production.** The rebuild of `MPBLfM4mwfE` was the first live run of the addendum, and it holds up.
+
+- **All 63 `hand_setups` rows carry bounty data.** 282 of 285 seats have a non-null `bounty`; the three that do not are the phantom seats described under "Phantom seats and the checks that find them" — the extra seat reads null for everything, bounty included, so this is not a bounty-extraction gap.
+- **The mapping is right where ground truth exists.** `_001_001` nine-handed reproduces the notebook spike's verified read exactly: BB 125.0, SB 945.31, BTN 687.5, CO 1359.37, HJ 406.25, LJ 187.5, UTG+2 484.38, UTG+1 281.25, UTG 281.25.
+- **Values arrive as numbers, not `$`-prefixed strings,** across the whole run — but `_parse_bounty` is not thereby redundant, since the string form was observed on a single frame and its absence from 285 seats is not proof it cannot recur.
+- **All values sit on the halving lattice** from a 125 starting bounty.
+
+**A second validity signal, found in the data rather than designed.** Between consecutive hands with no bust-out, the *multiset* of bounties is identical and only the seat assignment shifts, by one position, as the button advances. The badge belongs to the player; the position label rotates past it. Across the rebuilt corpus this holds for 55 of 62 consecutive pairs, and the 7 that differ are exactly the 7 hands where the seat count drops — every bust-out and nothing else.
+
+It is a stronger check than the lattice, which only constrains individual values, and it is one window function on one stage table:
+
+```sql
+STRING_AGG(bounty ORDER BY bounty) OVER (hand)  -- compare to LAG, expect equality unless seat count fell
+```
+
+It survives the phantom seats too: a null bounty drops out of the aggregate, leaving the remaining values matching their neighbours, which is independent corroboration that the phantom is an extra seat rather than a misread of a real one. Whether to build it is a separate question from having found it.
 
 **Stated assumptions.** Badge legibility and placement rest on one video — `MPBLfM4mwfE` is the only progressive event ingested, and `oWKpfjfEM4c` is a confirmed second PKO and the obvious next test of whether badge position holds across broadcast skins. And seat assignment is verified *stable*, not verified *correct*: three consistent reps rule out the rotation failure but cannot distinguish three right answers from three consistently wrong ones. The spot-check against the stored frame is the ground truth.
 
@@ -469,7 +486,7 @@ Shares `videos_downloader.py`, `frame_extractor.py`, `frame_uploader.py`, `gemin
 ### CLI
 
 ```
-tt process-hand-setups --project P --dataset D --videos-bucket VB --hand-starts-bucket HB [--video-id ID] [--max-concurrent 4] [--max-attempts 3]
+tt process-hand-setups --project P --dataset D --videos-bucket VB --hand-starts-bucket HB [--video-id ID] [--hand-setup-id ID] [--max-concurrent 4] [--max-attempts 3]
 ```
 
 ### The processing window: LEAD + cap
@@ -507,9 +524,9 @@ All three write zero `hand_starts` rows. The `complete_uncontested` branch calls
 
 ### What `hand_starts` guarantees, and what it does not
 
-Established by exhaustive validation of 65 hands in video `MPBLfM4mwfE` (60 `complete` with rows, 1 `complete_uncontested`, 2 `complete_skipped`, 2 `failed_transient`; the uncontested hand predates the status and carries a historical `complete` row, superseded on reprocessing). The two `failed_transient` rows are now understood to be duplicate clip-boundary fragments of hands captured elsewhere in the corpus (see "Retry caps"), so the corpus holds roughly 63 distinct hands and there are no unexplained failures in it. Downstream phases must treat all of the following as **normal input**, not defects:
+Established by exhaustive validation over `MPBLfM4mwfE`: first across the 65 hands of the original run, then re-established across the 63 of the rebuild. The rebuild's outcome is 58 `complete` with rows, 2 `complete_uncontested` (`_010_002`, `_013_001`), 2 `complete_skipped` (`_005_005` on SB and `_009_005` on CO, both null stack), and 1 `failed_transient` (`_008_004`) — 63 hand setups in, 58 `hand_starts` rows out. The single failure is a clip-boundary fragment and is not unexplained; see "Retry caps", which also records why its twin from the original run, `_004_008`, completed this time. Both row counts are properties of a *run*, not of the video — see "Detection is not deterministic." Downstream phases must treat all of the following as **normal input**, not defects:
 
-- **Eligible-seat hole cards may be `null`** in a `complete` record (4 of 65 observed). Most were on folded players and inconsequential. One was on a live player and is **frame-limited** — a six-time reproduction against the stored frame returned null every time while the adjacent seat read correctly, so the card is genuinely not legible at the FVA moment. More retries would not recover it.
+- **Eligible-seat hole cards may be `null`** in a `complete` record (4 of 65 in the original run, 2 of 58 in the rebuild — `_004_008` on CO and `_005_001` on BTN, both enumerated in `status_message`). Read that as a range, not a trend: the rate moved across a re-detection with no prompt change between the runs. Most were on folded players and inconsequential. One was on a live player and is **frame-limited** — a six-time reproduction against the stored frame returned null every time while the adjacent seat read correctly, so the card is genuinely not legible at the FVA moment. More retries would not recover it.
 - **Non-null hole cards may be wrong.** One hand returned `4d4s` for a seat holding `9s7d` — a hallucination, not a null. It landed on a folded seat, but the failure mode is real. `status_message` enumerates residual nulls and has **no signal** for wrong-but-non-null cards, so neither Phase 5 nor DBT can use status to filter bad data. The only mitigation would be consensus reads, which the pipeline does not do.
 - **`complete` does not guarantee complete hole-card data.** Inspect `hand_start_state` for nulls on players who acted; do not rely on status.
 - **`fva.action_type ∈ {call, raise, all_in}`.** No `limp` — it is derivable as `call` with `bet_amount == 1.0` preflop. `fold` and `check` are unreachable because the FVA is defined by chip commitment.
@@ -582,7 +599,7 @@ The bound is the raw LEAD gap capped at `MAX_WINDOW_SECONDS` (240) — a technic
 
 Phase 4 truncates at its cap because it only needs the hand's start. Phase 5 needs the whole hand, so truncation would produce a record showing the hand ending early — a silent wrong answer rather than a loud failure. Because `raw_lead_gap_seconds` is known before any Gemini call, a hand exceeding the cap is a precondition skip instead.
 
-A hand genuinely longer than 240 seconds therefore cannot be processed at 1 fps. The options — lower fps, or split the window across two calls and stitch — are real work and out of scope. Zero of 65 corpus hands exceed the cap (max gap 168s, median 34s), so the limit is currently theoretical and the cap guards against pathological gaps rather than filtering routinely.
+A hand genuinely longer than 240 seconds therefore cannot be processed at 1 fps. The options — lower fps, or split the window across two calls and stitch — are real work and out of scope. Zero corpus hands exceed the cap in either run — 62 gaps across the rebuilt 63 rows, max 187s, median 35s, against 168s and 34s before — so the limit is currently theoretical and the cap guards against pathological gaps rather than filtering routinely.
 
 ### Two bounds on the window
 
@@ -623,14 +640,22 @@ A mid-hand `found: false` from a street scan is **not** a failure — it is how 
 
 ### What the corpus run established
 
-A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_starts` guarantees."
+A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_starts` guarantees." The figures below are the original run's and are kept as the historical record; the rebuild's are in "What the rebuild added" beneath.
 
 - **60 of 60 hands complete.** The first run gave 56 complete, 3 rate-limited transients, and 1 hallucinated flop timestamp caught by `_street_timestamp_guard`. All four resolved on a rerun at `--max-concurrent 2` after the prompt and scan-retry fixes.
   - The 3 rate-limited transients are real — they are still in `hand_start_processing_attempts`, carrying `429 RESOURCE_EXHAUSTED` status messages. The *explanation* was wrong: lowering concurrency worked because it avoided provoking 429s, not because it gave the backoff room to work. No backoff ran. See "The 429 backoff that never fired."
 - **Cost is roughly $0.053 per hand** — 2.49M tokens over 204 calls, about $3.20 for the video. Input dominates. Video scans run ~20K tokens, frame reads ~2.4K, and scan cost falls with each street as the window narrows.
 - **One prompt finding.** D over-reported streets on hands that ended preflop: the instruction to record streets with empty action arrays read as applying whenever no postflop action occurred, rather than only when a called all-in means cards keep coming. Reproduced 4/4 before and after the fix.
 - **Three data errors in the 65 `hand_setups` rows** — one all-null stack read, one phantom seat (`_009_005` declared four seats with a three-seat pot), and one misread pot (`_011_002`). Two were filtered by Phase 4's null-stack precondition; the third propagated harmlessly.
-- **The 65-row corpus holds roughly 63 distinct poker hands**, since two rows are clip-boundary fragments. Any integrity check or validation run reasoning from row counts must not expect 65 `hand_actions` rows. The fragment rate is measured on one video only; a materially higher rate on a future video would make the decision not to add a fragment precondition worth revisiting.
+  - The rebuild reframes the first two as one defect and adds a third instance. All-null-stack *is* phantom seat: the extra seat reads null for stack, bounty and cards alike. The rebuilt 63 rows carry three — `_005_005`, `_009_005` and `_012_003` — and `_012_003`'s phantom reports `stack_size = 0.38`, so the null-stack precondition does not filter it and Phase 4 processed the hand `complete`. See "Phantom seats and the checks that find them."
+- **Row counts do not equal hand counts, and neither is fixed.** The original 65 `hand_setups` rows held roughly 63 distinct poker hands, two rows being clip-boundary fragments. The rebuilt 63 rows hold roughly 62: one fragment pair survived re-detection (`_008_004`/`_009_001`) and the other did not. Any integrity check or validation run reasoning from row counts must not expect the stage tables to agree row for row. The fragment rate is measured on one video only, and it moves between runs on that one video — see "Detection is not deterministic" — so a materially higher rate on a future video would make the decision not to add a fragment precondition worth revisiting, but a single run is not enough to establish one.
+
+### What the rebuild added
+
+Phase 5 over the rebuilt corpus: 57 of 58 `hand_starts` complete, one `failed_permanent`. Two observations worth keeping.
+
+- **`_008_001_001`'s malformed JSON was a refusal, not a parse failure.** The response was Gemini declining in prose — the six cards visible were all in player positions and no community cards were on the table. The classification is right (malformed JSON does not fix itself on a retry), but the cause is upstream of the classifier: a street was read that should not have been, either because D over-reported it or because E's scan landed before the deal. The same hand completed in the original run with `streets=preflop,flop`. D over-reporting streets on preflop-ending hands is a known and prompt-fixed failure recorded above, so this may be a residual instance — but nobody has looked at the frame, so record it as an observation and not a diagnosis.
+- **`CARD_READ_ATTEMPTS` exhausting is not always frame-limited.** `_002_001_001` failed `failed_transient` with `river: null card in read after 3 reads`, then completed on a single retry against the same frames. That read was stochastic. The known hole-card null in Phase 4 is the opposite case — six reproductions against the stored frame returned null every time, so the card is genuinely illegible. The two are **indistinguishable in `status_message`**, which means a null-after-N-reads message is not by itself grounds for giving up on a card, and the retry that resolves one costs nothing on the other.
 
 ## Cross-cutting
 
@@ -642,7 +667,11 @@ A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_st
 - `mark_pending.py` — the reprocessing cascade behind `tt mark-pending`
 - `timestamp_utils.py` — `parse_timestamp`, shared by orchestrators
 - `_generated/` — codegen output from `scripts/gen_schemas.py`, committed
-- `prompts/*.md` — LLM prompts (`extract_results.md`, `identify_hand.md`, `extract_player_info.md`, `identify_hand_start.md`, `extract_hole_cards.md`), versioned with code so prompt changes ride code review
+- `prompts/*.md` — LLM prompts, versioned with code so prompt changes ride code review. All nine, by the phase that loads them:
+  - Payout extraction — `extract_results.md`
+  - Phase 3 — `identify_hand.md`, `extract_player_info.md`, `extract_player_info_bounty_addendum.md` (concatenated onto the previous only when `bounty_type = 'progressive'`)
+  - Phase 4 — `identify_hand_start.md`, `extract_hole_cards.md`
+  - Phase 5 — `extract_player_actions.md` (step D), `extract_community_cards.md` (step E's scan), `extract_community_cards_from_frame.md` (step E's read)
 
 ### Test files
 
@@ -690,6 +719,8 @@ Phase 1 and `videos` are out of scope. Not because fact tables do not exist — 
 
 The first run against the pre-rebuild corpus returns exactly one finding: `MPBLfM4mwfE_010_002`, `complete` with zero `hand_starts` rows. Its `status_message` reads "complete: uncontested — no voluntary chip commitment", written 2026-08-03 before `complete_uncontested` existed. It is a true reading of the current state, it resolves itself when the rebuild appends a superseding `complete_uncontested` row, and no legacy tolerance was added — permanently weakening a check to hide a temporary artifact is the wrong trade.
 
+The rebuild appended that row, and the audit now reports clean across both videos: 0 orphaned rows, 0 duplicate natural ids, 0 status/row mismatches over 260 stage rows. The finding resolved itself exactly as predicted, without a tolerance. Note what clean does *not* mean here — the same corpus is missing an estimated 5% of the video's hands and carries three phantom seats, neither of which is in scope for any of the three checks. See "Detection is not deterministic" and "Phantom seats and the checks that find them."
+
 ### Reprocessing and the mark-pending cascade
 
 `tt mark-pending` is the sanctioned way to make a finished entity eligible for reprocessing. It appends a retryable attempt row to the named stage's state table and to every stage downstream of it, and deletes the downstream stage rows that reprocessing would otherwise leave stale. `mark_pending.py` holds the cascade; `--dry-run` prints the same plan the real run executes, from the same code path.
@@ -724,11 +755,20 @@ Marks carry `status_message = "mark-pending: rebuilding {stage}"`. That string i
 
 Orchestrators park an entity after N consecutive failures rather than retrying forever. See CLAUDE.md's "Retry caps and terminal parking" for the rules.
 
-Two corpus hands motivated this: `MPBLfM4mwfE_008_004`, which failed three times with `no_first_voluntary_commitment_found` including after the step-A prompt fix, and `MPBLfM4mwfE_004_008`, which failed once the same way, then twice with `no second action observed within window`. An earlier version of this section read these as two different failure classes and warned against diagnosing them as one pattern. That was wrong; **retracted**. A later query against `clip_manifest` and `hand_setups` found the real cause: both are the same clip-boundary re-detection artifact. `_008_004` begins at 1915s; the next `hand_setups` row, `_009_001`, begins at 1920s — exactly clip 009's `clip_start_time` — leaving `_008_004` a five-second LEAD window. `_004_008` begins at 959s; the next row, `_005_001`, begins at 960s — exactly clip 005's `clip_start_time` — leaving it a one-second window. Neither is a detection failure: `_004_008`'s real first voluntary commitment is at 967s with its second action at 971s (confirmed by manual video check), both outside its one-second window, so no retry and no prompt fix could ever have found them. Both are duplicate fragments of hands already captured under a different `hand_setup_id` — `_005_001` and `_009_001` respectively — and both of those completed with `hand_starts` rows. No hands were lost; see "Data and schema" for the upstream fix this points to.
+Two corpus hands motivated this: `MPBLfM4mwfE_008_004`, which failed three times with `no_first_voluntary_commitment_found` including after the step-A prompt fix, and `MPBLfM4mwfE_004_008`, which failed once the same way, then twice with `no second action observed within window`. An earlier version of this section read these as two different failure classes and warned against diagnosing them as one pattern. That was wrong; **retracted**. A later query against `clip_manifest` and `hand_setups` found the real cause: both are the same clip-boundary re-detection artifact. `_008_004` begins at 1915s; the next `hand_setups` row, `_009_001`, begins at 1920s — exactly clip 009's `clip_start_time` — leaving `_008_004` a five-second LEAD window. `_004_008` begins at 959s; the next row, `_005_001`, begins at 960s — exactly clip 005's `clip_start_time` — leaving it a one-second window. Neither is a detection failure: `_004_008`'s real first voluntary commitment is at 967s with its second action at 971s (confirmed by manual video check), both outside its one-second window, so no retry and no prompt fix could have found them *through that window*. Both are duplicate fragments of hands already captured under a different `hand_setup_id` — `_005_001` and `_009_001` respectively — and both of those completed with `hand_starts` rows. No hands were lost; see "Data and schema" for the upstream fix this points to.
 
-The retry cap still did the right thing here — it stopped two entities that could not complete from retrying forever — but honestly, in this case that meant saving wasted calls on unprocessable fragments, not isolating genuinely hard hands. The accumulate-hard-hands-for-diagnosis rationale has no confirmed instances yet.
+**The generalisation drawn from that — that neither could ever be found — is wrong, and it was wrong in two different ways.** It came from a manual check of `_004_008` only. The rebuild separated the cases:
 
-These failures are cheap: a step-A miss never reaches the HIGH-resolution hole-card call and writes no stage row, so failing fast on hard hands saves cost rather than losing data.
+- **`_004_008` completed.** Not by a retry and not by a prompt fix, but because re-detection removed the row that was truncating it: t=960 was not detected the second time, t=959 survives, the next row is at t=984, and the window is 25 seconds instead of one. The FVA at 967s falls inside it. The claim was true of the window and false of the entity, and what repaired it was unrelated to the entity — see "Detection is not deterministic."
+- **`_008_004` was found, and what was found was not the hand.** On a retry run before the rebuild it completed, writing a `hand_starts` row that looks entirely ordinary: FVA at 1918s, second action at 1919s, both inside the five-second window, BTN all-in for 27.4bb — their exact stack. But `_009_001` at t=1920 is the same poker hand, and the tables say so: identical hole cards on BB and SB, identical stacks across all three seats (30.9 / 27.4 / 21.9), identical pot of 1.88. A manual video check confirms `_009_001` is the correct record — BTN raises to 2.0 at 1923s with the second action at 1926s, no all-in — so the `_008_004` row was wrong in BTN's hole-card suit and wrong in BTN's FVA, confidently and in both fields. On the rebuild run the same five-second window returned `no_first_voluntary_commitment_found` again.
+
+**A truncated window does not reliably fail — it can fabricate instead.** This is the part worth carrying forward. A failure is loud and costs only wasted calls; the pipeline is built for it. `_008_004` produced the other outcome: a confident, internally consistent, wrong record that passes every check there is, `tt check-integrity` included, since it has a parent and exactly one row. That is the *silent wrong answer* the Phase 3 re-detection follow-up warns about, arriving a phase earlier than that item anticipates — the follow-up describes the risk as beginning at a hypothetical assembly phase, and it is already here in Phase 4.
+
+`_008_004` is deliberately left at `failed_transient`. Re-running it is a coin flip that could reinstate the bad record; one more attempt parks it, which is where it belongs.
+
+The retry cap still did the right thing, but a narrower thing than first claimed. It stopped two entities from retrying forever, which saved wasted calls on fragments rather than isolating genuinely hard hands; the accumulate-hard-hands-for-diagnosis rationale still has no confirmed instances. And parking `_004_008` turned out to be premature relative to a re-detection that had not happened yet — which cost nothing, because parking is not terminal in practice: `tt mark-pending` un-parked it and it completed. That is the argument for parking rather than for a `failed_permanent`, and it is the first time the distinction has paid.
+
+These failures are cheap: a step-A miss never reaches the HIGH-resolution hole-card call and writes no stage row, so failing fast on hard hands saves cost rather than losing data. That is an argument about *failures* only, and `_008_004` is the reminder that it does not extend to the entity — a fragment that succeeds is not cheap, it is expensive in a way nothing bills for.
 
 The counter is consecutive failures since the last non-failure, not lifetime — `MPBLfM4mwfE_006_004`'s history (`complete` → `failed_transient` → `complete`) is the case that makes the distinction necessary.
 
@@ -790,6 +830,29 @@ Per-seat bounty is additive, and a rebuild was still chosen — on economics, no
 
 Re-detection being stochastic, the row counts are expected to move. Record the new ones; a difference is not a defect. A large move is itself a finding about detection stability.
 
+### Detection is not deterministic
+
+"Rebuild, not backfill" said the row counts were expected to move and that a large move would itself be a finding. They moved, and it is.
+
+Two Phase 3 runs over the same 13 clips of the same video, on the same model, produced **different sets of hand setups** — 65 rows the first time, 63 the second. Comparing by `hand_setup_time_seconds`, since the ids are not comparable across runs:
+
+- **22 detections shifted by ±1 second.** Same hands, jitter, harmless.
+- **Three legitimate hands present in the first run were absent in the second:** t=1126 (18:46), t=1320 (22:00), t=2546 (42:26).
+- **Two legitimate hands absent from the first run were found in the second:** t=2787 (46:27) and t=2893 (48:13).
+- **One duplicate detection resolved.** t=960, exactly clip 005's `clip_start_time`, was not re-detected; t=959 survives. That is what freed `_004_008` — see "Retry caps."
+
+Four of those were manually checked against the video and confirmed legitimate setups — the three losses and t=2787. The second gain, t=2893, was identified by reconciling the per-clip counts below rather than at the video, and has not been checked; it is counted here because the reconciliation is exact, not because anyone has looked at it. Subject to that, this is not detection finding spurious hands or rejecting bad ones. It is real hands appearing and disappearing between runs on identical input, at roughly 5%.
+
+The first run's `hand_setups` rows were replaced, so the per-timestamp comparison above is not re-derivable from the tables today; it was made while both sets existed. What *is* still recoverable is the per-clip shape, because `hand_setup_processing_attempts` is append-only and its superseded rows survive: clip 005 lost two detections, clips 006 and 011 lost one each, clips 012 and 013 gained one each. Four `hand_setup_id`s attempted in the first run have no row today; two ids that exist today were never attempted in it.
+
+**Ids are positional, so id identity is not hand identity across runs.** `{clip_id}_{NNN}` renumbers whenever a clip's detection count changes, which is why the comparison keys on time. This is the same property behind the content-staleness gap, seen from the other side.
+
+**No check in the pipeline can see any of this.** Both runs reported 13/13 clips `complete` with zero failures. A hand Phase 3 never detected leaves no row, so `LEAD` spans the gap silently and a long gap is indistinguishable from a genuinely long hand. Chip conservation is blind to it too — no chips leave the table between two hands whether or not a hand happened in between, so the totals still reconcile. `tt check-integrity` reports clean on both runs, correctly: every row has a parent and a plausible count. The gap was already described as accepted. It now has a measurement.
+
+**The consequence is that the corpus is a sample, not a census.** At the projected 20K hands, ~5% is on the order of 1,000 hands present in the broadcast and absent from the data. Whether the misses are random or systematic is unknown, and the distinction decides how much it matters: random misses cost precision, while a detector that systematically loses a *kind* of hand biases every aggregate built on top of it. That question is open and is not answered by anything measured here.
+
+**A cheap mitigation exists.** Noting it, not proposing it: the two runs found more distinct hands between them than either found alone, and a union across two detection passes would recover most of the gap for the cost of the clip-mode calls only. Those are a small fraction of per-hand cost, since the expensive HIGH-resolution frame reads live in Phases 4 and 5 and would run once on the union. This is the consensus-read idea rejected for card reading, applied where it is cheap rather than where it is not — but a union needs a dedup rule across runs, and the ±1s jitter means that rule is proximity in time, the same signal the clip-boundary duplicate fix needs.
+
 ### The 429 backoff that never fired
 
 `gemini_caller._call_with_retry` shipped catching `google.api_core.exceptions.ResourceExhausted`. The client is `google-genai`, which raises `google.genai.errors.ClientError` with `code == 429` instead. The two families share no ancestry — `genai`'s `APIError` is rooted at plain `Exception` and is not even a `GoogleAPIError` — so the `except` never matched. The backoff loop never ran once.
@@ -804,6 +867,8 @@ Two consequences beyond the retry, from the same root cause:
 - **`ServerError` landed on `failed_transient` correctly, but by accident** — via the catch-all rather than by classification.
 
 **The fix keys on the status code, not the exception class.** `ClientError` covers every 4xx including 429, so mapping the class wholesale to permanent would have re-broken the retry, and would have made 429's retryability depend on `_call_with_retry` having filtered it out first. `_genai_status_code` reads `code` or `status_code` (the spelling has moved across SDK versions) and never parses the message — a message mentioning 429 for an unrelated reason must not trigger a retry. An unreadable status classifies transient, matching the "anything not recognised is transient" convention.
+
+**Still untested under load.** Nine 429s stand in the dev attempts tables and no new ones have arrived, because both rebuild phases ran at `--max-concurrent 2` — the setting that avoided provoking them in the first place. The backoff has therefore been fixed but never exercised: not once has it caught a real 429 and slept. See the follow-up under Tooling for the cheap way to find out.
 
 **The `api_core` tuples stay.** They are not dead: `google-cloud-storage` genuinely raises them, which is why `videos_downloader.py` is correct as written and was never affected. The two-family handling is deliberate, not redundancy to simplify away.
 
@@ -827,13 +892,34 @@ Happy-path validation for Phase 4 was a manual exhaustive CLI run across a full 
 
 `stack_size` and `pot_size_bb` are expressed in big blinds, so the same chips give a smaller number after a level increase and values are not comparable across levels. The broadcast displays no blind level, ante or level clock anywhere on screen, so the level is not observable and can only be inferred.
 
-It can be inferred, though. Summing `stack_size` across players and adding `pot_size_bb` gives a total identical between consecutive `hand_setups` rows to within ±0.2%, across all 64 corpus pairs including seat-count changes from bust-outs. `stack_size` is recorded before forced contributions leave the seats, which is why the pot must be added back. Four pairs depart — at t=585, 1203, 1779 and 2409, roughly every ten minutes, which is a level clock. The distribution is sharply bimodal: same-level pairs at 1.000 ± 0.002, level changes at ≥ 1.14, a gap of about 70× the noise floor.
+It can be inferred, though. Summing `stack_size` across players and adding `pot_size_bb` gives a total identical between consecutive `hand_setups` rows to within ±0.2%, including across seat-count changes from bust-outs. `stack_size` is recorded before forced contributions leave the seats, which is why the pot must be added back. Four pairs depart, roughly every ten minutes, which is a level clock. The distribution is sharply bimodal: same-level pairs at 1.000 ± 0.002, level changes at ≥ 1.14, a gap of about 70× the noise floor.
+
+Recomputed on the rebuilt 63 rows the result survives re-detection, which is a stability finding in its own right: **the same four level boundaries reappear**, between t=584/668, 1203/1239, 1779/1915 and 2409/2495 — the earlier row of each pair having shifted a second under jitter — and 56 of the 62 pairs sit within ±0.2%, max deviation 0.002 exactly.
+
+The two remaining pairs are new and are not a level change. Chips go 71.84 → 72.27 → 71.84 entering and leaving `_012_003` at t=2751, an excursion of ±0.6% that goes up and comes straight back where a level change is a step. That is the phantom seat's 0.38 bb stack appearing and disappearing.
+
+### Phantom seats and the checks that find them
+
+A phantom seat is a `hand_setups` row declaring one more player than the table holds. Three of the rebuilt 63 rows carry one: `_005_005` (SB), `_009_005` (CO) and `_012_003` (CO). Two read null for `stack_size`, `bounty` and hole cards alike, and Phase 4's null-stack precondition filters them to `complete_skipped` — which is why the class was originally recorded as two separate defects, an "all-null stack read" and a "phantom seat." They are the same thing. `_012_003`'s extra seat reports `stack_size = 0.38` with a null bounty, passes the precondition, and Phase 4 processed the hand `complete`.
+
+Two things found it, neither of which was designed for it and neither of which needs a schema change:
+
+- **Seat count is non-increasing within a video.** Players bust; they do not rejoin. Comparing the player count against `LAG` over `hand_setup_time_seconds` returns five violations across the whole corpus — the three above, plus `YzKyFMQ1avU_009_001` and `YzKyFMQ1avU_012_006` in a video Phase 4 has not yet touched. One window function on one stage table, no join, no LLM. It catches all three kinds.
+- **Chip conservation** catches only `_012_003`, and only because its phantom carries a non-null stack — which is precisely the kind the null-stack precondition misses. The two are complementary rather than redundant: the precondition catches the null phantoms before any LLM call, conservation catches the non-null one after the fact, and nothing catches the non-null one *before* it is processed.
+
+The bounty multiset invariant (see "Per-seat bounty capture") stayed clean through all three, because a null bounty drops out of the aggregate and the remainder matches the neighbours. That is corroboration rather than a miss: it says the phantom is an extra seat, not a misread of a real one.
+
+**An observation, not a claim: 0.38 has now appeared twice as a spurious value.** `_011_002` records `pot_size_bb = 0.38` where 1.88 is expected (see "What `check_preconditions` is for"), and `_012_003`'s phantom seat reports `stack_size = 0.38`. Different fields, different rows, different runs. Almost certainly coincidence, and two instances is nothing. But if 0.38 turns out to be something rendered on screen that the model occasionally latches onto, that is a lead worth having already written down — and noting it costs nothing. A third sighting in any field is the point at which it stops being a coincidence.
+
+None of this is built. It is recorded because the checks are cheap and the second video already has two instances waiting.
 
 ### Observed extraction errors
 
-Errors cluster in card reading, not action tracking. **Action data has been correct in every hand examined**, across both the PoC and the dev corpus.
+Errors cluster in card reading, not action tracking. **Action data has been correct in every hand examined**, across both the PoC and the dev corpus — with one counterexample, and a caveat that probably preserves the claim.
 
-**Hole-card errors are suit errors.** Two were found by spot-check across 60 hands: `MPBLfM4mwfE_002_002_001` recorded `AsJc` for an actual `AcJc`, and `MPBLfM4mwfE_009_004_001` recorded `Ah7s` for `Ad7s`. Rank was correct both times, and the seats' screen positions differed, so location is not the cause. Both are the four-colour-deck confusions `extract_hole_cards.md` explicitly warns about — clubs/spades and diamonds/hearts.
+The counterexample is `MPBLfM4mwfE_008_004`, whose pre-rebuild record put the BTN all-in for their exact stack where the truth is a raise to 2.0 (see "Retry caps"). It is the first observed action-data error. But it sits on a clip-boundary fragment — a record that should not have been produced at all, extracted from a five-second window that does not contain the action it purports to describe. The claim very likely still holds for legitimately-detected hands. It is no longer unqualified, and the qualification is about *which rows exist*, not about action extraction.
+
+**Hole-card errors are suit errors.** Two were found by spot-check across the original run's 60 hands: `MPBLfM4mwfE_002_002_001` recorded `AsJc` for an actual `AcJc`, and `MPBLfM4mwfE_009_004_001` recorded `Ah7s` for `Ad7s`. Rank was correct both times, and the seats' screen positions differed, so location is not the cause. Both are the four-colour-deck confusions `extract_hole_cards.md` explicitly warns about — clubs/spades and diamonds/hearts.
 
 Consequence depends entirely on the hand. `_002_002_001` ended preflop, so the wrong suit never collides with anything and the record stays useful. `_009_004_001`'s `Ah` also appears on the flop, correctly recorded — an impossible duplicate, and the hand is unusable.
 
@@ -860,6 +946,9 @@ Not blocking any current phase, but accumulated as the project has grown.
 ### Tooling
 
 - **Cross-phase content staleness is undetected** — the residual half of the reprocessing cascade gap, now that `tt mark-pending` has closed the orphan and stale-row halves. A `hand_setup_id` that survives re-detection at a shifted moment leaves downstream rows describing a different hand, with no orphan and reconciling counts. The eventual answer is a content hash of the upstream row stored downstream, making a mismatch a one-column comparison — a schema change to two tables. **Spike the cheaper option first:** `hand_start_state.hand_setup` is already a verbatim copy of the parent blob, so a `TO_JSON_STRING` comparison may detect this today with no schema change, if BigQuery's JSON normalisation is consistent enough to make equal blobs compare equal. Two queries answer it: one same-row comparison that should return no differences, and one cross-row that should return differences. A spike, not a spec.
+- **Detection variance is quantified but not addressed** — roughly 5% of legitimate hands differ between two Phase 3 runs on identical input, in both directions, with nothing in the pipeline able to see it. See "Detection is not deterministic." Two pieces of work, in order. First the **open question**: are the misses random or systematic? A detector that loses a *kind* of hand biases every aggregate, where random misses only cost precision, and this bears directly on Phase 6's analytical premise — it decides whether the corpus can be read as a census at all. Answering it needs a third and fourth detection pass on one video and a look at what the differing hands have in common, not new machinery. Then the **cheap mitigation**: union across two detection passes, at the cost of the clip-mode calls only. It needs a cross-run dedup rule, and that rule is proximity in time — the same signal the clip-boundary duplicate below needs, which is an argument for doing them together.
+- **429 backoff is untested at default concurrency** — the fix is in and correct by inspection, but every run since has been at `--max-concurrent 2`, which avoids provoking 429s at all. Exercise it at the default of 4 against `YzKyFMQ1avU`, which has 45 unprocessed `hand_setups` and nothing depending on them, and confirm a 429 is absorbed rather than surfaced.
+- **Seat-count monotonicity is an unbuilt check with known hits** — the player count in `hand_setups` must not increase over `hand_setup_time_seconds` within a video. One window function on one stage table, and it already finds five phantom seats across the corpus, two of them in `YzKyFMQ1avU`. See "Phantom seats and the checks that find them" for why the null-stack precondition does not cover it.
 - **Ruff baseline** — 189 errors across `src/`, `tests/` and `scripts/`, 164 of them E501 against the configured 100-char limit and the rest auto-fixable imports plus two decorative unused mocks. Ruff is not in CI, which is why they accumulated. With that many standing errors a new one is invisible.
 - **Notebook reproduction harnesses are untracked** — `*.ipynb` is gitignored, while `jupyterlab`, `ipykernel` and `pillow` are dev dependencies precisely because CLAUDE.md's regression guard for prompts is notebook reproduction. The harnesses themselves are not versioned, so each investigation rebuilds them.
 
@@ -874,7 +963,9 @@ Not blocking any current phase, but accumulated as the project has grown.
 - **`_bq_param_type` narrowness** — `bq_param_type` handles `str`, `int`, and `dict`; REPEATED columns are handled separately via `ArrayQueryParameter` in `hand_starts_writer`. A `FLOAT64`, `BOOL`, or `BYTES` column would make this live. Note `bool` is a subclass of `int` and must be checked first if added.
 - **`status_message` truncation** — the 500-char limit can cut off ffmpeg or Gemini error detail before the useful tail. Either raise the limit or extract the tail.
 - **`status_message` description typo** in `schemas/clip_processing_attempts.json` ("reason.NULL" missing a space).
-- **Phase 3 re-detects an in-progress hand at the start of the next clip** — a hand a few seconds old still matches the hand-setup criteria, so Phase 3 writes a second `hand_setups` row for the same poker hand just after a clip boundary. The duplicate collapses the earlier row's Phase 4 LEAD window (down to one and five seconds in the two corpus instances, see "Retry caps") and adds a duplicate hand to the corpus — two of `MPBLfM4mwfE`'s 65 `hand_setups` rows are such fragments. The fix belongs in Phase 3 or Phase 2: suppress detections in the first few seconds of a clip, or deduplicate across clip boundaries. Deduplication cannot key on matching state, since the duplicate rows carry different stack snapshots a second apart; proximity in time across a clip boundary is the only usable signal. The failure mode is worse downstream than upstream — Phase 4 degrades visibly, as a failure, while a phase that needs the whole hand would see the fragment as a hand that ended early, a silent wrong answer rather than a loud one.
+- **Phase 3 re-detects an in-progress hand at the start of the next clip** — a hand a few seconds old still matches the hand-setup criteria, so Phase 3 writes a second `hand_setups` row for the same poker hand just after a clip boundary. The duplicate collapses the earlier row's Phase 4 LEAD window (down to one and five seconds in the two corpus instances, see "Retry caps") and adds a duplicate hand to the corpus — two of `MPBLfM4mwfE`'s original 65 `hand_setups` rows were such fragments, and one of the two survived re-detection into the rebuilt 63. The fix belongs in Phase 3 or Phase 2: suppress detections in the first few seconds of a clip, or deduplicate across clip boundaries. Deduplication cannot key on matching state, since the duplicate rows carry different stack snapshots a second apart; proximity in time across a clip boundary is the only usable signal. The failure mode is worse downstream than upstream — Phase 4 degrades visibly, as a failure, while a phase that needs the whole hand would see the fragment as a hand that ended early, a silent wrong answer rather than a loud one.
+
+  **Amended: the silent wrong answer already happens, in Phase 4.** `_008_004` completed on a five-second fragment window and wrote a confident, internally consistent, wrong `hand_starts` row (see "Retry caps"). A truncated window fabricates as readily as it fails, so this is not a risk deferred to a future assembly phase; it is present behaviour, and it raises the item's priority. It is also the same problem as the detection variance above — over-detection and under-detection are one reliability question and probably one piece of work — with the note that in this sample under-detection is roughly twice as frequent as over-detection.
 
 ### Cleanup
 
