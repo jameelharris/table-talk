@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import subprocess
 import tempfile
@@ -360,6 +361,51 @@ def test_usage_logged_before_parse_failure(capsys):
     assert "gemini_usage " in line
     assert "label=step_d" in line
     assert "total_tokens=1540" in line
+
+
+# --- model configuration tests ---
+
+
+def _load_fresh_module():
+    """Import gemini_caller into a fresh module object, re-reading the env.
+
+    _MODEL is resolved at import, so the env var has to be set before the
+    module body runs. A plain importlib.reload would rebind the exception
+    classes in sys.modules, leaving the ones this file imported at collection
+    time no longer identical to the ones the module raises.
+    """
+    spec = importlib.util.find_spec("table_talk.gemini_caller")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_model_defaults_when_env_unset(monkeypatch):
+    monkeypatch.delenv("TT_GEMINI_MODEL", raising=False)
+
+    assert _load_fresh_module()._MODEL == "gemini-2.5-pro"
+
+
+def test_env_var_sets_both_request_model_and_usage_log(monkeypatch, capsys):
+    # The usage line is the only record of which model produced a corpus, so
+    # it has to follow the same source as the request itself.
+    monkeypatch.setenv("TT_GEMINI_MODEL", "gemini-3.7-flash")
+    module = _load_fresh_module()
+
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        module.call_gemini_for_clip(
+            prompt=PROMPT,
+            video_gcs_uri=VIDEO_URI,
+            start_offset_seconds=10,
+            end_offset_seconds=50,
+            project_id=PROJECT,
+            user_text=USER_TEXT,
+        )
+
+    kw = mock_client_inst.models.generate_content.call_args.kwargs
+    assert kw["model"] == "gemini-3.7-flash"
+    assert "model=gemini-3.7-flash" in capsys.readouterr().err
 
 
 # --- happy path tests ---

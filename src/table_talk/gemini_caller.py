@@ -14,6 +14,7 @@
 # ClientError spans 429 and 400 alike.
 
 import json
+import os
 import random
 import re
 import sys
@@ -24,7 +25,7 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
-_MODEL = "gemini-2.5-pro"
+_MODEL = os.environ.get("TT_GEMINI_MODEL", "gemini-2.5-pro")
 
 _RETRY_MAX_ATTEMPTS = 5
 _RETRY_BASE_DELAY_SECONDS = 5.0

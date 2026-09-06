@@ -341,7 +341,7 @@ Picks up pending clips from `clip_manifest`, downloads the source video to a per
 - `videos_downloader.py` — GCS-to-local download (done once per video, reused across clips); raises `DownloadPermanentError` on GCS 404
 - `frame_extractor.py` — ffmpeg subprocess wrapper; sharpness/saturation filters match the notebook's image-quality settings; accepts `float | int` timestamps
 - `frame_uploader.py` — GCS frame upload
-- `gemini_caller.py` — Vertex AI Gemini Pro caller (clip-mode video + frame-mode image), with truncated exponential backoff retry on HTTP 429: 5 attempts, full jitter, delays capped at 60s. The retry and the transient/permanent split key on the **status code** across both exception families the stack raises — `google.genai.errors.APIError` and `google.api_core.exceptions` — never on the exception class; see "The 429 backoff that never fired." `user_text` is required on both callers so no phase can silently inherit another's user turn.
+- `gemini_caller.py` — Vertex AI Gemini Pro caller (clip-mode video + frame-mode image), with truncated exponential backoff retry on HTTP 429: 5 attempts, full jitter, delays capped at 60s. The retry and the transient/permanent split key on the **status code** across both exception families the stack raises — `google.genai.errors.APIError` and `google.api_core.exceptions` — never on the exception class; see "The 429 backoff that never fired." `user_text` is required on both callers so no phase can silently inherit another's user turn. The model is set by `TT_GEMINI_MODEL`, read once at import and defaulting to `gemini-2.5-pro`; the `gemini_usage` line reports whichever model was used.
 - `hand_setups_writer.py` — `hand_setups` table writes (batched DML with replace semantics keyed on `clip_id`; JSON column passed as `dict` directly to `ScalarQueryParameter(type="JSON")` — single-encoded)
 - `seat_enrichment.py` — deterministic `SEAT_NUMBER_MAP` (BB=1, SB=2, BTN=3, CO=4, HJ=5, LJ=6, UTG+2=7, UTG+1=8, UTG=9); `add_seat_numbers` injects + sorts players; `normalize_heads_up` rewrites SB→BTN when `total_seat_count == 2`
 - `clip_processing_attempts_writer.py` — `clip_processing_attempts` state table writes
@@ -790,7 +790,7 @@ Validity belongs in the DBT layer, where a failed check is recomputable rather t
 
 ### Cost instrumentation
 
-Both `gemini_caller` functions emit one line per call to stderr — model, an optional caller-supplied label, and the prompt, candidate and total token counts. Grep with `gemini_usage`.
+Both `gemini_caller` functions emit one line per call to stderr — model, an optional caller-supplied label, and the prompt, candidate and total token counts. Grep with `gemini_usage`. `model=` is the resolved `TT_GEMINI_MODEL` value rather than a constant, so a corpus can be attributed to a model after the fact.
 
 Logging happens *before* `_parse_and_validate`, because a response that fails validation — MAX_TOKENS, SAFETY, malformed JSON — is still a billed call, and those are exactly the ones whose cost would otherwise vanish.
 
