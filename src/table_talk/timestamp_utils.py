@@ -14,3 +14,18 @@ def parse_timestamp(s: str) -> int:
     if len(values) == 2:
         return values[0] * 60 + values[1]
     return values[0] * 3600 + values[1] * 60 + values[2]
+
+
+def format_timestamp(seconds: int) -> str:
+    """Convert integer seconds to 'MM:SS', or 'HH:MM:SS' at or beyond an hour.
+
+    The inverse of parse_timestamp over the range it produces, and the format
+    the clip prompts already specify for the timestamps they return.
+    """
+    if seconds < 0:
+        raise ValueError(f"Negative seconds: {seconds!r}")
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"

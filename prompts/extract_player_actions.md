@@ -26,10 +26,10 @@ The first voluntary chip commitment for this hand has been identified:
 
 {fva_context}
 
-This is action_order 1 on the preflop street. When you observe
-this action in the clip, you have found your starting point.
-Record it as action_order 1 and continue recording all subsequent
-actions from action_order 2 onwards.
+This action occurs at the timestamp given above. Begin recording
+there — it is action_order 1 on the preflop street. Do not record
+any action that precedes it, including folds. Continue recording
+all subsequent actions from action_order 2 onwards.
 
 # SCANNING INSTRUCTIONS
 

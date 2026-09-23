@@ -10,6 +10,8 @@
 #
 # build_fva_context had no caller between the step-C stack-anchor fix and Phase 5;
 # extract_player_actions.md uses it again to establish that the FVA is action_order 1.
+# Its timestamp line is the anchor that prompt tells the model to begin recording at,
+# so the 'Occurs at:' wording is load-bearing on both sides of the slot.
 
 from table_talk.prompt_context import (
     build_action_context,
@@ -62,7 +64,22 @@ def test_build_player_context_multiple_players():
 
 def test_build_fva_context():
     fva = {"seat_number": 9, "seat_position_label": "UTG", "action_type": "all_in", "bet_amount": 5.98}
-    assert build_fva_context(fva) == "Seat 9 (UTG)\nAction: all_in 5.98 BB"
+    assert build_fva_context(fva, 2359) == (
+        "Seat 9 (UTG)\n"
+        "Action: all_in 5.98 BB\n"
+        "Occurs at: 39:19 (2359s, absolute broadcast time)"
+    )
+
+
+def test_build_fva_context_past_an_hour_uses_hh_mm_ss():
+    # Broadcasts run well past an hour, so this is the common case in the
+    # corpus rather than an edge one.
+    fva = {"seat_number": 2, "seat_position_label": "SB", "action_type": "call", "bet_amount": 1.0}
+    assert build_fva_context(fva, 5006) == (
+        "Seat 2 (SB)\n"
+        "Action: call 1.0 BB\n"
+        "Occurs at: 01:23:26 (5006s, absolute broadcast time)"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -473,7 +473,10 @@ async def process_hand_start(
         filled_actions_prompt = (
             extract_player_actions_prompt
             .replace("{player_context}", build_action_context(hs.hand_start_state))
-            .replace("{fva_context}", build_fva_context(hs.hand_start_state["fva"]))
+            .replace(
+                "{fva_context}",
+                build_fva_context(hs.hand_start_state["fva"], hs.fva_time_seconds),
+            )
         )
         d_result = await asyncio.to_thread(
             call_gemini_for_clip,

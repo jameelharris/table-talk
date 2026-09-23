@@ -391,7 +391,11 @@ def test_step_d_receives_window_prompts_and_label():
     assert "{player_context}" not in filled_prompt
     assert "{fva_context}" not in filled_prompt
     assert "Hole cards: Ah Kd" in filled_prompt
-    assert "Seat 4 (CO)" in filled_prompt
+    # The FVA line specifically, not just "Seat 4 (CO)" — that substring also
+    # matches the player-context line and so would pass on an empty fva slot.
+    assert "Seat 4 (CO)\nAction: raise 2.5 BB\n" in filled_prompt
+    # The anchor the prompt tells the model to begin recording at.
+    assert "Occurs at: 01:45 (105s, absolute broadcast time)" in filled_prompt
 
 
 def test_full_river_hand_issues_one_d_call_and_six_e_calls():

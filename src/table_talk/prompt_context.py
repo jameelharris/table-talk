@@ -1,3 +1,6 @@
+from .timestamp_utils import format_timestamp
+
+
 def build_player_context(hand_setup_state: dict) -> str:
     lines = []
     for p in hand_setup_state.get("players", []):
@@ -7,10 +10,23 @@ def build_player_context(hand_setup_state: dict) -> str:
     return "\n".join(lines)
 
 
-def build_fva_context(fva_data: dict) -> str:
+def build_fva_context(fva_data: dict, fva_time_seconds: int) -> str:
+    # The timestamp is the anchor; the seat/action lines above it are
+    # corroboration. Phase 4 has already located the FVA, so step D is handed
+    # the position rather than asked to re-derive it by matching a description
+    # across a window that can run a minute or more. Two prompts answering the
+    # same question is an invitation to disagree — and step D disagreed, opening
+    # preflop with a fold that precedes the FVA.
+    #
+    # Video-absolute, per schemas/hand_starts.json: "Offset from start of source
+    # video (not from start of clip)". Both forms are emitted — MM:SS is the
+    # vocabulary every clip prompt uses for the timestamps it returns, and the
+    # raw seconds are unambiguous if the colonned form is read as clip-relative.
     return (
         f"Seat {fva_data.get('seat_number')} ({fva_data.get('seat_position_label')})\n"
-        f"Action: {fva_data.get('action_type')} {fva_data.get('bet_amount')} BB"
+        f"Action: {fva_data.get('action_type')} {fva_data.get('bet_amount')} BB\n"
+        f"Occurs at: {format_timestamp(fva_time_seconds)} "
+        f"({fva_time_seconds}s, absolute broadcast time)"
     )
 
 
