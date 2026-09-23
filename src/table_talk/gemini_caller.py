@@ -25,7 +25,12 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
-_MODEL = os.environ.get("TT_GEMINI_MODEL", "gemini-2.5-pro")
+# One model per call mode: a comparison over MPBLfM4mwfE found Pro better at
+# clip-mode video scans and Flash better at frame reads. Read once at import,
+# because a model changing mid-run would leave the corpus with no record of
+# which row came from which. The names are vendor-neutral on purpose.
+_CLIP_MODEL = os.environ.get("TT_CLIP_MODEL", "gemini-2.5-pro")
+_FRAME_MODEL = os.environ.get("TT_FRAME_MODEL", "gemini-3.8-flash")
 
 _RETRY_MAX_ATTEMPTS = 5
 _RETRY_BASE_DELAY_SECONDS = 5.0
@@ -122,7 +127,7 @@ def _call_with_retry(fn):
             time.sleep(random.uniform(0, cap_delay))
 
 
-def _log_usage(response, label: str | None) -> None:
+def _log_usage(response, label: str | None, model: str) -> None:
     """Emit one greppable stderr line of token counts for a completed call.
 
     Phase 5 costs up to 7 calls per hand, so per-call token counts are what
@@ -131,6 +136,10 @@ def _log_usage(response, label: str | None) -> None:
     Called before _parse_and_validate, so a response that fails validation
     (MAX_TOKENS, SAFETY, malformed JSON) still reports what it consumed —
     those calls are billed too.
+
+    `model` is passed in rather than read from a module constant: with one
+    constant per call mode there is no single right answer here, and guessing
+    would mislabel every row's provenance.
     """
     usage = getattr(response, "usage_metadata", None)
     if usage is None:
@@ -140,7 +149,7 @@ def _log_usage(response, label: str | None) -> None:
         "candidates_tokens": getattr(usage, "candidates_token_count", None),
         "total_tokens": getattr(usage, "total_token_count", None),
     }
-    fields = [f"gemini_usage model={_MODEL}"]
+    fields = [f"gemini_usage model={model}"]
     if label is not None:
         fields.append(f"label={label}")
     fields += [f"{k}={v}" for k, v in counts.items() if v is not None]
@@ -213,7 +222,7 @@ def call_gemini_for_clip(
     try:
         response = _call_with_retry(
             lambda: client.models.generate_content(
-                model=_MODEL,
+                model=_CLIP_MODEL,
                 config=types.GenerateContentConfig(system_instruction=prompt),
                 contents=request_contents,
             )
@@ -227,7 +236,7 @@ def call_gemini_for_clip(
     except genai_errors.APIError as exc:
         raise _classify_genai_error(exc) from exc
 
-    _log_usage(response, label)
+    _log_usage(response, label, _CLIP_MODEL)
     return _parse_and_validate(response)
 
 
@@ -250,7 +259,7 @@ def call_gemini_for_frame(
     try:
         response = _call_with_retry(
             lambda: client.models.generate_content(
-                model=_MODEL,
+                model=_FRAME_MODEL,
                 config=types.GenerateContentConfig(
                     system_instruction=prompt,
                     media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
@@ -267,5 +276,5 @@ def call_gemini_for_frame(
     except genai_errors.APIError as exc:
         raise _classify_genai_error(exc) from exc
 
-    _log_usage(response, label)
+    _log_usage(response, label, _FRAME_MODEL)
     return _parse_and_validate(response)

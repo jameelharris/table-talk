@@ -76,13 +76,15 @@ The window between first voluntary chip commitment and second action timestamps 
 
 The bet_amount is the total chips the FIRST voluntary actor has committed AT THE MOMENT of their first voluntary commitment — not a later action, not the largest bet in the hand. Read the chips in front of THAT specific seat at THAT moment, denominated in big blinds (BB).
 
+For a seat that posted a blind, the blind is part of that reading, because it is already in front of them. An SB that shoves reports its displayed stack plus 0.5; a BB that shoves reports its displayed stack plus 1.
+
 - Read only the chips in front of the first voluntary actor's seat
 - Read them at the moment of their first voluntary commitment, not later
 - If the first voluntary action is a limp or call, the amount is typically 1 BB — do NOT report a later raise's larger amount
 - If you find yourself about to report a bet larger than the first voluntary commitment, you have advanced too far in time; return to the first moment chips were voluntarily committed and read THAT amount
 - Do not read the pot total
 - Do not read another seat's chips
-- Do not read the blind amount
+- Do not report a forced blind on its own as the bet amount — a seat showing only its blind has not committed voluntarily
 
 CORRECT (BB-denominated): 2.09, 6.5, 13.6, 43.7
 WRONG (chip-denominated): 1087500, 3375000, 7050000, 22700568
@@ -94,8 +96,10 @@ If bet_amount is larger than 200 you are almost certainly reading the wrong numb
 Determine action_type from the first voluntary actor's committed amount relative to the current bet facing them at the moment they act:
 
 - If the amount matches the largest amount already committed (1 BB preflop when no one has raised) → call
-- If the amount exceeds that and is less than the player's full stack → raise
-- If the amount equals the player's full remaining stack → all_in
+- If the amount exceeds that and is less than everything the player can commit → raise
+- If the amount equals everything the player can commit → all_in
+
+Stack sizes in the player context are already net of blinds and antes. So a blind-position seat is all-in when the amount equals its displayed stack PLUS its blind; any other seat is all-in when the amount equals its displayed stack.
 
 Derive action_type from the FVA's own chip amount at the moment of their commitment — not from a later action, and not from action labels.
 

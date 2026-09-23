@@ -8,13 +8,15 @@ The following players are active in this hand. This data is authoritative:
 
 {player_context}
 
-Stack sizes are as of the hand setup moment, before any voluntary action. They decrease as players commit chips, so they are not live seat identifiers — use seat number and hole cards for identification, and treat the listed stack as each player's starting chips for this hand.
+Stack sizes are as of the hand setup moment. Blinds and antes have ALREADY been deducted from these figures — a BB showing 14.5 has posted its 1 BB and holds 14.5 behind it. They decrease further as players commit chips, so they are not live seat identifiers — use seat number and hole cards for identification, and treat the listed stack as each player's starting chips for this hand.
+
+A blind-position player is all-in when the chips in front of them equal their displayed stack plus their blind. Any other player is all-in when the chips in front of them equal their displayed stack.
 
 Use this context to:
 - Attribute each action to the correct seat_position_label
 - Determine whether a bet constitutes an all_in by comparing the
-  committed amount to the player's remaining chips — the listed
-  stack minus whatever they have already committed this hand
+  committed amount to the player's remaining chips, using the rule
+  stated above
 - Cross-reference hole cards to confirm which player is acting
 - Determine correct action order using seat numbers
 
@@ -55,8 +57,10 @@ display amount as the primary signal for action_type:
 - Compare the committed chip amount to the previous bet to
   determine call vs raise
 - Compare the committed chip amount to the player's remaining
-  chips to determine all_in — the listed stack minus whatever
-  they have already committed this hand
+  chips to determine all_in. Remaining chips are the listed stack
+  minus anything committed in earlier VOLUNTARY actions this hand.
+  The blind is not subtracted, because it was already deducted
+  from the listed stack.
 - A disappearing hand of cards indicates fold
 - No chips committed and action passing indicates check
 
@@ -67,6 +71,31 @@ Preflop: action starts with the highest occupied seat number and moves clockwise
 Postflop: action always starts with SB (seat 2) and moves clockwise through active players to the highest occupied seat.
 
 # WHAT COUNTS AS A VOLUNTARY ACTION
+
+`bet_amount` is the player's TOTAL chips in front of them on that street after
+the action — not the chips this action alone moved. For a seat that posted a
+blind, the blind is part of that total, because it is already in front of them.
+
+Fold and check are always 0.0, even for a seat with a blind posted.
+
+Antes are excluded. They leave the seat and are not committed in front of it.
+
+Displayed stacks are already net of the blind, so a blind-position player's
+total is their displayed stack plus their blind when they commit everything.
+
+Worked examples, all with an SB whose displayed stack reads 9.2 and who has
+0.5 already posted:
+
+  raises to 3.8        -> bet_amount 3.8   (3.3 more leaves the seat, 5.9 remains)
+  calls a raise to 2.1 -> bet_amount 2.1   (1.6 more leaves the seat, 7.6 remains)
+  moves all-in         -> bet_amount 9.7   (9.2 leaves the seat, 0 remains)
+  folds                -> bet_amount 0.0   (the 0.5 posted is not recorded)
+
+These figures are illustrative and do not correspond to any real hand. Read the
+actual chip amounts from the clip; never carry a number over from this example.
+
+The same rule applies to the BB with its 1 BB posted, and to every other seat
+with nothing posted — for them the total simply equals what they committed.
 
 Record these actions:
 - Fold — player's cards disappear
@@ -97,12 +126,13 @@ The distinguishing question is not "was anyone all-in?" It is "did two or more
 players still have live cards after the last action?" If only one player is
 left, the hand is over.
 
-Example — hand ends preflop, do NOT record flop/turn/river:
+Example — hand ends preflop, do NOT record flop/turn/river. The SB's displayed
+stack reads 58.0 and it has 0.5 already posted, so its total is 58.5:
 
 {
   "street_name": "preflop",
   "actions": [
-    {"action_order": 1, "seat_position_label": "SB", "action_type": "all_in", "bet_amount": 58.0},
+    {"action_order": 1, "seat_position_label": "SB", "action_type": "all_in", "bet_amount": 58.5},
     {"action_order": 2, "seat_position_label": "BB", "action_type": "fold", "bet_amount": 0.0}
   ]
 }
@@ -305,7 +335,9 @@ Example 7 — Turn all-in called, river runs out:
   "winning_positions": ["SB"]
 }
 
-Example 8 — 3-handed, one player all-in preflop, two players compete on subsequent streets:
+Example 8 — 3-handed, one player all-in preflop, two players compete on subsequent
+streets. The SB's displayed stack reads 6.0 and it has 0.5 already posted, so its
+total is 6.5:
 {
   "streets": [
     {
@@ -344,13 +376,14 @@ Example 8 — 3-handed, one player all-in preflop, two players compete on subseq
 }
 
 Example 9 — Uncalled all-in ends the hand, 5 players. No cards are dealt,
-so no further streets are recorded:
+so no further streets are recorded. The SB's displayed stack reads 58.0 and it
+has 0.5 already posted, so its total is 58.5:
 {
   "streets": [
     {
       "street_name": "preflop",
       "actions": [
-        {"action_order": 1, "seat_position_label": "SB", "action_type": "all_in", "bet_amount": 58.0},
+        {"action_order": 1, "seat_position_label": "SB", "action_type": "all_in", "bet_amount": 58.5},
         {"action_order": 2, "seat_position_label": "BB", "action_type": "fold", "bet_amount": 0.0}
       ]
     }

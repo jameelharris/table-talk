@@ -341,7 +341,7 @@ Picks up pending clips from `clip_manifest`, downloads the source video to a per
 - `videos_downloader.py` — GCS-to-local download (done once per video, reused across clips); raises `DownloadPermanentError` on GCS 404
 - `frame_extractor.py` — ffmpeg subprocess wrapper; sharpness/saturation filters match the notebook's image-quality settings; accepts `float | int` timestamps
 - `frame_uploader.py` — GCS frame upload
-- `gemini_caller.py` — Vertex AI Gemini Pro caller (clip-mode video + frame-mode image), with truncated exponential backoff retry on HTTP 429: 5 attempts, full jitter, delays capped at 60s. The retry and the transient/permanent split key on the **status code** across both exception families the stack raises — `google.genai.errors.APIError` and `google.api_core.exceptions` — never on the exception class; see "The 429 backoff that never fired." `user_text` is required on both callers so no phase can silently inherit another's user turn. The model is set by `TT_GEMINI_MODEL`, read once at import and defaulting to `gemini-2.5-pro`; the `gemini_usage` line reports whichever model was used.
+- `gemini_caller.py` — Vertex AI Gemini caller (clip-mode video + frame-mode image), with truncated exponential backoff retry on HTTP 429: 5 attempts, full jitter, delays capped at 60s. The retry and the transient/permanent split key on the **status code** across both exception families the stack raises — `google.genai.errors.APIError` and `google.api_core.exceptions` — never on the exception class; see "The 429 backoff that never fired." `user_text` is required on both callers so no phase can silently inherit another's user turn. The model is set per call mode, each read once at import: `TT_CLIP_MODEL` (default `gemini-2.5-pro`) for `call_gemini_for_clip`, `TT_FRAME_MODEL` (default `gemini-3.8-flash`) for `call_gemini_for_frame` — see "Model selection is per call mode." Neither caller takes a model argument; the `gemini_usage` line is passed the model that ran rather than reading a constant.
 - `hand_setups_writer.py` — `hand_setups` table writes (batched DML with replace semantics keyed on `clip_id`; JSON column passed as `dict` directly to `ScalarQueryParameter(type="JSON")` — single-encoded)
 - `seat_enrichment.py` — deterministic `SEAT_NUMBER_MAP` (BB=1, SB=2, BTN=3, CO=4, HJ=5, LJ=6, UTG+2=7, UTG+1=8, UTG=9); `add_seat_numbers` injects + sorts players; `normalize_heads_up` rewrites SB→BTN when `total_seat_count == 2`
 - `clip_processing_attempts_writer.py` — `clip_processing_attempts` state table writes
@@ -790,9 +790,31 @@ Validity belongs in the DBT layer, where a failed check is recomputable rather t
 
 ### Cost instrumentation
 
-Both `gemini_caller` functions emit one line per call to stderr — model, an optional caller-supplied label, and the prompt, candidate and total token counts. Grep with `gemini_usage`. `model=` is the resolved `TT_GEMINI_MODEL` value rather than a constant, so a corpus can be attributed to a model after the fact.
+Both `gemini_caller` functions emit one line per call to stderr — model, an optional caller-supplied label, and the prompt, candidate and total token counts. Grep with `gemini_usage`. `model=` is the model that actually served *that call*, passed in by the caller rather than read from a constant. Since the model is per call mode, a corpus is a mixture: provenance is per row, not per run, and attributing one means reading the line for each call rather than the run's configuration.
 
 Logging happens *before* `_parse_and_validate`, because a response that fails validation — MAX_TOKENS, SAFETY, malformed JSON — is still a billed call, and those are exactly the ones whose cost would otherwise vanish.
+
+### Model selection is per call mode
+
+`gemini_caller` holds two model constants, not one: `TT_CLIP_MODEL` (default `gemini-2.5-pro`) serves `call_gemini_for_clip`, `TT_FRAME_MODEL` (default `gemini-3.8-flash`) serves `call_gemini_for_frame`. Both are read once at import, so a model cannot change mid-run and leave the corpus with no record of which row came from which. `TT_GEMINI_MODEL`, which set one model for the whole process, is retired rather than kept as a fallback — two mechanisms for one setting is how a run ends up with nobody sure which won.
+
+The names are deliberately vendor-neutral. The values are Gemini ids today, but nothing in the callers' contract requires that to stay true, and a variable named for a vendor would be wrong the first time it isn't.
+
+**The split is by call mode, not by phase, and neither caller takes a model argument.** Both are stateless primitives that do not know which phase invoked them; a parameter would have to be plumbed through five orchestrators for no current benefit. Per-phase or per-step selection is a further step the evidence does not reach.
+
+**What the evidence is.** A full-corpus comparison of `gemini-2.5-pro` against `gemini-3.8-flash` over `MPBLfM4mwfE`, adjudicated against the broadcast wherever the two disagreed.
+
+- **Frame reads — Flash.** 13 of 14 adjudicated disagreements resolved in Flash's favour: two seat-attribution errors, one wrong community card and three phantom seats, all Pro's. Five of five correct on BB-anchor placement where the two Pro runs were 2 and 2. Eight of eight on the blind convention below.
+- **Clip-mode video scans — Pro.** Flash truncated a street on six hands that both Pro runs found — five rivers and one turn. Four were runouts where the cards are analytically inert but still needed for showdown evaluation and duplicate-card detection. **One, t=1320, had betting on the river that Flash therefore dropped entirely** — a lost decision, not a lost card.
+
+**The defaults change behaviour.** An unconfigured run now puts frame reads on Flash, which moves `extract_player_info.md`, `extract_hole_cards.md`, `extract_community_cards_from_frame.md` and `extract_results.md` off Pro. That is the finding rather than a placeholder, but it means an unconfigured run no longer reproduces the corpus built before it.
+
+**This comparison is not conclusive.** One video, one adjudicator, and the disagreement set contains only cases where the two models differed — an error both made identically is invisible to it. It is enough to justify the split and not enough to settle which model is better in general.
+
+**Two findings from adjudicating it, both worth keeping.**
+
+- **t=584 is prompt ambiguity, not a model difference — and it was first recorded as the latter.** Flash read the SB's preflop re-raise as 4.55 and its flop shove as 6.55, against 7 and 4.55 in both stored Pro runs, so it went down as a Flash amount-read error. Re-running Pro against the *old* prompt produced Flash's answer, 4.55/6.55. Neither model is reliably on one side: both pairs are internally consistent against the SB's 11.1 displayed stack — Flash's sums to it exactly, Pro's reconciles under the inclusive blind convention — so no arithmetic check separates them, and the reading moves run to run. The broadcast confirms 7. This belongs to "`bet_amount` includes a posted blind" rather than to this comparison. The general lesson is worth more than the case: **a disagreement between two models can be a disagreement with an ambiguous prompt, read twice.** Attributing one to a model without re-running the other on the same prompt text will sometimes name the wrong cause.
+- **t=2529 is a fourth Pro seat swap.** The Pro rebuild puts the hand's 10.1 stack on SB where the broadcast, Pro run 1 and Flash all say BTN. Same class as the two seat attributions counted above — but it was found by three-way comparison across runs, not by the Pro-vs-Flash disagreement set, which is a concrete instance of the blind spot the caveat above describes.
 
 ### Frames and orphaned GCS objects
 
@@ -888,11 +910,35 @@ The two parked-hand fragments (see "Retry caps") are the counterexample in the o
 
 Happy-path validation for Phase 4 was a manual exhaustive CLI run across a full video, not an automated single-sample integration test. The integration tests prove the plumbing; the corpus run proves the extraction.
 
+### `bet_amount` includes a posted blind
+
+`bet_amount` is the player's **total** chips in front of them on that street after the action, not the chips that action alone moved. For a seat that posted a blind, the blind is part of that total. Antes are not — they leave the seat rather than sitting in front of it. Fold and check stay 0.0 regardless, which is a carve-out the "total in front" wording would otherwise contradict for any blind seat that folds.
+
+The prompts left this open and the corpus carried both answers. `extract_player_actions.md` defined `bet_amount` once as "chip amount committed in BB" and then pointed two ways at once: `# WHAT NOT TO DO` said not to record blind posts, while `# PLAYER CONTEXT` computed all-in from "the listed stack minus whatever they have already committed this hand." Over 49 hands, eight blind-position all-ins differed between two models by exactly that seat's blind and nothing else — one convention question, answered twice.
+
+**Inclusive is the right answer.** Three supports:
+
+- The broadcast at t=772 (12:52): an SB with a displayed stack of 58 moves all-in and the chips in front read 58.5.
+- Displayed stacks are net of forced contributions. `pot_size_bb` at the setup moment is exactly the blinds plus antes — see "BB denomination and chip conservation" — so a seat showing 14.5 has already posted its blind and holds 14.5 behind it.
+- At t=584 the SB re-raises to 7 with 11.1 displayed, then shoves 4.55 on the flop. That reconciles only if the 7 is inclusive: 6.5 more leaves the seat, 4.6 remains, and 4.55 is that within display rounding.
+
+The change was framed as writing down a convention raises already followed, extended to the one action type applying it inconsistently — on the evidence that both stored Pro runs recorded the inclusive 7 at t=584. **Reproduction contradicted that framing.** Pro on the old prompt produced the exclusive 4.55 on the same raise, so the corpus's raise values were not following a settled convention; they were landing on one of two readings, run by run, and the all-ins were only the place it was visible. This cuts both ways. The ambiguity was wider than believed, which strengthens the case for closing it. But it also means the stored corpus cannot be read as a stable baseline for raises, and the t=584 "must not change" control was measuring a stability the old prompt did not have. `identify_hand_start.md` carries the same field in its `fva` block and had the same gap in its all-in rule, so both prompts moved together — Phase 5's FVA cross-check compares preflop `action_order 1` against that block directly, and a split convention would make two correct extractions look like a disagreement.
+
+**The regression guard was reproduction against three stored windows**, per "Validation discipline," run on Pro with the old prompt and the new one against identical input. Two of the three were controls rather than the change. Results:
+
+- **t=772, SB all-in, displayed stack 58** — 58.0 under the old prompt, **58.5** under the new one, twice. The `fva` context was forced back to the old-convention 58 for this call, so the prompt produced 58.5 against an anchor telling it otherwise rather than echoing what it was handed.
+- **t=584, SB raise, displayed stack 11.1** — 4.55 preflop / 6.55 flop under the old prompt, **7.0 / 4.55** under the new one, twice. Intended as a control, it turned out to be a second instance of the change: see the paragraph above.
+- **t=2529, BTN all-in 10.1, nothing posted** — 10.1 under both. A true control, unmoved.
+
+**One methodological finding, worth more than the three results.** The first pass of the new prompt returned 4.6 on t=584's flop where the screen reads 4.55. 4.6 is what `11.1 - 6.5` gives, and the prompt's own worked example read *"an SB whose displayed stack reads 11.1 ... raises to 7 -> 6.5 more leaves the seat, 4.6 remains."* The example had been written from this exact hand, so the check was measuring whether the model could copy the example rather than whether it had understood the definition — and the copied value was arithmetic where the instruction everywhere else in the file is to read the chip display. Rewriting the example with figures absent from the corpus (an SB showing 9.2, raising to 3.8, shoving 9.7) and adding an explicit "never carry a number over from this example" line restored 4.55 on both subsequent runs.
+
+The rule that falls out: **a worked example in a prompt must not reuse the numbers of a hand the guard reproduces**, or the guard tests recall instead of comprehension, and the prompt hands the model an answer it should be reading off the screen. Example 9 still carries t=772's 58/58.5 — it was already in the file, and correcting it from 58.0 was the point of the edit — so check 1 retains exactly this coupling and is weaker evidence than checks 2 and 3 on that account.
+
 ### BB denomination and chip conservation
 
 `stack_size` and `pot_size_bb` are expressed in big blinds, so the same chips give a smaller number after a level increase and values are not comparable across levels. The broadcast displays no blind level, ante or level clock anywhere on screen, so the level is not observable and can only be inferred.
 
-It can be inferred, though. Summing `stack_size` across players and adding `pot_size_bb` gives a total identical between consecutive `hand_setups` rows to within ±0.2%, including across seat-count changes from bust-outs. `stack_size` is recorded before forced contributions leave the seats, which is why the pot must be added back. Four pairs depart, roughly every ten minutes, which is a level clock. The distribution is sharply bimodal: same-level pairs at 1.000 ± 0.002, level changes at ≥ 1.14, a gap of about 70× the noise floor.
+It can be inferred, though. Summing `stack_size` across players and adding `pot_size_bb` gives a total identical between consecutive `hand_setups` rows to within ±0.2%, including across seat-count changes from bust-outs. `stack_size` is recorded *after* forced contributions have left the seats, which is why adding the pot back recovers the table total. At the setup moment `pot_size_bb` holds exactly the forced contributions and nothing else: across all 63 rebuilt rows it equals `0.125 × total_seat_count + 1.5` — the ante per seat plus the two blinds — at every seat count from 9 down to 2. An earlier version of this section had this backwards; the identity only works because the chips have already moved. See "`bet_amount` includes a posted blind," which rests on the same fact. Four pairs depart, roughly every ten minutes, which is a level clock. The distribution is sharply bimodal: same-level pairs at 1.000 ± 0.002, level changes at ≥ 1.14, a gap of about 70× the noise floor.
 
 Recomputed on the rebuilt 63 rows the result survives re-detection, which is a stability finding in its own right: **the same four level boundaries reappear**, between t=584/668, 1203/1239, 1779/1915 and 2409/2495 — the earlier row of each pair having shifted a second under jitter — and 56 of the 62 pairs sit within ±0.2%, max deviation 0.002 exactly.
 
@@ -922,6 +968,14 @@ The counterexample is `MPBLfM4mwfE_008_004`, whose pre-rebuild record put the BT
 **Hole-card errors are suit errors.** Two were found by spot-check across the original run's 60 hands: `MPBLfM4mwfE_002_002_001` recorded `AsJc` for an actual `AcJc`, and `MPBLfM4mwfE_009_004_001` recorded `Ah7s` for `Ad7s`. Rank was correct both times, and the seats' screen positions differed, so location is not the cause. Both are the four-colour-deck confusions `extract_hole_cards.md` explicitly warns about — clubs/spades and diamonds/hearts.
 
 Consequence depends entirely on the hand. `_002_002_001` ended preflop, so the wrong suit never collides with anything and the record stays useful. `_009_004_001`'s `Ah` also appears on the flop, correctly recorded — an impossible duplicate, and the hand is unusable.
+
+### Pre-FVA folds are recorded inconsistently
+
+Two reproductions of the same t=584 window, same prompt, same model, differed in whether the three seats that folded *before* the first voluntary action appeared in the sequence: one run opened with the CO's raise, the other prefixed it with `UTG+2 fold`, `LJ fold`, `HJ fold`. Neither stored corpus run has them.
+
+Both readings are defensible from the prompt as written, which is the problem. `# FIRST VOLUNTARY CHIP COMMITMENT CONTEXT` says the FVA "is action_order 1 on the preflop street ... record it as action_order 1," while `# ACTION ORDER` and the fold-is-a-recordable-action list together imply earlier folds occupy orders 1-3 and push the FVA to 4. Example 9 has the same shape — five players, an SB shove at `action_order 1`, and no folds from the three seats that must have acted before it.
+
+Recorded, not fixed. It was observed during `bet_amount` reproduction and is unrelated to that change; the stakes are low (a fold carries no chips and `winning_positions` is unaffected) but it means preflop `action_order` is not a reliable count of seats that acted, and anything downstream keying off order 1 being the FVA should not assume it. Fixing it means deciding which of the two the schema wants, then reconciling the FVA-context instruction, the ACTION ORDER section and Example 9 in one pass.
 
 ### Manual correction is a sanctioned path
 
