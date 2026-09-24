@@ -74,7 +74,7 @@ def test_clip_request_structure():
     mock_cls.assert_called_once_with(vertexai=True, project=PROJECT, location="us-central1")
 
     kw = mock_client_inst.models.generate_content.call_args.kwargs
-    assert kw["model"] == "gemini-2.5-pro"
+    assert kw["model"] == "gemini-3.8-flash"
 
     contents = kw["contents"]
     assert contents.role == "user"
@@ -290,7 +290,7 @@ def test_usage_line_logged_to_stderr_with_label(capsys):
 
     line = capsys.readouterr().err.strip()
     assert line.startswith("gemini_usage ")
-    assert "model=gemini-2.5-pro" in line
+    assert "model=gemini-3.8-flash" in line
     assert "label=step_d" in line
     assert "prompt_tokens=1200" in line
     assert "candidates_tokens=340" in line
@@ -408,13 +408,16 @@ def _call_clip_on(module, mock_client_inst):
         )
 
 
-def test_model_defaults_split_by_call_mode(monkeypatch):
-    # Pro for clip-mode video scans, Flash for frame reads. The defaults are
-    # the finding, not a placeholder: an unconfigured run is meant to use them.
+def test_model_defaults(monkeypatch):
+    # Both call modes default to the same model today. That is deliberate — the
+    # split is a mechanism for reversing the clip default, not a claim that the
+    # two values differ — so this test cannot tell the constants apart on its
+    # own: it would pass if one caller read the other's constant. The two
+    # env-var isolation tests below are what carry that guarantee.
     _unset_model_env(monkeypatch)
     module = _load_fresh_module()
 
-    assert module._CLIP_MODEL == "gemini-2.5-pro"
+    assert module._CLIP_MODEL == "gemini-3.8-flash"
     assert module._FRAME_MODEL == "gemini-3.8-flash"
 
 
@@ -422,35 +425,40 @@ def test_clip_env_var_sets_request_model_and_usage_log(monkeypatch, capsys):
     # The usage line is the only record of which model produced a corpus, so
     # it has to follow the same source as the request itself.
     _unset_model_env(monkeypatch)
-    monkeypatch.setenv("TT_CLIP_MODEL", "gemini-3.7-flash")
+    monkeypatch.setenv("TT_CLIP_MODEL", "clip-model-under-test")
     module = _load_fresh_module()
 
     mock_client_inst = _patched_client(_make_response('{"ok": true}'))
     _call_clip_on(module, mock_client_inst)
 
     kw = mock_client_inst.models.generate_content.call_args.kwargs
-    assert kw["model"] == "gemini-3.7-flash"
-    assert "model=gemini-3.7-flash" in capsys.readouterr().err
+    assert kw["model"] == "clip-model-under-test"
+    assert "model=clip-model-under-test" in capsys.readouterr().err
 
 
 def test_frame_env_var_sets_request_model_and_usage_log(monkeypatch, capsys):
     _unset_model_env(monkeypatch)
-    monkeypatch.setenv("TT_FRAME_MODEL", "gemini-3.7-flash")
+    monkeypatch.setenv("TT_FRAME_MODEL", "frame-model-under-test")
     module = _load_fresh_module()
 
     mock_client_inst = _patched_client(_make_response('{"ok": true}'))
     _call_frame_on(module, mock_client_inst)
 
     kw = mock_client_inst.models.generate_content.call_args.kwargs
-    assert kw["model"] == "gemini-3.7-flash"
-    assert "model=gemini-3.7-flash" in capsys.readouterr().err
+    assert kw["model"] == "frame-model-under-test"
+    assert "model=frame-model-under-test" in capsys.readouterr().err
 
 
 def test_clip_env_var_does_not_affect_frame_calls(monkeypatch, capsys):
     # The whole point of two variables is that they are independent. If one
     # leaked into the other, a corpus would be attributed to the wrong model.
+    # The override is a sentinel rather than a real model id on purpose: the two
+    # defaults now coincide, so this pair is the only thing that would catch a
+    # caller reading the other mode's constant, and a near-miss like
+    # "gemini-3.7-flash" against a "gemini-3.8-flash" default is a one-character
+    # difference a reader can fail to see.
     _unset_model_env(monkeypatch)
-    monkeypatch.setenv("TT_CLIP_MODEL", "gemini-3.7-flash")
+    monkeypatch.setenv("TT_CLIP_MODEL", "clip-model-under-test")
     module = _load_fresh_module()
 
     mock_client_inst = _patched_client(_make_response('{"ok": true}'))
@@ -463,15 +471,15 @@ def test_clip_env_var_does_not_affect_frame_calls(monkeypatch, capsys):
 
 def test_frame_env_var_does_not_affect_clip_calls(monkeypatch, capsys):
     _unset_model_env(monkeypatch)
-    monkeypatch.setenv("TT_FRAME_MODEL", "gemini-3.7-flash")
+    monkeypatch.setenv("TT_FRAME_MODEL", "frame-model-under-test")
     module = _load_fresh_module()
 
     mock_client_inst = _patched_client(_make_response('{"ok": true}'))
     _call_clip_on(module, mock_client_inst)
 
     kw = mock_client_inst.models.generate_content.call_args.kwargs
-    assert kw["model"] == "gemini-2.5-pro"
-    assert "model=gemini-2.5-pro" in capsys.readouterr().err
+    assert kw["model"] == "gemini-3.8-flash"
+    assert "model=gemini-3.8-flash" in capsys.readouterr().err
 
 
 def test_usage_log_reports_the_model_that_actually_ran(monkeypatch, capsys):
@@ -494,10 +502,10 @@ def test_tt_gemini_model_is_retired(monkeypatch):
     # Retired rather than kept as a fallback: two mechanisms for one setting is
     # how a run ends up with nobody sure which won.
     _unset_model_env(monkeypatch)
-    monkeypatch.setenv("TT_GEMINI_MODEL", "gemini-3.7-flash")
+    monkeypatch.setenv("TT_GEMINI_MODEL", "retired-model-under-test")
     module = _load_fresh_module()
 
-    assert module._CLIP_MODEL == "gemini-2.5-pro"
+    assert module._CLIP_MODEL == "gemini-3.8-flash"
     assert module._FRAME_MODEL == "gemini-3.8-flash"
 
 

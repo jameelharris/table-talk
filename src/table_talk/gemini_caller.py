@@ -25,11 +25,22 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
-# One model per call mode: a comparison over MPBLfM4mwfE found Pro better at
-# clip-mode video scans and Flash better at frame reads. Read once at import,
-# because a model changing mid-run would leave the corpus with no record of
-# which row came from which. The names are vendor-neutral on purpose.
-_CLIP_MODEL = os.environ.get("TT_CLIP_MODEL", "gemini-2.5-pro")
+# One model per call mode. Both default to the same model today, and that is a
+# cost and throughput decision rather than a finding that one model reads clips
+# better: on Pro, clip-mode calls measured ~30x a frame read's prompt tokens on
+# the pipeline's highest-volume call type, and exhausted the 429 backoff twice
+# on a single video. The quality cost is real — Flash truncates a street on
+# roughly 1.5% of hands — but bounded and detectable, since step E records a
+# D/E street disagreement in status_message.
+#
+# The two constants survive precisely so that trade is reversible: setting
+# TT_CLIP_MODEL alone moves clip calls back to Pro if another broadcast turns
+# out worse. Do not collapse them.
+#
+# Read once at import, because a model changing mid-run would leave the corpus
+# with no record of which row came from which. The names are vendor-neutral on
+# purpose.
+_CLIP_MODEL = os.environ.get("TT_CLIP_MODEL", "gemini-3.8-flash")
 _FRAME_MODEL = os.environ.get("TT_FRAME_MODEL", "gemini-3.8-flash")
 
 _RETRY_MAX_ATTEMPTS = 5
