@@ -29,13 +29,27 @@ from google.genai import types
 # cost and throughput decision rather than a finding that one model reads clips
 # better: on Pro, clip-mode calls measured ~30x a frame read's prompt tokens on
 # the pipeline's highest-volume call type, and exhausted the 429 backoff twice
-# on a single video. The quality cost is real — Flash truncates a street on
-# roughly 1.5% of hands — but bounded and detectable, since step E records a
-# D/E street disagreement in status_message.
+# on a single video.
+#
+# The quality cost of that default is larger than first recorded. This comment
+# read "roughly 1.5% of hands — but bounded and detectable"; measured across two
+# videos the Flash truncation rate is ~15%, and it is not uniform. Runout streets
+# carry no decisions, so losing one costs cards but no action data. A *contested*
+# truncation yields a hand that looks complete and ends a street early, which
+# corrupts an aggregate rather than thinning it, and the status_message marker
+# names only the first unfound street — so it bounds neither how much was lost
+# nor whether anything was.
+#
+# Consequence: Phase 5 is run with TT_CLIP_MODEL=gemini-2.5-pro, which recovers
+# these. The default here stays Flash because this constant also serves Phase 3
+# detection and Phase 4 step A, where the evidence does not reach and the token
+# cost is highest. See ARCHITECTURE.md "The truncation rate, and why hand shape
+# decides what it costs" and "Model selection is per call mode."
 #
 # The two constants survive precisely so that trade is reversible: setting
-# TT_CLIP_MODEL alone moves clip calls back to Pro if another broadcast turns
-# out worse. Do not collapse them.
+# TT_CLIP_MODEL alone moves clip calls to Pro without touching frame reads. That
+# is now a standing operational setting, not a hypothetical rollback. Do not
+# collapse them.
 #
 # Read once at import, because a model changing mid-run would leave the corpus
 # with no record of which row came from which. The names are vendor-neutral on
