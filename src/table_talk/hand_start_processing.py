@@ -35,13 +35,33 @@ from .hand_setup_processing_attempts_writer import write_hand_setup_processing_a
 from .hand_starts_writer import write_hand_starts
 from .prompt_context import build_hole_card_context, build_player_context
 from .provenance import build_provenance, select
-from .seat_enrichment import add_fva_seat_number, normalize_heads_up
+from .seat_enrichment import add_fva_seat_number, canonical_labels, normalize_heads_up
 from .timestamp_utils import parse_timestamp
 from .videos_downloader import DownloadPermanentError, download_video
 
 MAX_AVAILABLE_SECONDS = 60
 VERIFY_COUNT = 3
 VERIFY_INTERVAL = 0.05  # seconds
+
+# Gate identifiers for status_message. The "<gate_id>: <code>: " prefix is fixed
+# and must stay stable across releases — the per-gate report groups the attempts
+# tables by it, so renaming one silently splits its history in two. The detail
+# after the prefix is free text and may change freely.
+#
+# Not shared with Phase 5: orchestrators are not shared in this codebase, and a
+# common constants module would couple two phases that otherwise only meet at a
+# table boundary.
+GATE_NULL_BOUNTY_PROGRESSIVE = "P4-1: null_bounty_progressive"
+GATE_BOUNTY_ON_NON_BOUNTY_VIDEO = "P4-2: bounty_on_non_bounty_video"
+GATE_INVALID_LABEL_SET = "P4-3: invalid_label_set"
+GATE_INVALID_FVA_ACTION_TYPE = "P4-4: invalid_fva_action_type"
+GATE_DUPLICATE_HOLE_CARD = "P4-5: duplicate_hole_card"
+GATE_MISSING_HOLE_CARDS_LIVE_SEAT = "P4-6: missing_hole_cards_live_seat"
+
+# identify_hand_start.md offers exactly these three. fold and check are
+# unreachable by definition — the FVA is the first *voluntary chip commitment*,
+# and neither commits chips. bet is not in that prompt's vocabulary at all.
+VALID_FVA_ACTION_TYPES = frozenset({"call", "raise", "all_in"})
 
 
 @dataclass(frozen=True)
@@ -54,6 +74,10 @@ class PendingHandSetup:
     available_seconds: int
     raw_lead_gap_seconds: int
     consecutive_failures: int
+    # Query-computed, not a hand_setups column: it comes from the video's
+    # tournament_results row. Per CLAUDE.md it belongs on this module-local
+    # dataclass rather than being hand-added to the generated row class.
+    bounty_type: str
 
 
 def _find_pending_hand_setups(
@@ -132,15 +156,29 @@ def _find_pending_hand_setups(
         SELECT
           w.*,
           LEAST(w.raw_lead_gap_seconds, @max_available_seconds) AS available_seconds,
-          COALESCE(a.consecutive_failures, 0) AS consecutive_failures
+          COALESCE(a.consecutive_failures, 0) AS consecutive_failures,
+          tr.bounty_type
         FROM windowed w
         LEFT JOIN attempt_state a USING (hand_setup_id)
+        LEFT JOIN `{project_id}.{dataset}.tournament_results` tr ON tr.video_id = w.video_id
         WHERE (a.latest_status IS NULL OR a.latest_status = 'failed_transient')
           {video_filter}
           {hand_setup_filter}
     """
     job_config = bigquery.QueryJobConfig(query_parameters=params)
     rows = list(client.query(query, job_config=job_config).result())
+    # A hand setup whose video has no tournament_results row is a broken
+    # invariant, not a data condition: Phase 2's materialization gate records
+    # blocked_upstream rather than producing clips, so nothing downstream of it
+    # should exist. Raising matches Phase 3, which reaches the same state by the
+    # same route. Skipping instead would silently drop the bounty gates.
+    for row in rows:
+        if row.bounty_type is None:
+            raise RuntimeError(
+                f"hand setup {row.hand_setup_id} (video {row.video_id}) has no "
+                f"tournament_results row; the materialization gate should have "
+                f"prevented this. Run `tt extract-payouts --video-id {row.video_id}`."
+            )
     return [
         PendingHandSetup(
             hand_setup_id=row.hand_setup_id,
@@ -151,14 +189,21 @@ def _find_pending_hand_setups(
             available_seconds=row.available_seconds,
             raw_lead_gap_seconds=row.raw_lead_gap_seconds,
             consecutive_failures=row.consecutive_failures,
+            bounty_type=row.bounty_type,
         )
         for row in rows
     ]
 
 
-def check_preconditions(hand_setup_state: dict) -> str | None:
+def check_preconditions(hand_setup_state: dict, bounty_type: str) -> str | None:
     """Return a skip reason if hand_setup_state can't support hand-start
-    processing, else None. Checks run in order; the first failure wins."""
+    processing, else None. Checks run in order; the first failure wins.
+
+    Takes bounty_type explicitly because it is not part of hand_setup_state: it
+    belongs to the video's tournament_results row and arrives on the pending
+    dataclass. Passing it rather than the whole dataclass keeps this a pure
+    function of the two things it actually reads.
+    """
     players = hand_setup_state.get("players", [])
 
     null_stack_labels = [
@@ -181,7 +226,146 @@ def check_preconditions(hand_setup_state: dict) -> str | None:
     if not pot_size_bb:  # covers both None and 0
         return f"skipped: pot_size_bb={pot_size_bb!r} (zero or null)"
 
+    # P4-1. Reverses the earlier "a null bounty is a gap, not a skip": a missing
+    # badge does not appear on a re-read of the same frame, so this is a skip
+    # rather than a retry. It also catches the one phantom-seat shape the
+    # null-stack check above cannot — an extra seat carrying a real-looking
+    # stack but a null bounty, which is how the documented non-null phantom
+    # presented.
+    if bounty_type == "progressive":
+        missing = [
+            p.get("seat_position_label") or "<unknown position>"
+            for p in players
+            if p.get("bounty") is None or p.get("bounty") <= 0
+        ]
+        if missing:
+            return (
+                f"skipped: {GATE_NULL_BOUNTY_PROGRESSIVE}: "
+                f"player(s) with no bounty on a progressive video — {', '.join(missing)}"
+            )
+    else:
+        # P4-2. The field is absent, not null, on a non-bounty video — nothing
+        # asked for it. A value here means bounty_type was misclassified, which
+        # is a property of the video's one payout read and will not change on a
+        # retry of this hand.
+        present = [
+            p.get("seat_position_label") or "<unknown position>"
+            for p in players
+            if p.get("bounty") is not None
+        ]
+        if present:
+            return (
+                f"skipped: {GATE_BOUNTY_ON_NON_BOUNTY_VIDEO}: "
+                f"bounty present on bounty_type={bounty_type!r} — {', '.join(present)}"
+            )
+
+    # P4-3. Labels come from Phase 3, and re-detecting a clip renumbers every
+    # hand in it, so a retry cannot repair this one row — hence a skip.
+    #
+    # Note what this does NOT catch: a phantom seat whose total_seat_count was
+    # inflated to match still presents a self-consistent label set and passes.
+    # Seat-count monotonicity is the check for that class, and it is not built.
+    expected = set(canonical_labels(total_seat_count))
+    actual = [p.get("seat_position_label") for p in players]
+    if sorted(actual) != sorted(expected):
+        return (
+            f"skipped: {GATE_INVALID_LABEL_SET}: "
+            f"{total_seat_count}-handed expects {sorted(expected)}, got {sorted(actual)}"
+        )
+
     return None
+
+
+def check_fva(fva: dict, hand_setup_state: dict) -> str | None:
+    """P4-4. Return a reason the FVA is unusable, or None.
+
+    Two conditions, one gate, because both make the same record unusable in the
+    same way and both are properties of one step-A answer.
+
+    The label check is not decoration. An unresolvable label leaves seat_number
+    None, and the eligible-seat calculation below reads a None seat_number as
+    "every seat is eligible" — so a bad label silently widens the hole-card read
+    to the whole table and would then make P4-6 demand cards for seats that
+    folded long before the FVA.
+    """
+    action_type = fva.get("action_type")
+    if action_type not in VALID_FVA_ACTION_TYPES:
+        return (
+            f"{GATE_INVALID_FVA_ACTION_TYPE}: fva action_type={action_type!r} "
+            f"not in {sorted(VALID_FVA_ACTION_TYPES)} — the FVA is a chip commitment"
+        )
+
+    label = fva.get("seat_position_label")
+    seats = {p.get("seat_position_label") for p in hand_setup_state.get("players", [])}
+    if label not in seats:
+        return (
+            f"{GATE_INVALID_FVA_ACTION_TYPE}: fva seat_position_label={label!r} "
+            f"is not a seat in this hand {sorted(s for s in seats if s)}"
+        )
+    return None
+
+
+def check_duplicate_hole_cards(eligible_players: list[dict]) -> str | None:
+    """P4-5. Return a reason two seats hold the same card, or None.
+
+    Compares case-folded. normalize_card only maps "10" -> "T"; it does not
+    canonicalize rank or suit case, so "Ah" and "AH" are distinct strings and a
+    naive comparison would let a duplicate through.
+
+    Transient: the observed hole-card errors are suit confusions in a stochastic
+    read, and a re-attempt re-reads every seat rather than the one that clashed.
+    """
+    seen: dict[str, str] = {}
+    for player in eligible_players:
+        for card in player.get("hole_cards") or []:
+            if card is None:
+                continue
+            key = card.casefold()
+            if key in seen:
+                return (
+                    f"{GATE_DUPLICATE_HOLE_CARD}: {card} appears twice — "
+                    f"{seen[key]} and {player.get('seat_position_label')}"
+                )
+            seen[key] = player.get("seat_position_label") or "<unknown position>"
+    return None
+
+
+def check_missing_hole_cards(eligible_players: list[dict]) -> str | None:
+    """P4-6. Return a reason a seat still in at the FVA has no cards, or None.
+
+    Permanent, unlike P4-5. This runs after the in-attempt retry, so a null here
+    has already survived a second read of the same frame, and the three observed
+    causes — frame-limited illegibility, four-colour suit confusion, and a chat
+    overlay covering the cards — are all properties of that frame. Another
+    attempt reads the same pixels. The accepted cost is that a hand a different
+    verification frame could have resolved is lost; mark-pending is the way back.
+    """
+    missing = [
+        p.get("seat_position_label") or "<unknown position>"
+        for p in eligible_players
+        if not p.get("hole_cards") or any(c is None for c in p["hole_cards"])
+    ]
+    if missing:
+        return (
+            f"{GATE_MISSING_HOLE_CARDS_LIVE_SEAT}: seat(s) still in at the FVA with "
+            f"no readable hole cards after retry — {', '.join(missing)}"
+        )
+    return None
+
+
+def eligible_seats_at_fva(hand_start_state: dict) -> list[dict]:
+    """The seats still in the hand when the FVA acts.
+
+    Preflop acting order is descending seat number, so "the FVA seat and every
+    seat after it" is exactly seat_number <= the FVA's. This is the same set
+    build_hole_card_context feeds to the step-C prompt; the two must agree, or
+    P4-6 would demand cards for a seat that was never read.
+    """
+    fva_seat_number = hand_start_state["fva"]["seat_number"]
+    players = hand_start_state["hand_setup"].get("players", [])
+    if fva_seat_number is None:
+        return players
+    return [p for p in players if p["seat_number"] <= fva_seat_number]
 
 
 def _hallucination_guard(fva_seconds: int, hand_setup_time: int, available_seconds: int) -> None:
@@ -237,7 +421,7 @@ async def process_hand_setup(
     translated into a return value so that process_pending_hand_setups can
     continue to the next hand_setup.
     """
-    skip_reason = check_preconditions(hs.hand_setup_state)
+    skip_reason = check_preconditions(hs.hand_setup_state, hs.bounty_type)
     if skip_reason is not None:
         _write_attempt(hs.hand_setup_id, "complete_skipped", skip_reason, project_id=project_id, dataset=dataset)
         return "complete_skipped"
@@ -310,6 +494,18 @@ async def process_hand_setup(
         }
         normalize_heads_up(hand_start_state["hand_setup"], fva=hand_start_state["fva"])
 
+        # P4-4 runs after normalize_heads_up, not before: heads-up rewrites the
+        # FVA's SB to BTN, and checking the label against the hand's seats ahead
+        # of that rewrite would reject every heads-up hand.
+        fva_reason = check_fva(hand_start_state["fva"], hand_start_state["hand_setup"])
+        if fva_reason is not None:
+            status = _transient_status(hs.consecutive_failures, max_attempts)
+            _write_attempt(
+                hs.hand_setup_id, status, f"{status}: {fva_reason}",
+                project_id=project_id, dataset=dataset,
+            )
+            return status
+
         with tempfile.TemporaryDirectory() as frame_tmpdir:
             async def _extract_verify_frames() -> list[str]:
                 paths = []
@@ -360,12 +556,8 @@ async def process_hand_setup(
             # returned another player's cards mislabeled onto the retried
             # seat — so the retry reuses this exact frame/prompt, fills gaps
             # only, and never overwrites a non-null first-call answer.
-            fva_seat_number = hand_start_state["fva"]["seat_number"]
             hand_setup_players = hand_start_state["hand_setup"].get("players", [])
-            eligible_players = (
-                hand_setup_players if fva_seat_number is None
-                else [p for p in hand_setup_players if p["seat_number"] <= fva_seat_number]
-            )
+            eligible_players = eligible_seats_at_fva(hand_start_state)
 
             if any(p.get("hole_cards") is None for p in eligible_players):
                 retry_hole_cards_result = await asyncio.to_thread(
@@ -385,9 +577,26 @@ async def process_hand_setup(
                     if matched and matched.get("hole_cards") is not None:
                         player["hole_cards"] = normalize_cards(matched["hole_cards"])
 
-            residual_null_labels = [
-                p.get("seat_position_label") for p in eligible_players if p.get("hole_cards") is None
-            ]
+            # P4-5 then P4-6, in that order and first-failure-wins. A hand with
+            # both a duplicate and a null is retried rather than parked: the
+            # duplicate is the recoverable half, and giving the permanent gate
+            # precedence would discard a hand a retry could still fix.
+            duplicate_reason = check_duplicate_hole_cards(eligible_players)
+            if duplicate_reason is not None:
+                status = _transient_status(hs.consecutive_failures, max_attempts)
+                _write_attempt(
+                    hs.hand_setup_id, status, f"{status}: {duplicate_reason}",
+                    project_id=project_id, dataset=dataset,
+                )
+                return status
+
+            missing_reason = check_missing_hole_cards(eligible_players)
+            if missing_reason is not None:
+                _write_attempt(
+                    hs.hand_setup_id, "failed_permanent", missing_reason,
+                    project_id=project_id, dataset=dataset,
+                )
+                return "failed_permanent"
 
             fva_frame_gcs_path = (
                 f"gs://{hand_starts_bucket}/{hs.video_id}/{hs.clip_id}/{hs.hand_setup_id}/fva.jpg"
@@ -428,8 +637,6 @@ async def process_hand_setup(
             )
         else:
             status_message = f"complete: available_seconds={hs.available_seconds}"
-        if residual_null_labels:
-            status_message += f"; null hole_cards after retry — {', '.join(residual_null_labels)}"
         # write_hand_starts() is REPLACE (DELETE+INSERT) semantics keyed on
         # hand_setup_id, so a post-write attempt-write failure here is safe:
         # re-running reproduces the same row set instead of duplicating it.

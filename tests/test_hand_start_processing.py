@@ -15,7 +15,11 @@ from table_talk.hand_start_processing import (
     _find_pending_hand_setups,
     _hallucination_guard,
     _transient_status,
+    check_duplicate_hole_cards,
+    check_fva,
+    check_missing_hole_cards,
     check_preconditions,
+    eligible_seats_at_fva,
     process_hand_setup,
     process_pending_hand_setups,
 )
@@ -26,11 +30,11 @@ from table_talk.videos_downloader import DownloadPermanentError
 # ---------------------------------------------------------------------------
 
 
-def _hand_setup_state(players=None, total_seat_count=6, pot_size_bb=1.5):
+def _hand_setup_state(players=None, total_seat_count=2, pot_size_bb=1.5):
     if players is None:
         players = [
             {"seat_position_label": "BB", "stack_size": 100.0, "seat_number": 1},
-            {"seat_position_label": "UTG", "stack_size": 50.0, "seat_number": 9},
+            {"seat_position_label": "BTN", "stack_size": 50.0, "seat_number": 3},
         ]
     return {
         "total_seat_count": total_seat_count,
@@ -53,22 +57,23 @@ _HS = PendingHandSetup(
     available_seconds=60,
     raw_lead_gap_seconds=60,
     consecutive_failures=0,
+        bounty_type="none",
 )
 
 _CLIP_RESULT_FOUND = {
     "found": True,
     "timestamp": "01:45",  # 105s, within [100, 160]
     "second_action_timestamp": "01:50",  # 110s
-    "seat_position_label": "UTG",
+    "seat_position_label": "BTN",
     "action_type": "raise",
     "bet_amount": 3.0,
 }
 
-_CLIP_RESULT_FVA_CO = {
+_CLIP_RESULT_FVA_SB = {
     "found": True,
     "timestamp": "01:45",
     "second_action_timestamp": "01:50",
-    "seat_position_label": "CO",  # seat_number 4 — UTG (seat 9) is non-eligible
+    "seat_position_label": "SB",  # seat_number 2 — BTN (seat 3) is non-eligible
     "action_type": "raise",
     "bet_amount": 3.0,
 }
@@ -76,7 +81,7 @@ _CLIP_RESULT_FVA_CO = {
 _HOLE_CARDS_RESULT = {
     "players": [
         {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
-        {"seat_position_label": "UTG", "hole_cards": ["2c", "3c"]},
+        {"seat_position_label": "BTN", "hole_cards": ["2c", "3c"]},
     ]
 }
 
@@ -107,14 +112,14 @@ def _mock_bq_client(rows=None):
 
 
 def test_check_preconditions_passes_valid_state():
-    assert check_preconditions(_hand_setup_state()) is None
+    assert check_preconditions(_hand_setup_state(), "none") is None
 
 
 def test_check_preconditions_null_stack_size():
     state = _hand_setup_state(players=[
         {"seat_position_label": "BB", "stack_size": None, "seat_number": 1},
     ])
-    reason = check_preconditions(state)
+    reason = check_preconditions(state, "none")
     assert reason is not None
     assert "null stack_size" in reason
     assert "BB" in reason
@@ -124,7 +129,7 @@ def test_check_preconditions_null_seat_position_label():
     state = _hand_setup_state(players=[
         {"seat_position_label": None, "stack_size": 75.0, "seat_number": 1},
     ])
-    reason = check_preconditions(state)
+    reason = check_preconditions(state, "none")
     assert reason is not None
     assert "null seat_position_label" in reason
     assert "75.0" in reason
@@ -135,21 +140,21 @@ def test_check_preconditions_both_null_reports_under_null_stack():
     state = _hand_setup_state(players=[
         {"seat_position_label": None, "stack_size": None, "seat_number": 1},
     ])
-    reason = check_preconditions(state)
+    reason = check_preconditions(state, "none")
     assert reason is not None
     assert "null stack_size" in reason
 
 
 def test_check_preconditions_total_seat_count_too_low():
     state = _hand_setup_state(total_seat_count=1)
-    reason = check_preconditions(state)
+    reason = check_preconditions(state, "none")
     assert reason is not None
     assert "total_seat_count" in reason
 
 
 def test_check_preconditions_total_seat_count_null():
     state = _hand_setup_state(total_seat_count=None)
-    reason = check_preconditions(state)
+    reason = check_preconditions(state, "none")
     assert reason is not None
     assert "total_seat_count" in reason
 
@@ -157,7 +162,7 @@ def test_check_preconditions_total_seat_count_null():
 def test_check_preconditions_pot_size_bb_zero_or_null():
     for bad_pot in (0, None):
         state = _hand_setup_state(pot_size_bb=bad_pot)
-        reason = check_preconditions(state)
+        reason = check_preconditions(state, "none")
         assert reason is not None
         assert "pot_size_bb" in reason
 
@@ -249,6 +254,7 @@ def test_find_pending_hand_setups_builds_pending_hand_setup():
     row.available_seconds = 60
     row.raw_lead_gap_seconds = 120
     row.consecutive_failures = 3
+    row.bounty_type = "none"
     mock_client = _mock_bq_client(rows=[row])
 
     results = _find_pending_hand_setups("proj", "ds", client=mock_client)
@@ -263,6 +269,7 @@ def test_find_pending_hand_setups_builds_pending_hand_setup():
         available_seconds=60,
         raw_lead_gap_seconds=120,
         consecutive_failures=3,
+        bounty_type="none",
     )
 
 
@@ -304,11 +311,11 @@ def test_process_hand_setup_happy_path():
     players = row.hand_start_state["hand_setup"]["players"]
     by_label = {p["seat_position_label"]: p for p in players}
     assert by_label["BB"]["hole_cards"] == ["Ah", "Kd"]
-    assert by_label["UTG"]["hole_cards"] == ["2c", "3c"]
+    assert by_label["BTN"]["hole_cards"] == ["2c", "3c"]
 
     fva = row.hand_start_state["fva"]
-    assert fva["seat_position_label"] == "UTG"
-    assert fva["seat_number"] == 9
+    assert fva["seat_position_label"] == "BTN"
+    assert fva["seat_number"] == 3
 
     attempt_row = mock_write_attempt.call_args[0][0]
     assert attempt_row.status == "complete"
@@ -325,6 +332,7 @@ def test_process_hand_setup_status_message_notes_capped_window():
         available_seconds=60,
         raw_lead_gap_seconds=200,  # capped: raw > available
         consecutive_failures=0,
+        bounty_type="none",
     )
     with (
         patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
@@ -352,20 +360,29 @@ def test_process_hand_setup_hole_card_no_match_is_none():
         clip_id="clip_001",
         video_id="vid_a",
         hand_setup_time_seconds=100,
-        hand_setup_state=_hand_setup_state(players=[
+        hand_setup_state=_hand_setup_state(total_seat_count=3, players=[
             {"seat_position_label": "BB", "stack_size": 100.0, "seat_number": 1},
-            {"seat_position_label": "CO", "stack_size": 60.0, "seat_number": 4},
-            {"seat_position_label": "UTG", "stack_size": 50.0, "seat_number": 9},
+            {"seat_position_label": "SB", "stack_size": 60.0, "seat_number": 2},
+            {"seat_position_label": "BTN", "stack_size": 50.0, "seat_number": 3},
         ]),
         available_seconds=60,
         raw_lead_gap_seconds=60,
         consecutive_failures=0,
+        bounty_type="none",
     )
-    # Gemini's response omits CO — its hole_cards should end up None.
+    # Gemini's response omits BTN — its hole_cards should end up None. The FVA
+    # is SB, so BTN is non-eligible and P4-6 does not fire: this test is about
+    # the matching loop, not about whether a null is tolerated.
     with (
-        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FVA_SB),
         patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
-        patch("table_talk.hand_start_processing.call_gemini_for_frame", return_value=_HOLE_CARDS_RESULT),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_frame",
+            return_value={"players": [
+                {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+                {"seat_position_label": "SB", "hole_cards": ["2c", "3c"]},
+            ]},
+        ),
         patch("table_talk.hand_start_processing.upload_frame"),
         patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
         patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row"),
@@ -380,7 +397,7 @@ def test_process_hand_setup_hole_card_no_match_is_none():
     assert outcome == "complete"
     players = mock_write_starts.call_args[0][0][0].hand_start_state["hand_setup"]["players"]
     by_label = {p["seat_position_label"]: p for p in players}
-    assert by_label["CO"]["hole_cards"] is None
+    assert by_label["BTN"]["hole_cards"] is None
     assert by_label["BB"]["hole_cards"] == ["Ah", "Kd"]
 
 
@@ -395,14 +412,15 @@ def _three_seat_hs():
         clip_id="clip_001",
         video_id="vid_a",
         hand_setup_time_seconds=100,
-        hand_setup_state=_hand_setup_state(players=[
+        hand_setup_state=_hand_setup_state(total_seat_count=3, players=[
             {"seat_position_label": "BB", "stack_size": 100.0, "seat_number": 1},
-            {"seat_position_label": "CO", "stack_size": 60.0, "seat_number": 4},
-            {"seat_position_label": "UTG", "stack_size": 50.0, "seat_number": 9},
+            {"seat_position_label": "SB", "stack_size": 60.0, "seat_number": 2},
+            {"seat_position_label": "BTN", "stack_size": 50.0, "seat_number": 3},
         ]),
         available_seconds=60,
         raw_lead_gap_seconds=60,
         consecutive_failures=0,
+        bounty_type="none",
     )
 
 
@@ -411,13 +429,13 @@ def test_process_hand_setup_retry_fills_eligible_null():
     first_response = {
         "players": [
             {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
-            {"seat_position_label": "UTG", "hole_cards": ["2c", "3c"]},
-            # CO omitted -> null on first call
+            {"seat_position_label": "BTN", "hole_cards": ["2c", "3c"]},
+            # SB omitted -> null on first call
         ]
     }
     second_response = {
         "players": [
-            {"seat_position_label": "CO", "hole_cards": ["Th", "9h"]},
+            {"seat_position_label": "SB", "hole_cards": ["Th", "9h"]},
         ]
     }
     with (
@@ -447,23 +465,32 @@ def test_process_hand_setup_retry_fills_eligible_null():
     players = mock_write_starts.call_args[0][0][0].hand_start_state["hand_setup"]["players"]
     by_label = {p["seat_position_label"]: p for p in players}
     assert by_label["BB"]["hole_cards"] == ["Ah", "Kd"]
-    assert by_label["CO"]["hole_cards"] == ["Th", "9h"]
-    assert by_label["UTG"]["hole_cards"] == ["2c", "3c"]
+    assert by_label["SB"]["hole_cards"] == ["Th", "9h"]
+    assert by_label["BTN"]["hole_cards"] == ["2c", "3c"]
 
     attempt_row = mock_write_attempt.call_args[0][0]
     assert attempt_row.status == "complete"
     assert "null hole_cards" not in attempt_row.status_message
 
 
-def test_process_hand_setup_retry_still_null_is_still_complete():
+def test_process_hand_setup_retry_still_null_is_failed_permanent():
+    """P4-6 reverses the old behaviour here.
+
+    This hand used to complete with the residual null enumerated in
+    status_message. It now fails permanently: a null on a seat still in at the
+    FVA has already survived a second read of the same frame, and all three
+    observed causes are properties of that frame, so a further attempt reads the
+    same pixels. The accepted cost is that a hand another verification frame
+    could have resolved is lost.
+    """
     hs = _three_seat_hs()
     first_response = {
         "players": [
             {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
-            {"seat_position_label": "UTG", "hole_cards": ["2c", "3c"]},
+            {"seat_position_label": "BTN", "hole_cards": ["2c", "3c"]},
         ]
     }
-    second_response = {"players": []}  # retry also misses CO
+    second_response = {"players": []}  # retry also misses SB
     with (
         patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
         patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
@@ -482,18 +509,16 @@ def test_process_hand_setup_retry_still_null_is_still_complete():
             prompt_hashes=_P4_HASHES,
         ))
 
-    assert outcome == "complete"
+    assert outcome == "failed_permanent"
+    # The retry still ran — P4-6 fires after it, not instead of it.
     assert mock_gemini_frame.call_count == 2
-    mock_write_starts.assert_called_once()
-
-    players = mock_write_starts.call_args[0][0][0].hand_start_state["hand_setup"]["players"]
-    by_label = {p["seat_position_label"]: p for p in players}
-    assert by_label["CO"]["hole_cards"] is None
+    # Failures never write a stage row.
+    mock_write_starts.assert_not_called()
 
     attempt_row = mock_write_attempt.call_args[0][0]
-    assert attempt_row.status == "complete"
-    assert "null hole_cards after retry" in attempt_row.status_message
-    assert "CO" in attempt_row.status_message
+    assert attempt_row.status == "failed_permanent"
+    assert attempt_row.status_message.startswith("P4-6: missing_hole_cards_live_seat: ")
+    assert "SB" in attempt_row.status_message
 
 
 def test_process_hand_setup_retry_does_not_clobber_first_call_answer():
@@ -501,14 +526,14 @@ def test_process_hand_setup_retry_does_not_clobber_first_call_answer():
     first_response = {
         "players": [
             {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
-            {"seat_position_label": "UTG", "hole_cards": ["2c", "3c"]},
-            # CO omitted -> null, triggers retry
+            {"seat_position_label": "BTN", "hole_cards": ["2c", "3c"]},
+            # SB omitted -> null, triggers retry
         ]
     }
     second_response = {
         "players": [
             {"seat_position_label": "BB", "hole_cards": None},  # simulated flip: null this time
-            {"seat_position_label": "CO", "hole_cards": ["Th", "9h"]},
+            {"seat_position_label": "SB", "hole_cards": ["Th", "9h"]},
         ]
     }
     with (
@@ -535,8 +560,8 @@ def test_process_hand_setup_retry_does_not_clobber_first_call_answer():
     players = mock_write_starts.call_args[0][0][0].hand_start_state["hand_setup"]["players"]
     by_label = {p["seat_position_label"]: p for p in players}
     assert by_label["BB"]["hole_cards"] == ["Ah", "Kd"]  # retained, not clobbered by retry's null
-    assert by_label["CO"]["hole_cards"] == ["Th", "9h"]  # filled by retry
-    assert by_label["UTG"]["hole_cards"] == ["2c", "3c"]
+    assert by_label["SB"]["hole_cards"] == ["Th", "9h"]  # filled by retry
+    assert by_label["BTN"]["hole_cards"] == ["2c", "3c"]
 
 
 def test_process_hand_setup_no_retry_when_first_call_fully_populated():
@@ -567,16 +592,16 @@ def test_process_hand_setup_no_retry_when_first_call_fully_populated():
 
 def test_process_hand_setup_non_eligible_null_does_not_trigger_retry():
     hs = _three_seat_hs()
-    # FVA is CO (seat 4) -> UTG (seat 9) is non-eligible, and it's the one that's null.
+    # FVA is SB (seat 2) -> BTN (seat 3) is non-eligible, and it's the one that's null.
     result = {
         "players": [
             {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
-            {"seat_position_label": "CO", "hole_cards": ["2c", "3c"]},
-            # UTG omitted -> null, but non-eligible
+            {"seat_position_label": "SB", "hole_cards": ["2c", "3c"]},
+            # BTN omitted -> null, but non-eligible so P4-6 does not fire
         ]
     }
     with (
-        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FVA_CO),
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FVA_SB),
         patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
         patch(
             "table_talk.hand_start_processing.call_gemini_for_frame",
@@ -598,7 +623,7 @@ def test_process_hand_setup_non_eligible_null_does_not_trigger_retry():
 
     players = mock_write_starts.call_args[0][0][0].hand_start_state["hand_setup"]["players"]
     by_label = {p["seat_position_label"]: p for p in players}
-    assert by_label["UTG"]["hole_cards"] is None
+    assert by_label["BTN"]["hole_cards"] is None
 
     attempt_row = mock_write_attempt.call_args[0][0]
     assert "null hole_cards" not in attempt_row.status_message
@@ -619,6 +644,7 @@ def test_process_hand_setup_complete_skipped():
         available_seconds=60,
         raw_lead_gap_seconds=60,
         consecutive_failures=0,
+        bounty_type="none",
     )
     with (
         patch("table_talk.hand_start_processing.call_gemini_for_clip") as mock_gemini,
@@ -948,9 +974,9 @@ def test_process_hand_setup_no_hand_starts_row_unless_complete_with_row():
 
 def test_process_pending_hand_setups_dispatch():
     hand_setups = [
-        PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0),
-        PendingHandSetup("vid_a_001_002", "vid_a_001", "vid_a", 60, {}, 60, 60, 0),
-        PendingHandSetup("vid_b_001_001", "vid_b_001", "vid_b", 0, {}, 60, 60, 0),
+        PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0, "none"),
+        PendingHandSetup("vid_a_001_002", "vid_a_001", "vid_a", 60, {}, 60, 60, 0, "none"),
+        PendingHandSetup("vid_b_001_001", "vid_b_001", "vid_b", 0, {}, 60, 60, 0, "none"),
     ]
     with (
         patch("table_talk.hand_start_processing._find_pending_hand_setups", return_value=hand_setups),
@@ -1009,7 +1035,7 @@ def test_process_pending_hand_setups_no_video_id_means_no_video_scope():
 
 
 def test_process_pending_hand_setups_download_failure_marks_transient():
-    hand_setups = [PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0)]
+    hand_setups = [PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0, "none")]
     with (
         patch("table_talk.hand_start_processing._find_pending_hand_setups", return_value=hand_setups),
         patch("table_talk.hand_start_processing.download_video", side_effect=Exception("network error")),
@@ -1028,7 +1054,7 @@ def test_process_pending_hand_setups_download_failure_marks_transient():
 
 
 def test_process_pending_hand_setups_download_failure_parks_at_cap():
-    hand_setups = [PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 2)]
+    hand_setups = [PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 2, "none")]
     with (
         patch("table_talk.hand_start_processing._find_pending_hand_setups", return_value=hand_setups),
         patch("table_talk.hand_start_processing.download_video", side_effect=Exception("network error")),
@@ -1045,8 +1071,8 @@ def test_process_pending_hand_setups_download_failure_parks_at_cap():
 
 def test_process_pending_hand_setups_download_not_found_marks_permanent():
     hand_setups = [
-        PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0),
-        PendingHandSetup("vid_a_001_002", "vid_a_001", "vid_a", 60, {}, 60, 60, 0),
+        PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0, "none"),
+        PendingHandSetup("vid_a_001_002", "vid_a_001", "vid_a", 60, {}, 60, 60, 0, "none"),
     ]
     with (
         patch("table_talk.hand_start_processing._find_pending_hand_setups", return_value=hand_setups),
@@ -1081,9 +1107,11 @@ async def _integration_body():
     from google.cloud import storage as gcs
 
     from table_talk._generated.hand_setups_row import HandSetupsRow
+    from table_talk._generated.tournament_results_row import TournamentResultsRow
     from table_talk.clip_manifest_writer import ClipManifestRow as CMRow
     from table_talk.clip_manifest_writer import write_clip_manifest_rows
     from table_talk.hand_setups_writer import write_hand_setups
+    from table_talk.tournament_results_writer import write_tournament_results
     from table_talk.videos_writer import VideosRow, write_video_row
 
     project = "table-talk-497020"
@@ -1105,6 +1133,7 @@ async def _integration_body():
     hand_setups_ref = f"{project}.{dataset}.hand_setups"
     attempts_ref = f"{project}.{dataset}.hand_setup_processing_attempts"
     hand_starts_ref = f"{project}.{dataset}.hand_starts"
+    results_ref = f"{project}.{dataset}.tournament_results"
 
     # Generate a small test video via ffmpeg (lavfi testsrc, 60 seconds)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1139,6 +1168,25 @@ async def _integration_body():
         dataset=dataset,
         client=bq_client,
     )
+    # Required setup since Phase 4's pending query joins tournament_results for
+    # bounty_type and raises on a null. bounty_type="none" keeps the hand on the
+    # P4-2 branch, which the fixture's bounty-free players satisfy.
+    write_tournament_results(
+        [
+            TournamentResultsRow(
+                video_id=video_id,
+                bounty_type="none",
+                currency_symbol="$",
+                frame_timestamp_seconds=0,
+                frame_gcs_path=f"gs://{videos_bucket}/{video_id}/results.jpg",
+                tournament_results_state={"panel": {"rows": []}},
+            )
+        ],
+        video_id=video_id,
+        project_id=project,
+        dataset=dataset,
+        client=bq_client,
+    )
     write_clip_manifest_rows(
         [CMRow(clip_id=clip_id, video_id=video_id, clip_start_time=0, clip_end_time=60)],
         video_id=video_id,
@@ -1155,11 +1203,11 @@ async def _integration_body():
                 hand_setup_time_seconds=0,
                 frame_gcs_path=f"gs://{hand_setups_bucket}/{video_id}/{clip_id}/{hand_setup_id}.jpg",
                 hand_setup_state={
-                    "total_seat_count": 6,
+                    "total_seat_count": 2,
                     "pot_size_bb": 1.5,
                     "players": [
                         {"seat_position_label": "BB", "stack_size": 100.0, "seat_number": 1},
-                        {"seat_position_label": "UTG", "stack_size": 100.0, "seat_number": 9},
+                        {"seat_position_label": "BTN", "stack_size": 100.0, "seat_number": 3},
                     ],
                 },
             )
@@ -1242,6 +1290,7 @@ async def _integration_body():
             (attempts_ref, "hand_setup_id", hand_setup_id),
             (hand_setups_ref, "hand_setup_id", hand_setup_id),
             (clip_ref, "clip_id", clip_id),
+            (results_ref, "video_id", video_id),
             (videos_ref, "video_id", video_id),
         ]:
             bq_client.query(
@@ -1271,7 +1320,9 @@ _PENDING_QUERY_DATASET = "table_talk_dev"
 
 def _seed_hand_setup_for_pending_query(bq_client):
     from table_talk._generated.hand_setups_row import HandSetupsRow
+    from table_talk._generated.tournament_results_row import TournamentResultsRow
     from table_talk.hand_setups_writer import write_hand_setups
+    from table_talk.tournament_results_writer import write_tournament_results
     from table_talk.videos_writer import VideosRow, write_video_row
 
     uid = uuid.uuid4().hex[:10]
@@ -1289,6 +1340,26 @@ def _seed_hand_setup_for_pending_query(bq_client):
             file_size_bytes=1,
         ),
         project=_PENDING_QUERY_PROJECT,
+        dataset=_PENDING_QUERY_DATASET,
+        client=bq_client,
+    )
+    # Phase 4's pending query joins tournament_results for bounty_type and
+    # raises on a null, so this row is now required setup rather than optional
+    # context. Written with the production writer, per CLAUDE.md's rule that
+    # cross-phase test setup goes through writers and never orchestrators.
+    write_tournament_results(
+        [
+            TournamentResultsRow(
+                video_id=video_id,
+                bounty_type="none",
+                currency_symbol="$",
+                frame_timestamp_seconds=0,
+                frame_gcs_path=f"gs://fake-bucket/{video_id}/results.jpg",
+                tournament_results_state={"panel": {"rows": []}},
+            )
+        ],
+        video_id=video_id,
+        project_id=_PENDING_QUERY_PROJECT,
         dataset=_PENDING_QUERY_DATASET,
         client=bq_client,
     )
@@ -1338,9 +1409,13 @@ def _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id):
     videos_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.videos"
     hand_setups_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.hand_setups"
     attempts_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.hand_setup_processing_attempts"
+    results_ref = f"{_PENDING_QUERY_PROJECT}.{_PENDING_QUERY_DATASET}.tournament_results"
+    # Reverse dependency order: tournament_results hangs off videos, so it goes
+    # before the video row and after anything keyed on the hand setup.
     for table, col, val in [
         (attempts_ref, "hand_setup_id", hand_setup_id),
         (hand_setups_ref, "hand_setup_id", hand_setup_id),
+        (results_ref, "video_id", video_id),
         (videos_ref, "video_id", video_id),
     ]:
         bq_client.query(
@@ -1540,3 +1615,331 @@ def test_phase_3_provenance_rides_through_the_nested_hand_setup():
     state = mock_write_starts.call_args[0][0][0].hand_start_state
     assert state["hand_setup"]["provenance"]["models"] == {"clip": "p3-model"}
     assert state["provenance"] != state["hand_setup"]["provenance"]
+
+
+# ---------------------------------------------------------------------------
+# P4-1 .. P4-3 — preconditions (no LLM call, complete_skipped)
+# ---------------------------------------------------------------------------
+
+
+def _bounty_state(bounties, total_seat_count=3):
+    """A valid 3-handed hand with the given bounty per seat, in seat order."""
+    labels = ["BB", "SB", "BTN"]
+    players = []
+    for i, (label, bounty) in enumerate(zip(labels, bounties), start=1):
+        player = {"seat_position_label": label, "stack_size": 50.0, "seat_number": i}
+        if bounty is not _ABSENT:
+            player["bounty"] = bounty
+        players.append(player)
+    return _hand_setup_state(total_seat_count=total_seat_count, players=players)
+
+
+_ABSENT = object()
+
+
+def test_p4_1_progressive_video_with_every_bounty_present_passes():
+    assert check_preconditions(_bounty_state([125.0, 250.0, 500.0]), "progressive") is None
+
+
+@pytest.mark.parametrize("bounties,expected_seat", [
+    ([125.0, None, 500.0], "SB"),
+    ([_ABSENT, 250.0, 500.0], "BB"),
+    ([125.0, 250.0, 0], "BTN"),          # zero is not a live bounty
+])
+def test_p4_1_progressive_video_missing_a_bounty_skips(bounties, expected_seat):
+    reason = check_preconditions(_bounty_state(bounties), "progressive")
+    assert reason.startswith("skipped: P4-1: null_bounty_progressive: ")
+    assert expected_seat in reason
+
+
+def test_p4_1_catches_the_phantom_seat_shape_the_null_stack_check_misses():
+    """The documented non-null phantom carried a real-looking stack and a null
+    bounty, so it passed the null-stack precondition and was processed."""
+    state = _bounty_state([125.0, 250.0, 500.0], total_seat_count=4)
+    state["players"].append(
+        {"seat_position_label": "CO", "stack_size": 0.38, "seat_number": 4, "bounty": None}
+    )
+    reason = check_preconditions(state, "progressive")
+    assert reason.startswith("skipped: P4-1: null_bounty_progressive: ")
+    assert "CO" in reason
+
+
+def test_p4_2_non_bounty_video_with_no_bounties_passes():
+    assert check_preconditions(_bounty_state([_ABSENT] * 3), "none") is None
+
+
+def test_p4_2_bounty_on_a_non_bounty_video_skips():
+    """A value here means bounty_type was misclassified by the video's one
+    payout read, which a retry of this hand cannot change."""
+    reason = check_preconditions(_bounty_state([_ABSENT, 250.0, _ABSENT]), "none")
+    assert reason.startswith("skipped: P4-2: bounty_on_non_bounty_video: ")
+    assert "SB" in reason
+
+
+@pytest.mark.parametrize("size,labels", [
+    (2, ["BB", "BTN"]),
+    (3, ["BB", "SB", "BTN"]),
+    (6, ["BB", "SB", "BTN", "CO", "HJ", "LJ"]),
+    (9, ["BB", "SB", "BTN", "CO", "HJ", "LJ", "UTG+2", "UTG+1", "UTG"]),
+])
+def test_p4_3_canonical_label_sets_pass(size, labels):
+    state = _hand_setup_state(
+        total_seat_count=size,
+        players=[
+            {"seat_position_label": lb, "stack_size": 50.0, "seat_number": i}
+            for i, lb in enumerate(labels, start=1)
+        ],
+    )
+    assert check_preconditions(state, "none") is None
+
+
+@pytest.mark.parametrize("size,labels,why", [
+    (3, ["BB", "SB"], "missing a seat"),
+    (3, ["BB", "SB", "SB"], "repeated label"),
+    (3, ["BB", "SB", "CO"], "foreign label for this size"),
+    (2, ["BB", "SB"], "heads-up stores BTN, not SB"),
+    (7, ["BB", "SB", "BTN", "CO", "HJ", "LJ", "UTG"], "7-handed ends at UTG+2"),
+])
+def test_p4_3_invalid_label_sets_skip(size, labels, why):
+    state = _hand_setup_state(
+        total_seat_count=size,
+        players=[
+            {"seat_position_label": lb, "stack_size": 50.0, "seat_number": i}
+            for i, lb in enumerate(labels, start=1)
+        ],
+    )
+    reason = check_preconditions(state, "none")
+    assert reason is not None, why
+    assert reason.startswith("skipped: P4-3: invalid_label_set: "), why
+
+
+def test_preconditions_first_failure_wins_and_null_stack_still_leads():
+    """Ordering is load-bearing: the pre-existing checks run before the new
+    ones, so a phantom seat reading null for everything still reports as a null
+    stack rather than as a bounty gap."""
+    state = _hand_setup_state(
+        total_seat_count=3,
+        players=[
+            {"seat_position_label": "BB", "stack_size": None, "seat_number": 1},
+            {"seat_position_label": "SB", "stack_size": 50.0, "seat_number": 2},
+            {"seat_position_label": "BTN", "stack_size": 50.0, "seat_number": 3},
+        ],
+    )
+    assert "null stack_size" in check_preconditions(state, "progressive")
+
+
+# ---------------------------------------------------------------------------
+# P4-4 .. P4-6 — output checks
+# ---------------------------------------------------------------------------
+
+
+_THREE_SEATS = {
+    "players": [
+        {"seat_position_label": "BB", "seat_number": 1},
+        {"seat_position_label": "SB", "seat_number": 2},
+        {"seat_position_label": "BTN", "seat_number": 3},
+    ]
+}
+
+
+@pytest.mark.parametrize("action_type", ["call", "raise", "all_in"])
+def test_p4_4_valid_fva_action_types_pass(action_type):
+    fva = {"seat_position_label": "BTN", "action_type": action_type, "seat_number": 3}
+    assert check_fva(fva, _THREE_SEATS) is None
+
+
+@pytest.mark.parametrize("action_type", ["fold", "check", "bet", "limp", None])
+def test_p4_4_non_commitment_action_types_fail(action_type):
+    """The FVA is the first voluntary chip commitment; fold and check commit
+    nothing, and bet is not in identify_hand_start.md's vocabulary."""
+    fva = {"seat_position_label": "BTN", "action_type": action_type, "seat_number": 3}
+    reason = check_fva(fva, _THREE_SEATS)
+    assert reason.startswith("P4-4: invalid_fva_action_type: ")
+
+
+def test_p4_4_fva_label_not_in_the_hand_fails():
+    """An unresolvable label leaves seat_number None, which the eligible-seat
+    calculation reads as 'every seat' — so this gate is what stops a bad label
+    silently widening the hole-card requirement to the whole table."""
+    fva = {"seat_position_label": "UTG", "action_type": "raise", "seat_number": None}
+    reason = check_fva(fva, _THREE_SEATS)
+    assert reason.startswith("P4-4: invalid_fva_action_type: ")
+    assert "not a seat in this hand" in reason
+
+
+def test_p4_5_distinct_cards_pass():
+    players = [
+        {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+        {"seat_position_label": "SB", "hole_cards": ["2c", "3c"]},
+    ]
+    assert check_duplicate_hole_cards(players) is None
+
+
+def test_p4_5_duplicate_across_two_seats_fails():
+    players = [
+        {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+        {"seat_position_label": "SB", "hole_cards": ["Ah", "3c"]},
+    ]
+    reason = check_duplicate_hole_cards(players)
+    assert reason.startswith("P4-5: duplicate_hole_card: ")
+    assert "BB" in reason and "SB" in reason
+
+
+def test_p4_5_duplicate_within_one_seat_fails():
+    players = [{"seat_position_label": "BB", "hole_cards": ["Ah", "Ah"]}]
+    assert check_duplicate_hole_cards(players).startswith("P4-5: duplicate_hole_card: ")
+
+
+def test_p4_5_compares_case_folded():
+    """normalize_card only maps '10' -> 'T'; it does not canonicalize case, so a
+    naive comparison would let this through."""
+    players = [
+        {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+        {"seat_position_label": "SB", "hole_cards": ["AH", "3c"]},
+    ]
+    assert check_duplicate_hole_cards(players) is not None
+
+
+def test_p4_5_ignores_nulls():
+    """A null is P4-6's business, not P4-5's — two nulls are not a duplicate."""
+    players = [
+        {"seat_position_label": "BB", "hole_cards": [None, None]},
+        {"seat_position_label": "SB", "hole_cards": [None, "3c"]},
+    ]
+    assert check_duplicate_hole_cards(players) is None
+
+
+def test_p4_6_all_eligible_seats_readable_passes():
+    players = [
+        {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+        {"seat_position_label": "SB", "hole_cards": ["2c", "3c"]},
+    ]
+    assert check_missing_hole_cards(players) is None
+
+
+@pytest.mark.parametrize("cards", [None, [], [None, None], ["Ah", None]])
+def test_p4_6_any_unreadable_card_on_a_live_seat_fails(cards):
+    players = [
+        {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+        {"seat_position_label": "SB", "hole_cards": cards},
+    ]
+    reason = check_missing_hole_cards(players)
+    assert reason.startswith("P4-6: missing_hole_cards_live_seat: ")
+    assert "SB" in reason
+
+
+def test_eligible_seats_at_fva_is_the_seats_from_the_fva_onwards():
+    """Preflop order is descending seat number, so 'the FVA and everyone after
+    it' is seat_number <= the FVA's."""
+    state = {
+        "fva": {"seat_number": 2},
+        "hand_setup": {"players": [
+            {"seat_position_label": "BB", "seat_number": 1},
+            {"seat_position_label": "SB", "seat_number": 2},
+            {"seat_position_label": "BTN", "seat_number": 3},
+        ]},
+    }
+    assert [p["seat_position_label"] for p in eligible_seats_at_fva(state)] == ["BB", "SB"]
+
+
+def test_find_pending_hand_setups_raises_when_the_video_has_no_payout_row():
+    """A missing tournament_results row is a broken invariant, not a data
+    condition: Phase 2's gate records blocked_upstream rather than producing
+    clips, so nothing downstream should exist.
+
+    The join is LEFT precisely so this is reachable. An INNER JOIN would drop
+    the row and the hand would silently stop being selected — the bounty gates
+    would go quiet rather than loud.
+    """
+    row = MagicMock()
+    row.hand_setup_id = "hs1"
+    row.video_id = "vid1"
+    row.bounty_type = None
+    mock_client = _mock_bq_client(rows=[row])
+
+    with pytest.raises(RuntimeError, match="no tournament_results row"):
+        _find_pending_hand_setups("proj", "ds", client=mock_client)
+
+
+def test_find_pending_hand_setups_error_names_the_command_that_fixes_it():
+    row = MagicMock()
+    row.hand_setup_id = "hs1"
+    row.video_id = "vid1"
+    row.bounty_type = None
+    mock_client = _mock_bq_client(rows=[row])
+
+    with pytest.raises(RuntimeError, match=r"tt extract-payouts --video-id vid1"):
+        _find_pending_hand_setups("proj", "ds", client=mock_client)
+
+
+def test_p4_4_fires_before_any_frame_work():
+    """The point of gating here rather than in dbt is the saved call. A bad FVA
+    must not pay for frame extraction, the hole-card read, or its retry."""
+    bad_fva = {**_CLIP_RESULT_FOUND, "action_type": "fold"}
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=bad_fva),
+        patch("table_talk.hand_start_processing.extract_frame") as mock_extract,
+        patch("table_talk.hand_start_processing.call_gemini_for_frame") as mock_frame,
+        patch("table_talk.hand_start_processing.upload_frame") as mock_upload,
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+        ))
+
+    assert outcome == "failed_transient"
+    mock_extract.assert_not_called()
+    mock_frame.assert_not_called()
+    mock_upload.assert_not_called()
+    mock_write_starts.assert_not_called()
+    assert mock_attempt.call_args[0][0].status_message.startswith(
+        "failed_transient: P4-4: invalid_fva_action_type: "
+    )
+
+
+def test_p4_4_parks_at_the_cap_like_any_other_transient():
+    bad_fva = {**_CLIP_RESULT_FOUND, "action_type": "check"}
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=bad_fva),
+        patch("table_talk.hand_start_processing.write_hand_starts"),
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+            max_attempts=3,
+        ))
+
+    assert outcome == "failed_parked"
+    assert "P4-4: invalid_fva_action_type: " in mock_attempt.call_args[0][0].status_message
+
+
+def test_p4_5_duplicate_in_the_orchestrator_is_transient_and_writes_no_row():
+    duplicate = {"players": [
+        {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+        {"seat_position_label": "BTN", "hole_cards": ["Ah", "3c"]},
+    ]}
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
+        patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch("table_talk.hand_start_processing.call_gemini_for_frame", return_value=duplicate),
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+        ))
+
+    assert outcome == "failed_transient"
+    mock_write_starts.assert_not_called()
+    assert "P4-5: duplicate_hole_card: " in mock_attempt.call_args[0][0].status_message
