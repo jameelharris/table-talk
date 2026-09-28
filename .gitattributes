@@ -1,0 +1,13 @@
+# The provenance block on every stage row records the git blob hash of the prompt
+# files and reference images that produced it, and a test asserts those hashes
+# equal `git hash-object`. That equality only holds if what git stored matches the
+# bytes on disk, so line-ending handling is pinned here rather than left to a
+# contributor's core.autocrlf.
+
+# Prompts are text and are hashed as LF.
+prompts/**      text eol=lf
+
+# Reference images are JPEGs. EOL normalization would corrupt them, and a
+# corrupted reference degrades street detection corpus-wide with no error
+# anywhere — the same failure mode reference_images.py guards against.
+references/**   -text

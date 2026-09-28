@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from table_talk.gemini_caller import GeminiPermanentError, GeminiTransientError
-from table_talk.videos_downloader import DownloadPermanentError
 from table_talk.hand_start_processing import (
     PendingHandSetup,
     _find_pending_hand_setups,
@@ -20,6 +19,7 @@ from table_talk.hand_start_processing import (
     process_hand_setup,
     process_pending_hand_setups,
 )
+from table_talk.videos_downloader import DownloadPermanentError
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -38,6 +38,11 @@ def _hand_setup_state(players=None, total_seat_count=6, pot_size_bb=1.5):
         "players": players,
     }
 
+
+_P4_HASHES = {
+    "prompts/identify_hand_start.md": "dddddddddddd",
+    "prompts/extract_hole_cards.md": "eeeeeeeeeeee",
+}
 
 _HS = PendingHandSetup(
     hand_setup_id="clip_001_001",
@@ -279,6 +284,7 @@ def test_process_hand_setup_happy_path():
             _HS, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "complete"
@@ -332,6 +338,7 @@ def test_process_hand_setup_status_message_notes_capped_window():
             hs, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "complete"
@@ -367,6 +374,7 @@ def test_process_hand_setup_hole_card_no_match_is_none():
             hs, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "complete"
@@ -427,6 +435,7 @@ def test_process_hand_setup_retry_fills_eligible_null():
             hs, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "complete"
@@ -470,6 +479,7 @@ def test_process_hand_setup_retry_still_null_is_still_complete():
             hs, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "complete"
@@ -516,6 +526,7 @@ def test_process_hand_setup_retry_does_not_clobber_first_call_answer():
             hs, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "complete"
@@ -544,6 +555,7 @@ def test_process_hand_setup_no_retry_when_first_call_fully_populated():
             _HS, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "complete"
@@ -578,6 +590,7 @@ def test_process_hand_setup_non_eligible_null_does_not_trigger_retry():
             hs, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "complete"
@@ -616,6 +629,7 @@ def test_process_hand_setup_complete_skipped():
             hs, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "complete_skipped"
@@ -643,6 +657,7 @@ def test_process_hand_setup_uncontested_is_complete_uncontested_zero_rows():
             _HS, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "complete_uncontested"
@@ -666,6 +681,7 @@ def test_process_hand_setup_no_first_voluntary_commitment_is_failed_transient():
             _HS, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "failed_transient"
@@ -687,6 +703,7 @@ def test_process_hand_setup_no_second_action_is_failed_transient():
             _HS, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "failed_transient"
@@ -711,6 +728,7 @@ def test_process_hand_setup_gemini_transient_error():
             _HS, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "failed_transient"
@@ -727,6 +745,7 @@ def test_process_hand_setup_gemini_permanent_error_malformed_json():
             _HS, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "failed_permanent"
@@ -746,6 +765,7 @@ def test_process_hand_setup_hallucinated_fva_is_failed_permanent():
             _HS, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "failed_permanent"
@@ -771,6 +791,7 @@ def test_process_hand_setup_hallucinated_fva_wins_over_no_second_action():
             _HS, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert outcome == "failed_permanent"
@@ -796,6 +817,7 @@ def test_process_hand_setup_no_first_voluntary_commitment_parks_at_cap():
             _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
             max_attempts=3,
         ))
 
@@ -818,6 +840,7 @@ def test_process_hand_setup_no_second_action_parks_at_cap():
             _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
             max_attempts=3,
         ))
 
@@ -838,6 +861,7 @@ def test_process_hand_setup_catch_all_exception_parks_at_cap():
             _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
             max_attempts=3,
         ))
 
@@ -855,6 +879,7 @@ def test_process_hand_setup_gemini_permanent_error_unaffected_by_cap():
             _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
             max_attempts=3,
         ))
 
@@ -873,6 +898,7 @@ def test_process_hand_setup_complete_uncontested_unaffected_by_cap():
             _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
             "videos-bucket", "hand-starts-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
             max_attempts=3,
         ))
 
@@ -905,6 +931,7 @@ def test_process_hand_setup_no_hand_starts_row_unless_complete_with_row():
                 _HS, "/tmp/video.mp4", "proj", "ds",
                 "videos-bucket", "hand-starts-bucket",
                 "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
             ))
         if expect_zero_row_call:
             mock_write_starts.assert_called_once_with(
@@ -932,6 +959,7 @@ def test_process_pending_hand_setups_dispatch():
     ):
         stats = _run(process_pending_hand_setups(
             "proj", "ds", "vbucket", "hbucket", "id_prompt", "eh_prompt",
+            prompt_hashes=_P4_HASHES,
         ))
 
     assert mock_download.call_count == 2
@@ -952,6 +980,7 @@ def test_process_pending_hand_setups_scope_params_translated():
     ):
         _run(process_pending_hand_setups(
             "proj", "ds", "vb", "hb", "ip", "ep",
+            prompt_hashes=_P4_HASHES,
             video_id="v1", only_hand_setup_ids=["hs1"],
         ))
 
@@ -969,7 +998,7 @@ def test_process_pending_hand_setups_no_video_id_means_no_video_scope():
         patch("table_talk.hand_start_processing.download_video"),
         patch("table_talk.hand_start_processing.process_hand_setup", new_callable=AsyncMock, return_value="complete"),
     ):
-        _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep"))
+        _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES))
 
     mock_find.assert_called_once_with(
         "proj", "ds",
@@ -987,7 +1016,7 @@ def test_process_pending_hand_setups_download_failure_marks_transient():
         patch("table_talk.hand_start_processing.process_hand_setup", new_callable=AsyncMock) as mock_process,
         patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
     ):
-        stats = _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep"))
+        stats = _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES))
 
     mock_process.assert_not_called()
     assert stats["hand_setups_processed"] == 1
@@ -1006,7 +1035,7 @@ def test_process_pending_hand_setups_download_failure_parks_at_cap():
         patch("table_talk.hand_start_processing.process_hand_setup", new_callable=AsyncMock) as mock_process,
         patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
     ):
-        stats = _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep", max_attempts=3))
+        stats = _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES, max_attempts=3))
 
     mock_process.assert_not_called()
     assert stats["hand_setups_failed_parked"] == 1
@@ -1025,7 +1054,7 @@ def test_process_pending_hand_setups_download_not_found_marks_permanent():
         patch("table_talk.hand_start_processing.process_hand_setup", new_callable=AsyncMock) as mock_process,
         patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
     ):
-        stats = _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep"))
+        stats = _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES))
 
     mock_process.assert_not_called()
     assert stats["hand_setups_processed"] == 2
@@ -1052,7 +1081,8 @@ async def _integration_body():
     from google.cloud import storage as gcs
 
     from table_talk._generated.hand_setups_row import HandSetupsRow
-    from table_talk.clip_manifest_writer import ClipManifestRow as CMRow, write_clip_manifest_rows
+    from table_talk.clip_manifest_writer import ClipManifestRow as CMRow
+    from table_talk.clip_manifest_writer import write_clip_manifest_rows
     from table_talk.hand_setups_writer import write_hand_setups
     from table_talk.videos_writer import VideosRow, write_video_row
 
@@ -1152,6 +1182,7 @@ async def _integration_body():
             hand_starts_bucket=hand_starts_bucket,
             identify_hand_start_prompt=identify_hand_start_prompt,
             extract_hole_cards_prompt=extract_hole_cards_prompt,
+            prompt_hashes=_P4_HASHES,
             only_hand_setup_ids=[hand_setup_id],
             bq_client=bq_client,
             gcs_client=gcs_client,
@@ -1281,8 +1312,12 @@ def _seed_hand_setup_for_pending_query(bq_client):
 
 
 def _write_pending_query_attempt(bq_client, hand_setup_id, status):
-    from table_talk._generated.hand_setup_processing_attempts_row import HandSetupProcessingAttemptsRow
-    from table_talk.hand_setup_processing_attempts_writer import write_hand_setup_processing_attempt_row
+    from table_talk._generated.hand_setup_processing_attempts_row import (
+        HandSetupProcessingAttemptsRow,
+    )
+    from table_talk.hand_setup_processing_attempts_writer import (
+        write_hand_setup_processing_attempt_row,
+    )
 
     write_hand_setup_processing_attempt_row(
         HandSetupProcessingAttemptsRow(
@@ -1445,3 +1480,63 @@ def test_find_pending_hand_setups_latest_parked_not_selected():
         assert results == [], f"Expected parked entity to be excluded, got {results}"
     finally:
         _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id)
+
+
+# ---------------------------------------------------------------------------
+# Provenance
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_is_a_sibling_and_lists_both_prompts():
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
+        patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch("table_talk.hand_start_processing.call_gemini_for_frame", return_value=_HOLE_CARDS_RESULT),
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row"),
+    ):
+        _run(process_hand_setup(
+            _HS, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+        ))
+
+    state = mock_write_starts.call_args[0][0][0].hand_start_state
+    assert set(state) == {"hand_setup", "fva", "provenance"}
+    assert set(state["provenance"]["prompts"]) == {
+        "prompts/identify_hand_start.md",
+        "prompts/extract_hole_cards.md",
+    }
+
+
+def test_phase_3_provenance_rides_through_the_nested_hand_setup():
+    """Phase 4 nests hand_setup verbatim, so a Phase 3 provenance block reaches
+    hand_starts with no code here assembling it. That chain is the design — a
+    hand_actions row ends up carrying all three layers."""
+    hs = replace(
+        _HS,
+        hand_setup_state={
+            **_HS.hand_setup_state,
+            "provenance": {"models": {"clip": "p3-model"}, "prompts": {"prompts/identify_hand.md": "abc"}},
+        },
+    )
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
+        patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch("table_talk.hand_start_processing.call_gemini_for_frame", return_value=_HOLE_CARDS_RESULT),
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row"),
+    ):
+        _run(process_hand_setup(
+            hs, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+        ))
+
+    state = mock_write_starts.call_args[0][0][0].hand_start_state
+    assert state["hand_setup"]["provenance"]["models"] == {"clip": "p3-model"}
+    assert state["provenance"] != state["hand_setup"]["provenance"]

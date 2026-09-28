@@ -58,6 +58,15 @@ def _hand_start_state(total_seat_count=6, fva=_FVA, players=None):
     return state
 
 
+_P5_HASHES = {
+    "prompts/extract_player_actions.md": "111111111111",
+    "prompts/extract_community_cards.md": "222222222222",
+    "prompts/extract_community_cards_from_frame.md": "333333333333",
+    "references/flop_reference.jpeg": "444444444444",
+    "references/turn_reference.jpeg": "555555555555",
+    "references/river_reference.jpeg": "666666666666",
+}
+
 def _pending(**kwargs) -> PendingHandStart:
     # Window is [100, 160]; the FVA lands at 105.
     defaults = dict(
@@ -161,6 +170,7 @@ def _call(hs):
         process_hand_start(
             hs, "/tmp/video.mp4", "proj", "ds", "videos-bucket", "actions-bucket",
             _ACTIONS_PROMPT, _SCAN_PROMPT, _FRAME_PROMPT, _REFERENCE_IMAGES,
+            prompt_hashes=_P5_HASHES,
         )
     )
 
@@ -437,8 +447,11 @@ def test_hand_start_state_nested_verbatim_under_hand_start():
         _call(_pending())
 
     state = _written_row(mocks).hand_action_state
+    # Verbatim: provenance is a sibling of this phase's contribution, so the
+    # nested upstream blob is untouched. If provenance were merged into
+    # hand_start instead, this equality would fail — which is the point.
     assert state["hand_start"] == _hand_start_state()
-    assert set(state) == {"hand_start", "streets", "winning_positions"}
+    assert set(state) == {"hand_start", "streets", "winning_positions", "provenance"}
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +976,7 @@ def _run_pending(**kwargs):
         process_pending_hand_starts(
             "proj", "ds", "videos-bucket", "actions-bucket",
             _ACTIONS_PROMPT, _SCAN_PROMPT, _FRAME_PROMPT, _REFERENCE_IMAGES,
+            prompt_hashes=_P5_HASHES,
             **kwargs,
         )
     )
@@ -1599,3 +1613,69 @@ def test_find_pending_hand_starts_latest_parked_not_selected():
         assert results == []
     finally:
         _cleanup_hand_start(bq_client, ids)
+
+
+# ---------------------------------------------------------------------------
+# Provenance
+#
+# Step E's prompts and reference images are listed only when step E ran. A hand
+# that ended preflop makes no scan and no read, so naming those files would
+# claim a provenance the row does not have.
+# ---------------------------------------------------------------------------
+
+
+def _provenance_from(mocks):
+    return _written_row(mocks).hand_action_state["provenance"]
+
+
+def test_preflop_only_hand_lists_step_d_prompt_only():
+    with _patched([_d_result()]) as mocks:
+        _call(_pending())
+
+    provenance = _provenance_from(mocks)
+    assert set(provenance["prompts"]) == {"prompts/extract_player_actions.md"}
+    # No frame call was made, so no frame model is claimed.
+    assert set(provenance["models"]) == {"clip"}
+
+
+def test_hand_reaching_the_flop_lists_step_e_prompts_and_references():
+    with _patched(
+        [_d_result(("preflop", "flop")), _scan()],
+        frame_results=[{"new_cards": ["Ah", "Kd", "2c"]}],
+    ) as mocks:
+        _call(_pending())
+
+    provenance = _provenance_from(mocks)
+    assert set(provenance["prompts"]) == {
+        "prompts/extract_player_actions.md",
+        "prompts/extract_community_cards.md",
+        "prompts/extract_community_cards_from_frame.md",
+        "references/flop_reference.jpeg",
+        "references/turn_reference.jpeg",
+        "references/river_reference.jpeg",
+    }
+    # The card read is a frame-mode call; the scan is clip-mode.
+    assert set(provenance["models"]) == {"clip", "frame"}
+
+
+def test_all_three_references_are_listed_even_for_a_flop_only_hand():
+    """Every scan carries all three images, so all three contributed."""
+    with _patched(
+        [_d_result(("preflop", "flop")), _scan()],
+        frame_results=[{"new_cards": ["Ah", "Kd", "2c"]}],
+    ) as mocks:
+        _call(_pending())
+
+    prompts = _provenance_from(mocks)["prompts"]
+    assert "references/turn_reference.jpeg" in prompts
+    assert "references/river_reference.jpeg" in prompts
+
+
+def test_provenance_hashes_are_the_ones_handed_in():
+    with _patched([_d_result()]) as mocks:
+        _call(_pending())
+
+    prompts = _provenance_from(mocks)["prompts"]
+    assert prompts["prompts/extract_player_actions.md"] == (
+        _P5_HASHES["prompts/extract_player_actions.md"]
+    )

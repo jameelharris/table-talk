@@ -27,6 +27,12 @@ from table_talk._generated.clip_processing_attempts_row import ClipProcessingAtt
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
 
+_P3_HASHES = {
+    "prompts/identify_hand.md": "aaaaaaaaaaaa",
+    "prompts/extract_player_info.md": "bbbbbbbbbbbb",
+    "prompts/extract_player_info_bounty_addendum.md": "cccccccccccc",
+}
+
 _CLIP = PendingClip(
     clip_id="dQw4w9WgXcQ_001",
     video_id="dQw4w9WgXcQ",
@@ -167,6 +173,7 @@ def test_process_clip_happy_path():
             _CLIP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
         ))
 
     assert outcome == "complete"
@@ -207,6 +214,7 @@ def test_process_clip_empty_hand_setups():
             _CLIP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
         ))
 
     assert outcome == "complete"
@@ -235,6 +243,7 @@ def test_process_clip_gemini_transient_error():
             _CLIP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
         ))
 
     assert outcome == "failed_transient"
@@ -251,6 +260,7 @@ def test_process_clip_gemini_permanent_error():
             _CLIP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
         ))
 
     assert outcome == "failed_permanent"
@@ -271,6 +281,7 @@ def test_process_clip_frame_extraction_error_no_uploads_no_writes():
             _CLIP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
         ))
 
     assert outcome == "failed_transient"
@@ -298,6 +309,7 @@ def test_process_clip_hallucinated_timestamp_outside_range():
             _CLIP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
         ))
 
     assert outcome == "failed_permanent"
@@ -329,6 +341,7 @@ def test_process_clip_gemini_frame_error_no_inserts_no_uploads():
             _CLIP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
         ))
 
     assert outcome == "failed_transient"
@@ -354,6 +367,7 @@ def test_process_clip_catch_all_exception_parks_at_cap():
             _CLIP_AT_CAP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
             max_attempts=3,
         ))
 
@@ -371,6 +385,7 @@ def test_process_clip_gemini_permanent_error_unaffected_by_cap():
             _CLIP_AT_CAP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
             max_attempts=3,
         ))
 
@@ -388,6 +403,7 @@ def test_process_clip_complete_unaffected_by_cap():
             _CLIP_AT_CAP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
             max_attempts=3,
         ))
 
@@ -425,6 +441,7 @@ def test_process_clip_seat_enrichment_applied():
             _CLIP, "/tmp/video.mp4", "proj", "ds",
             "hand-setups-bucket", "videos-bucket",
             "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
         ))
 
     rows_arg = mock_write_setups.call_args[0][0]
@@ -518,11 +535,58 @@ def _run_one_clip_and_capture_frame_prompt(bounty_type, player_info=None):
     ):
         _run(process_pending_clips(
             "proj", "ds", "vb", "hb", "BASE PROMPT", "BASE PROMPT", "BOUNTY ADDENDUM",
+            _P3_HASHES,
         ))
 
     frame_prompt = mock_frame.call_args[0][0]
-    written_players = mock_write.call_args[0][0][0].hand_setup_state["players"]
-    return frame_prompt, written_players
+    written_state = mock_write.call_args[0][0][0].hand_setup_state
+    return frame_prompt, written_state["players"]
+
+
+def _run_one_clip_and_capture_provenance(bounty_type):
+    clip = replace(_CLIP, bounty_type=bounty_type)
+    with (
+        patch("table_talk.hand_setup_processing._find_pending_clips", return_value=[clip]),
+        patch("table_talk.hand_setup_processing.download_video"),
+        patch("table_talk.hand_setup_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_ONE_SETUP),
+        patch("table_talk.hand_setup_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch("table_talk.hand_setup_processing.call_gemini_for_frame", return_value=_PLAYER_INFO),
+        patch("table_talk.hand_setup_processing.upload_frame"),
+        patch("table_talk.hand_setup_processing.write_hand_setups") as mock_write,
+        patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row"),
+    ):
+        _run(process_pending_clips(
+            "proj", "ds", "vb", "hb", "BASE PROMPT", "BASE PROMPT", "BOUNTY ADDENDUM",
+            _P3_HASHES,
+        ))
+    return mock_write.call_args[0][0][0].hand_setup_state["provenance"]
+
+
+def test_provenance_lists_the_bounty_addendum_only_on_a_progressive_video():
+    """The addendum contributes to the row only when it was concatenated. The
+    branch here must mirror _player_info_prompt's, and nothing else checks it."""
+    progressive = _run_one_clip_and_capture_provenance("progressive")
+    assert set(progressive["prompts"]) == {
+        "prompts/identify_hand.md",
+        "prompts/extract_player_info.md",
+        "prompts/extract_player_info_bounty_addendum.md",
+    }
+
+    non_bounty = _run_one_clip_and_capture_provenance("none")
+    assert set(non_bounty["prompts"]) == {
+        "prompts/identify_hand.md",
+        "prompts/extract_player_info.md",
+    }
+
+
+def test_provenance_records_both_call_modes():
+    """Phase 3 makes a clip call (detection) and a frame call (player info), and
+    the two can be served by different models."""
+    from table_talk.gemini_caller import CLIP_MODEL, FRAME_MODEL
+
+    provenance = _run_one_clip_and_capture_provenance("none")
+    assert provenance["models"] == {"clip": CLIP_MODEL, "frame": FRAME_MODEL}
+    assert provenance["prompts"]["prompts/identify_hand.md"] == _P3_HASHES["prompts/identify_hand.md"]
 
 
 def test_non_bounty_video_sends_the_unmodified_prompt():
@@ -612,7 +676,7 @@ def test_process_pending_clips_dispatch():
         patch("table_talk.hand_setup_processing.process_clip", new_callable=AsyncMock, return_value="complete") as mock_process,
     ):
         stats = _run(process_pending_clips(
-            "proj", "ds", "vbucket", "hbucket", "id_prompt", "ep_prompt", "addendum",
+            "proj", "ds", "vbucket", "hbucket", "id_prompt", "ep_prompt", "addendum", _P3_HASHES,
         ))
 
     # One download per video
@@ -636,7 +700,7 @@ def test_process_pending_clips_scope_params_propagated():
         patch("table_talk.hand_setup_processing.process_clip", new_callable=AsyncMock, return_value="complete"),
     ):
         _run(process_pending_clips(
-            "proj", "ds", "vb", "hb", "ip", "ep", "addendum",
+            "proj", "ds", "vb", "hb", "ip", "ep", "addendum", _P3_HASHES,
             only_clip_ids=["c1"], only_video_ids=["v1"],
         ))
 
@@ -658,7 +722,7 @@ def test_process_pending_clips_download_failure_marks_clips_failed():
         patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
     ):
         stats = _run(process_pending_clips(
-            "proj", "ds", "vb", "hb", "ip", "ep", "addendum",
+            "proj", "ds", "vb", "hb", "ip", "ep", "addendum", _P3_HASHES,
         ))
 
     mock_process.assert_not_called()
@@ -681,7 +745,7 @@ def test_process_pending_clips_download_failure_parks_at_cap():
         patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
     ):
         stats = _run(process_pending_clips(
-            "proj", "ds", "vb", "hb", "ip", "ep", "addendum", max_attempts=3,
+            "proj", "ds", "vb", "hb", "ip", "ep", "addendum", _P3_HASHES, max_attempts=3,
         ))
 
     mock_process.assert_not_called()
@@ -702,7 +766,7 @@ def test_process_pending_clips_download_not_found_marks_clips_permanent():
         patch("table_talk.hand_setup_processing.process_clip", new_callable=AsyncMock) as mock_process,
         patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
     ):
-        stats = _run(process_pending_clips("proj", "ds", "vb", "hb", "ip", "ep", "addendum"))
+        stats = _run(process_pending_clips("proj", "ds", "vb", "hb", "ip", "ep", "addendum", _P3_HASHES))
 
     mock_process.assert_not_called()
     assert stats["clips_processed"] == 2

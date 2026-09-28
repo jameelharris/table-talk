@@ -24,10 +24,17 @@ from ._generated.hand_starts_row import HandStartsRow
 from .card_normalization import normalize_cards
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
-from .gemini_caller import GeminiPermanentError, call_gemini_for_clip, call_gemini_for_frame
+from .gemini_caller import (
+    CLIP_MODEL,
+    FRAME_MODEL,
+    GeminiPermanentError,
+    call_gemini_for_clip,
+    call_gemini_for_frame,
+)
 from .hand_setup_processing_attempts_writer import write_hand_setup_processing_attempt_row
 from .hand_starts_writer import write_hand_starts
 from .prompt_context import build_hole_card_context, build_player_context
+from .provenance import build_provenance, select
 from .seat_enrichment import add_fva_seat_number, normalize_heads_up
 from .timestamp_utils import parse_timestamp
 from .videos_downloader import DownloadPermanentError, download_video
@@ -221,6 +228,7 @@ async def process_hand_setup(
     identify_hand_start_prompt: str,
     extract_hole_cards_prompt: str,
     *,
+    prompt_hashes: dict[str, str],
     max_attempts: int = 3,
 ) -> str:
     """Process one hand_setup end-to-end. Returns the outcome status string.
@@ -285,7 +293,21 @@ async def process_hand_setup(
         # field isn't) — normalize_heads_up and the hole-card matching below
         # mutate it in place, so hs.hand_setup_state is mutated too. Harmless
         # today since nothing reads hs after this point.
-        hand_start_state = {"hand_setup": hs.hand_setup_state, "fva": fva_data}
+        hand_start_state = {
+            "hand_setup": hs.hand_setup_state,
+            "fva": fva_data,
+            # Sibling of this phase's own contribution. The nested hand_setup
+            # carries Phase 3's own provenance block unchanged, so a hand_starts
+            # row records both layers without this phase assembling anything.
+            "provenance": build_provenance(
+                models={"clip": CLIP_MODEL, "frame": FRAME_MODEL},
+                prompts=select(
+                    prompt_hashes,
+                    "prompts/identify_hand_start.md",
+                    "prompts/extract_hole_cards.md",
+                ),
+            ),
+        }
         normalize_heads_up(hand_start_state["hand_setup"], fva=hand_start_state["fva"])
 
         with tempfile.TemporaryDirectory() as frame_tmpdir:
@@ -431,6 +453,7 @@ async def process_pending_hand_setups(
     identify_hand_start_prompt: str,
     extract_hole_cards_prompt: str,
     *,
+    prompt_hashes: dict[str, str],
     video_id: str | None = None,
     only_hand_setup_ids: list[str] | None = None,
     max_concurrent: int = 4,
@@ -518,6 +541,7 @@ async def process_pending_hand_setups(
                         hand_starts_bucket,
                         identify_hand_start_prompt,
                         extract_hole_cards_prompt,
+                        prompt_hashes=prompt_hashes,
                         max_attempts=max_attempts,
                     )
 

@@ -39,7 +39,7 @@
     "name": "hand_start_state",
     "type": "JSON",
     "mode": "REQUIRED",
-    "description": "Observed state at hand start. Structure: {hand_setup: {...same shape as hand_setups.hand_setup_state}, fva: {seat_position_label: string, seat_number: int, action_type: string, bet_amount: number|null}}. Outer wrapper from raw LLM response is stripped before storage."
+    "description": "Observed state at hand start. Structure: {hand_setup: {...same shape as hand_setups.hand_setup_state}, fva: {seat_position_label: string, seat_number: int, action_type: string, bet_amount: number|null}}. Outer wrapper from raw LLM response is stripped before storage. The provenance key is a sibling of this phase's own contribution and records the models that served each call mode and the git blob hash of every prompt file and reference image that contributed to this row."
   },
   {
     "name": "fva_frame_gcs_path",

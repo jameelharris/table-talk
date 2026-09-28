@@ -54,8 +54,15 @@ from google.genai import types
 # Read once at import, because a model changing mid-run would leave the corpus
 # with no record of which row came from which. The names are vendor-neutral on
 # purpose.
-_CLIP_MODEL = os.environ.get("TT_CLIP_MODEL", "gemini-3.8-flash")
-_FRAME_MODEL = os.environ.get("TT_FRAME_MODEL", "gemini-3.8-flash")
+#
+# Public, not underscore-private: the provenance block on every stage row records
+# which model served each call mode, and it reads these. Re-deriving them from
+# os.environ at the write site would be a second mechanism for one setting — the
+# thing TT_GEMINI_MODEL's retirement exists to prevent — and would silently
+# disagree if the environment were ever mutated after import. Same reasoning as
+# _log_usage taking `model` as a parameter: guessing mislabels every row.
+CLIP_MODEL = os.environ.get("TT_CLIP_MODEL", "gemini-3.8-flash")
+FRAME_MODEL = os.environ.get("TT_FRAME_MODEL", "gemini-3.8-flash")
 
 _RETRY_MAX_ATTEMPTS = 5
 _RETRY_BASE_DELAY_SECONDS = 5.0
@@ -247,7 +254,7 @@ def call_gemini_for_clip(
     try:
         response = _call_with_retry(
             lambda: client.models.generate_content(
-                model=_CLIP_MODEL,
+                model=CLIP_MODEL,
                 config=types.GenerateContentConfig(system_instruction=prompt),
                 contents=request_contents,
             )
@@ -261,7 +268,7 @@ def call_gemini_for_clip(
     except genai_errors.APIError as exc:
         raise _classify_genai_error(exc) from exc
 
-    _log_usage(response, label, _CLIP_MODEL)
+    _log_usage(response, label, CLIP_MODEL)
     return _parse_and_validate(response)
 
 
@@ -284,7 +291,7 @@ def call_gemini_for_frame(
     try:
         response = _call_with_retry(
             lambda: client.models.generate_content(
-                model=_FRAME_MODEL,
+                model=FRAME_MODEL,
                 config=types.GenerateContentConfig(
                     system_instruction=prompt,
                     media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
@@ -301,5 +308,5 @@ def call_gemini_for_frame(
     except genai_errors.APIError as exc:
         raise _classify_genai_error(exc) from exc
 
-    _log_usage(response, label, _FRAME_MODEL)
+    _log_usage(response, label, FRAME_MODEL)
     return _parse_and_validate(response)

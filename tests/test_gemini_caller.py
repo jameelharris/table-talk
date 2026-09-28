@@ -417,8 +417,8 @@ def test_model_defaults(monkeypatch):
     _unset_model_env(monkeypatch)
     module = _load_fresh_module()
 
-    assert module._CLIP_MODEL == "gemini-3.8-flash"
-    assert module._FRAME_MODEL == "gemini-3.8-flash"
+    assert module.CLIP_MODEL == "gemini-3.8-flash"
+    assert module.FRAME_MODEL == "gemini-3.8-flash"
 
 
 def test_clip_env_var_sets_request_model_and_usage_log(monkeypatch, capsys):
@@ -505,8 +505,8 @@ def test_tt_gemini_model_is_retired(monkeypatch):
     monkeypatch.setenv("TT_GEMINI_MODEL", "retired-model-under-test")
     module = _load_fresh_module()
 
-    assert module._CLIP_MODEL == "gemini-3.8-flash"
-    assert module._FRAME_MODEL == "gemini-3.8-flash"
+    assert module.CLIP_MODEL == "gemini-3.8-flash"
+    assert module.FRAME_MODEL == "gemini-3.8-flash"
 
 
 # --- happy path tests ---

@@ -35,7 +35,8 @@ from ._generated.tournament_results_processing_attempts_row import (
 from ._generated.tournament_results_row import TournamentResultsRow
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
-from .gemini_caller import GeminiPermanentError, call_gemini_for_frame
+from .gemini_caller import FRAME_MODEL, GeminiPermanentError, call_gemini_for_frame
+from .provenance import build_provenance, select
 from .tournament_results_processing_attempts_writer import (
     write_tournament_results_processing_attempt_row,
 )
@@ -347,6 +348,7 @@ async def process_video(
     tournament_results_bucket: str,
     extract_results_prompt: str,
     *,
+    prompt_hashes: dict[str, str],
     max_attempts: int = 3,
 ) -> str:
     """Process one video end-to-end. Returns the outcome status string.
@@ -388,7 +390,16 @@ async def process_video(
                 currency_symbol=panel["currency_symbol"].strip(),
                 frame_timestamp_seconds=timestamp,
                 frame_gcs_path=frame_gcs_path,
-                tournament_results_state={"panel": normalized},
+                tournament_results_state={
+                    "panel": normalized,
+                    # Sibling of the phase's own contribution, per CLAUDE.md's
+                    # stage-blob rule. This phase makes one frame call and has
+                    # no upstream blob to nest.
+                    "provenance": build_provenance(
+                        models={"frame": FRAME_MODEL},
+                        prompts=select(prompt_hashes, "prompts/extract_results.md"),
+                    ),
+                },
             )
             write_tournament_results(
                 [row], video_id=video.video_id, project_id=project_id, dataset=dataset
@@ -430,6 +441,7 @@ async def process_pending_videos(
     tournament_results_bucket: str,
     extract_results_prompt: str,
     *,
+    prompt_hashes: dict[str, str],
     video_id: str | None = None,
     max_attempts: int = 3,
     bq_client: bigquery.Client | None = None,
@@ -519,6 +531,7 @@ async def process_pending_videos(
                 dataset,
                 tournament_results_bucket,
                 extract_results_prompt,
+                prompt_hashes=prompt_hashes,
                 max_attempts=max_attempts,
             )
 

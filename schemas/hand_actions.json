@@ -27,7 +27,7 @@
     "name": "hand_action_state",
     "type": "JSON",
     "mode": "REQUIRED",
-    "description": "Observed action sequence, community cards, and outcome for the hand. Structure: {hand_start: {...verbatim copy of hand_starts.hand_start_state}, streets: [{street_name: string, street_timestamp: int|null, community_cards: [string], actions: [{action_order: int, seat_position_label: string, action_type: string, bet_amount: number|null}]}], winning_positions: [string]}. street_timestamp is an offset from the start of the source video in whole seconds, and is null for preflop (there is no card-reveal moment). The embedded hand_start is a snapshot taken at write time; reprocessing Phase 4 does not update it."
+    "description": "Observed action sequence, community cards, and outcome for the hand. Structure: {hand_start: {...verbatim copy of hand_starts.hand_start_state}, streets: [{street_name: string, street_timestamp: int|null, community_cards: [string], actions: [{action_order: int, seat_position_label: string, action_type: string, bet_amount: number|null}]}], winning_positions: [string]}. street_timestamp is an offset from the start of the source video in whole seconds, and is null for preflop (there is no card-reveal moment). The embedded hand_start is a snapshot taken at write time; reprocessing Phase 4 does not update it. The provenance key is a sibling of this phase's own contribution and records the models that served each call mode and the git blob hash of every prompt file and reference image that contributed to this row."
   },
   {
     "name": "street_frame_gcs_paths",

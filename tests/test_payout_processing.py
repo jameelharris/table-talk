@@ -27,6 +27,7 @@ from table_talk.videos_downloader import DownloadPermanentError
 
 _PROMPT = "RESULTS PANEL PROMPT"
 _BUCKET = "tournament-results-bucket"
+_HASHES = {"prompts/extract_results.md": "0123456789ab"}
 _LONG_ENOUGH = 3000
 
 
@@ -124,6 +125,7 @@ def _call(video, mocks_max_attempts=3):
             "ds",
             _BUCKET,
             _PROMPT,
+            prompt_hashes=_HASHES,
             max_attempts=mocks_max_attempts,
         )
     )
@@ -472,7 +474,9 @@ def test_written_row_nests_the_panel_under_a_named_key():
         _call(_pending())
 
     row = _written_row(mocks)
-    assert set(row.tournament_results_state) == {"panel"}
+    # provenance is a sibling of the phase's own contribution, not a wrapper
+    # around it — the panel stays reachable at the same path it always was.
+    assert set(row.tournament_results_state) == {"panel", "provenance"}
     assert row.tournament_results_state["panel"]["rows"][0]["payout"] == 62760.03
 
 
@@ -713,7 +717,7 @@ def test_pending_videos_precondition_skip_never_downloads():
     # The whole point of checking ahead of the download: the entity IS the
     # video, so there is nothing to amortise a 100-200 MB fetch over.
     with _patched_orchestrator([_pending(duration_seconds=1)]) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT))
+        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
 
     mocks.download.assert_not_called()
     mocks.process.assert_not_called()
@@ -724,7 +728,7 @@ def test_pending_videos_precondition_skip_never_downloads():
 
 def test_pending_videos_happy_path_downloads_then_processes():
     with _patched_orchestrator([_pending()]) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT))
+        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
 
     mocks.download.assert_called_once()
     assert mocks.download.call_args[0][0] == "gs://vb/dQw4w9WgXcQ.mp4"
@@ -736,7 +740,7 @@ def test_pending_videos_download_404_is_permanent():
     with _patched_orchestrator(
         [_pending()], download_error=DownloadPermanentError("Video object not found")
     ) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT))
+        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
 
     mocks.process.assert_not_called()
     assert stats["videos_failed_permanent"] == 1
@@ -749,7 +753,7 @@ def test_pending_videos_download_error_is_transient():
     with _patched_orchestrator(
         [_pending()], download_error=RuntimeError("connection reset")
     ) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT))
+        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
 
     mocks.process.assert_not_called()
     assert stats["videos_failed_transient"] == 1
@@ -762,7 +766,7 @@ def test_pending_videos_download_error_at_the_cap_parks():
     with _patched_orchestrator(
         [_pending(consecutive_failures=2)], download_error=RuntimeError("connection reset")
     ) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT))
+        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
 
     assert stats["videos_failed_parked"] == 1
     assert mocks.write_attempt.call_args[0][0].status == "failed_parked"
@@ -770,21 +774,21 @@ def test_pending_videos_download_error_at_the_cap_parks():
 
 def test_pending_videos_scopes_to_video_id():
     with _patched_orchestrator([]) as mocks:
-        _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, video_id="somevid"))
+        _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES, video_id="somevid"))
 
     assert mocks.find.call_args[1]["only_video_ids"] == ["somevid"]
 
 
 def test_pending_videos_no_video_id_scopes_to_everything():
     with _patched_orchestrator([]) as mocks:
-        _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT))
+        _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
 
     assert mocks.find.call_args[1]["only_video_ids"] is None
 
 
 def test_pending_videos_stats_shape_with_no_work():
     with _patched_orchestrator([]):
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT))
+        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
 
     assert stats == {
         "videos_processed": 0,
@@ -805,7 +809,7 @@ def test_pending_videos_continues_past_a_failing_video():
     with _patched_orchestrator(
         [_pending(video_id="a"), _pending(video_id="b")], process_outcomes=_next
     ) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT))
+        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
 
     assert mocks.process.call_count == 2
     assert stats["videos_processed"] == 2
@@ -1105,3 +1109,16 @@ def test_currency_symbol_is_stored_trimmed():
 
     assert outcome == "complete"
     assert _written_row(mocks).currency_symbol == "$"
+
+
+def test_provenance_records_the_frame_model_and_the_results_prompt():
+    """Payout extraction is the only single-call-mode phase: one frame call, so
+    one model and one prompt."""
+    from table_talk.gemini_caller import FRAME_MODEL
+
+    with _patched([_panel()]) as mocks:
+        _call(_pending())
+
+    provenance = _written_row(mocks).tournament_results_state["provenance"]
+    assert provenance["models"] == {"frame": FRAME_MODEL}
+    assert provenance["prompts"] == _HASHES

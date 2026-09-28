@@ -21,8 +21,15 @@ from ._generated.hand_setups_row import HandSetupsRow
 from .clip_processing_attempts_writer import write_clip_processing_attempt_row
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
-from .gemini_caller import GeminiPermanentError, call_gemini_for_clip, call_gemini_for_frame
+from .gemini_caller import (
+    CLIP_MODEL,
+    FRAME_MODEL,
+    GeminiPermanentError,
+    call_gemini_for_clip,
+    call_gemini_for_frame,
+)
 from .hand_setups_writer import write_hand_setups
+from .provenance import build_provenance, select
 from .seat_enrichment import add_seat_numbers, normalize_heads_up
 from .timestamp_utils import parse_timestamp
 from .videos_downloader import DownloadPermanentError, download_video
@@ -46,6 +53,20 @@ def _player_info_prompt(base: str, addendum: str, bounty_type: str) -> str:
     the part that matters.
     """
     return f"{base}\n\n{addendum}" if bounty_type == "progressive" else base
+
+
+def _clip_prompt_files(bounty_type: str) -> tuple[str, ...]:
+    """The prompt files that produced a clip's rows, for the provenance block.
+
+    Mirrors _player_info_prompt's branch: the addendum contributes only on a
+    progressive video, and listing it elsewhere would claim a file the row never
+    saw. Kept beside that function so the two branches are read together — they
+    must agree, and nothing else enforces it.
+    """
+    files = ("prompts/identify_hand.md", "prompts/extract_player_info.md")
+    if bounty_type == "progressive":
+        return files + ("prompts/extract_player_info_bounty_addendum.md",)
+    return files
 
 
 def _parse_bounty(value: object) -> float | None:
@@ -182,6 +203,7 @@ async def process_clip(
     identify_hand_prompt: str,
     extract_player_info_prompt: str,
     *,
+    prompt_hashes: dict[str, str],
     max_attempts: int = 3,
 ) -> str:
     """Process one clip end-to-end. Returns the outcome status string.
@@ -269,6 +291,10 @@ async def process_clip(
                     "total_seat_count": inner.get("total_seat_count"),
                     "pot_size_bb": inner.get("pot_size_bb"),
                     "players": players,
+                    "provenance": build_provenance(
+                        models={"clip": CLIP_MODEL, "frame": FRAME_MODEL},
+                        prompts=prompt_hashes,
+                    ),
                 }
                 add_seat_numbers(hand_setup_state)
                 normalize_heads_up(hand_setup_state)
@@ -329,6 +355,7 @@ async def process_pending_clips(
     identify_hand_prompt: str,
     extract_player_info_prompt: str,
     extract_player_info_bounty_addendum: str,
+    prompt_hashes: dict[str, str],
     max_concurrent: int = 4,
     only_clip_ids: list[str] | None = None,
     only_video_ids: list[str] | None = None,
@@ -418,6 +445,12 @@ async def process_pending_clips(
                             extract_player_info_prompt,
                             extract_player_info_bounty_addendum,
                             c.bounty_type,
+                        ),
+                        # Selected here, not in process_clip, for the same reason
+                        # the prompt is composed here: process_clip stays
+                        # bounty-ignorant.
+                        prompt_hashes=select(
+                            prompt_hashes, *_clip_prompt_files(c.bounty_type)
                         ),
                         max_attempts=max_attempts,
                     )

@@ -34,10 +34,18 @@ from ._generated.hand_start_processing_attempts_row import HandStartProcessingAt
 from .card_normalization import normalize_cards
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
-from .gemini_caller import GeminiPermanentError, call_gemini_for_clip, call_gemini_for_frame
+from .gemini_caller import (
+    CLIP_MODEL,
+    FRAME_MODEL,
+    GeminiPermanentError,
+    call_gemini_for_clip,
+    call_gemini_for_frame,
+)
 from .hand_actions_writer import write_hand_actions
 from .hand_start_processing_attempts_writer import write_hand_start_processing_attempt_row
 from .prompt_context import build_action_context, build_fva_context, build_prior_cards_context
+from .provenance import build_provenance, select
+from .reference_images import STREET_REFERENCE_ORDER, reference_image_filename
 from .seat_enrichment import heads_up_label
 from .timestamp_utils import parse_timestamp
 from .videos_downloader import DownloadPermanentError, download_video
@@ -448,6 +456,7 @@ async def process_hand_start(
     extract_community_cards_from_frame_prompt: str,
     reference_images: list[tuple[bytes, str, str]] | None = None,
     *,
+    prompt_hashes: dict[str, str],
     max_attempts: int = 3,
 ) -> str:
     """Process one hand start end-to-end. Returns the outcome status string.
@@ -556,10 +565,33 @@ async def process_hand_start(
                     "actions": actions_by_street.get(street_name, []),
                 })
 
+            # Step E's prompts and reference images are listed only if step E
+            # actually ran. A hand that ended preflop makes no scan and no read,
+            # so naming those files would claim a provenance the row does not
+            # have. `resolved` is empty in exactly that case.
+            step_e_ran = bool(resolved)
+            prompt_files = ["prompts/extract_player_actions.md"]
+            models = {"clip": CLIP_MODEL}
+            if step_e_ran:
+                prompt_files += [
+                    "prompts/extract_community_cards.md",
+                    "prompts/extract_community_cards_from_frame.md",
+                    *(
+                        f"references/{reference_image_filename(street)}"
+                        for street in STREET_REFERENCE_ORDER
+                    ),
+                ]
+                # The card reads are frame-mode calls; the scans are clip-mode.
+                models["frame"] = FRAME_MODEL
+
             hand_action_state = {
                 "hand_start": hs.hand_start_state,
                 "streets": streets,
                 "winning_positions": winning_positions,
+                "provenance": build_provenance(
+                    models=models,
+                    prompts=select(prompt_hashes, *prompt_files),
+                ),
             }
 
             # Uploads precede the row write, so a live row's paths always resolve.
@@ -643,6 +675,7 @@ async def process_pending_hand_starts(
     extract_community_cards_from_frame_prompt: str,
     reference_images: list[tuple[bytes, str, str]] | None = None,
     *,
+    prompt_hashes: dict[str, str],
     video_id: str | None = None,
     only_hand_start_ids: list[str] | None = None,
     max_concurrent: int = 4,
@@ -731,6 +764,7 @@ async def process_pending_hand_starts(
                         extract_community_cards_prompt,
                         extract_community_cards_from_frame_prompt,
                         reference_images,
+                        prompt_hashes=prompt_hashes,
                         max_attempts=max_attempts,
                     )
 

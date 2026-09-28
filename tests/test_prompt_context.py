@@ -279,3 +279,71 @@ def test_build_prior_cards_context_preserves_supplied_order():
     # accumulator supplies is meaning, not presentation.
     result = build_prior_cards_context(["Kh", "5d", "As", "8d"])
     assert result.splitlines()[:4] == ["- Kh", "- 5d", "- As", "- 8d"]
+
+
+# ---------------------------------------------------------------------------
+# provenance must never reach a rendered prompt
+#
+# The block sits on the same state blobs the context builders read from, so the
+# guard is structural: every builder selects fields by name and returns a str.
+# If one ever grew a dict pass-through or a .format(**state), a per-row hash map
+# and a model id would start appearing in prompts corpus-wide with no error.
+# ---------------------------------------------------------------------------
+
+_PROVENANCE = {
+    "models": {"clip": "leaked-clip-model", "frame": "leaked-frame-model"},
+    "prompts": {"prompts/leaked.md": "deadbeefcafe"},
+}
+
+_LEAK_MARKERS = ("provenance", "leaked", "deadbeefcafe", "models")
+
+
+def _state_with_provenance():
+    return {
+        "hand_setup": {
+            "total_seat_count": 3,
+            "pot_size_bb": 1.5,
+            "provenance": _PROVENANCE,
+            "players": [
+                {
+                    "seat_number": 1, "seat_position_label": "BB",
+                    "stack_size": 20.0, "hole_cards": ["Ah", "Kd"],
+                    "provenance": _PROVENANCE,
+                },
+                {
+                    "seat_number": 3, "seat_position_label": "BTN",
+                    "stack_size": 30.0, "hole_cards": None,
+                    "provenance": _PROVENANCE,
+                },
+            ],
+        },
+        "fva": {
+            "seat_number": 3, "seat_position_label": "BTN",
+            "action_type": "raise", "bet_amount": 2.5,
+            "provenance": _PROVENANCE,
+        },
+        "provenance": _PROVENANCE,
+    }
+
+
+def _assert_clean(rendered):
+    assert isinstance(rendered, str)
+    lowered = rendered.lower()
+    for marker in _LEAK_MARKERS:
+        assert marker not in lowered, f"{marker!r} leaked into a rendered prompt"
+
+
+def test_build_player_context_does_not_leak_provenance():
+    _assert_clean(build_player_context(_state_with_provenance()["hand_setup"]))
+
+
+def test_build_action_context_does_not_leak_provenance():
+    _assert_clean(build_action_context(_state_with_provenance()))
+
+
+def test_build_hole_card_context_does_not_leak_provenance():
+    _assert_clean(build_hole_card_context(_state_with_provenance()))
+
+
+def test_build_fva_context_does_not_leak_provenance():
+    _assert_clean(build_fva_context(_state_with_provenance()["fva"], 105))

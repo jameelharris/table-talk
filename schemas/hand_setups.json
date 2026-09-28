@@ -33,7 +33,7 @@
     "name": "hand_setup_state",
     "type": "JSON",
     "mode": "REQUIRED",
-    "description": "Observed state at the hand setup moment. Structure: {hand_setup_time_seconds: int, total_seat_count: int, pot_size_bb: number|null, players: [{seat_position_label: string, stack_size: number|null}]}. Outer hand_setup wrapper from raw LLM response is stripped before storage."
+    "description": "Observed state at the hand setup moment. Structure: {hand_setup_time_seconds: int, total_seat_count: int, pot_size_bb: number|null, players: [{seat_position_label: string, stack_size: number|null}]}. Outer hand_setup wrapper from raw LLM response is stripped before storage. The provenance key is a sibling of this phase's own contribution and records the models that served each call mode and the git blob hash of every prompt file and reference image that contributed to this row."
   },
   {
     "name": "detected_at",

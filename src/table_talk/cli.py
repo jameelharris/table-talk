@@ -10,7 +10,11 @@ from pathlib import Path
 
 from google.cloud import bigquery, storage
 
-from .clip_materialization import MaterializeError, materialize_clips, materialize_clips_for_pending_videos
+from .clip_materialization import (
+    MaterializeError,
+    materialize_clips,
+    materialize_clips_for_pending_videos,
+)
 from .hand_action_processing import process_pending_hand_starts
 from .hand_setup_processing import process_pending_clips
 from .hand_start_processing import process_pending_hand_setups
@@ -18,11 +22,22 @@ from .ingest import process_manifest
 from .integrity import format_report, run_integrity_checks
 from .mark_pending import STAGES, MarkPendingError, format_plan, mark_pending
 from .payout_processing import process_pending_videos
+from .provenance import hash_files
 from .reference_images import (
     STREET_REFERENCE_ORDER,
     load_reference_images,
     reference_image_filename,
 )
+
+
+def _repo_root() -> Path:
+    """The repo root, which is where prompts/ and references/ live.
+
+    Same derivation the prompt paths below already use. Provenance keys are
+    stored relative to this, so the recorded path means the same thing in a
+    query as it does in the repo.
+    """
+    return Path(__file__).resolve().parents[2]
 
 
 def main() -> None:
@@ -153,6 +168,7 @@ def main() -> None:
                 videos_bucket=args.videos_bucket,
                 tournament_results_bucket=args.tournament_results_bucket,
                 extract_results_prompt=extract_results_path.read_text(),
+                prompt_hashes=hash_files([extract_results_path], _repo_root()),
                 video_id=args.video_id,
                 max_attempts=args.max_attempts,
             )
@@ -189,6 +205,10 @@ def main() -> None:
         identify_hand_prompt = identify_hand_path.read_text()
         extract_player_info_prompt = extract_player_info_path.read_text()
         extract_player_info_bounty_addendum = bounty_addendum_path.read_text()
+        prompt_hashes = hash_files(
+            [identify_hand_path, extract_player_info_path, bounty_addendum_path],
+            _repo_root(),
+        )
         only_video_ids = [args.video_id] if args.video_id else None
         only_clip_ids = [args.clip_id] if args.clip_id else None
 
@@ -201,6 +221,7 @@ def main() -> None:
                 identify_hand_prompt=identify_hand_prompt,
                 extract_player_info_prompt=extract_player_info_prompt,
                 extract_player_info_bounty_addendum=extract_player_info_bounty_addendum,
+                prompt_hashes=prompt_hashes,
                 max_concurrent=args.max_concurrent,
                 only_video_ids=only_video_ids,
                 only_clip_ids=only_clip_ids,
@@ -230,6 +251,9 @@ def main() -> None:
 
         identify_hand_start_prompt = identify_hand_start_path.read_text()
         extract_hole_cards_prompt = extract_hole_cards_path.read_text()
+        prompt_hashes = hash_files(
+            [identify_hand_start_path, extract_hole_cards_path], _repo_root()
+        )
 
         stats = asyncio.run(
             process_pending_hand_setups(
@@ -239,6 +263,7 @@ def main() -> None:
                 hand_starts_bucket=args.hand_starts_bucket,
                 identify_hand_start_prompt=identify_hand_start_prompt,
                 extract_hole_cards_prompt=extract_hole_cards_prompt,
+                prompt_hashes=prompt_hashes,
                 video_id=args.video_id,
                 only_hand_setup_ids=(
                     [args.hand_setup_id] if args.hand_setup_id else None
@@ -275,6 +300,18 @@ def main() -> None:
         # scan calls per hand and each carries all three images.
         reference_images = load_reference_images(references_dir)
 
+        # Hashed once at startup alongside the reads, for the same reason: the
+        # files cannot change mid-run, and re-reading them per hand would add
+        # disk I/O to every iteration.
+        prompt_hashes = hash_files(
+            [
+                *prompt_paths.values(),
+                *(references_dir / reference_image_filename(street)
+                  for street in STREET_REFERENCE_ORDER),
+            ],
+            _repo_root(),
+        )
+
         stats = asyncio.run(
             process_pending_hand_starts(
                 project_id=args.project,
@@ -289,6 +326,7 @@ def main() -> None:
                     "extract_community_cards_from_frame"
                 ].read_text(),
                 reference_images=reference_images,
+                prompt_hashes=prompt_hashes,
                 video_id=args.video_id,
                 only_hand_start_ids=(
                     [args.hand_start_id] if args.hand_start_id else None
