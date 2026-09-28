@@ -31,6 +31,7 @@ from google.cloud import bigquery
 
 from ._generated.hand_actions_row import HandActionsRow
 from ._generated.hand_start_processing_attempts_row import HandStartProcessingAttemptsRow
+from .betting_state import GATE_AMOUNT_TOLERANCE_BB, replay_hand
 from .card_normalization import normalize_cards
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
@@ -78,6 +79,43 @@ CARD_READ_ATTEMPTS = 3
 SCAN_RETRY_ON_DISAGREEMENT = 1
 
 POSTFLOP_STREETS = ("flop", "turn", "river")
+
+# Gate identifiers for status_message. The "<gate_id>: <code>: " prefix is fixed
+# and must stay stable across releases — the per-gate report groups the attempts
+# table by it, so renaming one silently splits its history in two.
+#
+# P5-15 is out of sequence on purpose. The numbering is the spec's allocation
+# order, not this file's execution order, and P5-11 (board card count) turned
+# out to be already implemented as _street_cards_unusable, so its number is
+# retired rather than recycled — reusing it would make the report ambiguous
+# between two different checks.
+GATE_ACTION_LABEL_UNRESOLVED = "P5-1: action_label_unresolved"
+GATE_WINNER_UNRESOLVED = "P5-2: winner_unresolved"
+GATE_ACTION_AFTER_HAND_END = "P5-3: action_after_hand_end"
+GATE_ACTION_AFTER_FOLD_OR_ALL_IN = "P5-4: action_after_fold_or_all_in"
+GATE_ALL_IN_MISMATCH = "P5-5: all_in_mismatch"
+GATE_IMPLAUSIBLE_WINNER = "P5-6: implausible_winner"
+GATE_ILLEGAL_BETTING = "P5-7: illegal_betting"
+GATE_FVA_MISMATCH = "P5-8: fva_mismatch"
+GATE_AMOUNT_TYPE_MISMATCH = "P5-9: amount_type_mismatch"
+GATE_UNKNOWN_STREET = "P5-15: unknown_street"
+
+# betting_state reports structure; this maps its vocabulary onto the gates that
+# own each one, so the replay stays ignorant of status messages.
+_VIOLATION_GATES = {
+    "action_label_unresolved": GATE_ACTION_LABEL_UNRESOLVED,
+    "action_after_hand_end": GATE_ACTION_AFTER_HAND_END,
+    "action_after_fold_or_all_in": GATE_ACTION_AFTER_FOLD_OR_ALL_IN,
+    "unknown_street": GATE_UNKNOWN_STREET,
+}
+
+# Chip commitments. fold and check move nothing and are excluded everywhere an
+# amount is required to be positive.
+_COMMITTING_TYPES = frozenset({"call", "bet", "raise", "all_in"})
+
+# What the FVA can be, mirroring identify_hand_start.md. Duplicated rather than
+# imported from Phase 4: the two phases meet at a table boundary, not in code.
+_FVA_TYPES = frozenset({"call", "raise", "all_in"})
 
 # extract_community_cards_from_frame.md's count rule, mirrored here so a
 # short read is caught rather than stored as a malformed board.
@@ -264,6 +302,234 @@ def _street_cards_unusable(new_cards: list, prior_count: int) -> str | None:
         return f"expected {expected} new card(s), got {len(new_cards)}"
     if any(card is None for card in new_cards):
         return "null card in read"
+    return None
+
+
+def _check_amount_types(replay) -> str | None:
+    """P5-9. fold and check move no chips; everything else moves some."""
+    for street in replay.streets:
+        for a in street.actions:
+            if a.action_type in ("fold", "check"):
+                if abs(a.bet_amount) > GATE_AMOUNT_TOLERANCE_BB:
+                    return (
+                        f"{GATE_AMOUNT_TYPE_MISMATCH}: {street.street_name} action "
+                        f"{a.action_order} {a.seat_label} {a.action_type} carries "
+                        f"bet_amount {a.bet_amount}, expected 0"
+                    )
+            elif a.action_type in _COMMITTING_TYPES:
+                if a.bet_amount <= 0:
+                    return (
+                        f"{GATE_AMOUNT_TYPE_MISMATCH}: {street.street_name} action "
+                        f"{a.action_order} {a.seat_label} {a.action_type} carries "
+                        f"bet_amount {a.bet_amount}, expected greater than 0"
+                    )
+            if a.bet_amount < 0:
+                return (
+                    f"{GATE_AMOUNT_TYPE_MISMATCH}: {street.street_name} action "
+                    f"{a.action_order} {a.seat_label} has negative bet_amount "
+                    f"{a.bet_amount}"
+                )
+    return None
+
+
+def _check_all_in(replay) -> str | None:
+    """P5-5. All-in if and only if the stack runs out, and never more than it.
+
+    Both directions. Forward catches an all_in that leaves chips behind; reverse
+    catches a shove recorded as a raise, which is how a transposed raise/all-in
+    pair presents. Over-commitment is a third shape and gets its own message —
+    a seat cannot put in more than it holds.
+    """
+    for street in replay.streets:
+        for a in street.actions:
+            if a.chips_remaining_after < -GATE_AMOUNT_TOLERANCE_BB:
+                return (
+                    f"{GATE_ALL_IN_MISMATCH}: {street.street_name} action "
+                    f"{a.action_order} {a.seat_label} commits {a.bet_amount} but is "
+                    f"{abs(a.chips_remaining_after):.2f} BB beyond its stack"
+                )
+            if a.action_type == "all_in" and not a.exhausts_stack:
+                return (
+                    f"{GATE_ALL_IN_MISMATCH}: {street.street_name} action "
+                    f"{a.action_order} {a.seat_label} all_in {a.bet_amount} leaves "
+                    f"{a.chips_remaining_after:.2f} BB behind"
+                )
+            if a.action_type in _COMMITTING_TYPES and a.action_type != "all_in":
+                if a.exhausts_stack:
+                    return (
+                        f"{GATE_ALL_IN_MISMATCH}: {street.street_name} action "
+                        f"{a.action_order} {a.seat_label} {a.action_type} "
+                        f"{a.bet_amount} exhausts the stack but is not recorded "
+                        f"all_in"
+                    )
+    return None
+
+
+def _check_betting_legality(replay) -> str | None:
+    """P5-7(a). Each action against what the seat was actually facing.
+
+    Minimum raise sizes are deliberately not checked: display rounding and
+    incomplete all-in raises make them unenforceable against extracted amounts.
+    Turn order — P5-7(b) — is not checked here either; it is deferred to dbt.
+    """
+    for street in replay.streets:
+        for a in street.actions:
+            owed, largest = a.owed_before, a.largest_before
+            where = (
+                f"{GATE_ILLEGAL_BETTING}: (a) {street.street_name} action "
+                f"{a.action_order} {a.seat_label}"
+            )
+            if a.action_type == "fold":
+                continue  # always legal
+            if a.action_type == "all_in":
+                continue  # committing everything is legal in any spot
+            if a.action_type == "check":
+                if owed > GATE_AMOUNT_TOLERANCE_BB:
+                    return f"{where} checked while owing {owed:.2f} BB"
+            elif a.action_type == "call":
+                short = a.bet_amount < largest - GATE_AMOUNT_TOLERANCE_BB
+                if short and not a.exhausts_stack:
+                    return (
+                        f"{where} called {a.bet_amount} against {largest} without "
+                        f"being all-in for less"
+                    )
+            elif a.action_type == "bet":
+                if street.street_name == "preflop":
+                    return f"{where} bet preflop, where the blind means something is owed"
+                if largest > GATE_AMOUNT_TOLERANCE_BB:
+                    return f"{where} bet into an existing commitment of {largest}"
+            elif a.action_type == "raise":
+                if a.bet_amount <= largest + GATE_AMOUNT_TOLERANCE_BB:
+                    return f"{where} raised to {a.bet_amount}, not above {largest}"
+    return None
+
+
+def _check_street_completeness(replay) -> str | None:
+    """P5-7(c), scoped to live streets.
+
+    A live street is one where betting had not already closed — two or more
+    seats still in and more than one holding chips, per D1. On an inert street
+    the opposite is true and the rule inverts: a called all-in runout leaves the
+    deeper caller holding chips with nothing to do, and requiring it to act
+    would fail every correct runout hand. Measured at 9 of 133 hands before this
+    scoping was added.
+
+    Only streets with a successor are checked. If the hand carried on, this
+    street's betting must have finished.
+    """
+    inert = set(replay.inert_streets())
+    for street in replay.streets[:-1]:
+        if street.street_name in inert:
+            continue
+        acted = {a.seat_label for a in street.actions}
+        silent = [s for s in street.seats_with_chips if s not in acted]
+        if silent:
+            return (
+                f"{GATE_ILLEGAL_BETTING}: (c) {street.street_name} ended with "
+                f"{', '.join(sorted(silent))} still in holding chips and never "
+                f"acting, but a later street follows"
+            )
+    return None
+
+
+def _check_fva_cross_check(replay, fva: dict) -> str | None:
+    """P5-8. Step D's first preflop action against the block it was handed.
+
+    Reverses the earlier judgement that this belongs in dbt rather than the
+    orchestrator. Under a Phase 6 gate a flagged hand is excluded anyway, so a
+    retry is the only route by which it can ever land.
+    """
+    preflop = replay.street("preflop")
+    if preflop is None or not preflop.actions:
+        return None
+    first = preflop.actions[0]
+
+    if first.action_type not in _FVA_TYPES:
+        return (
+            f"{GATE_FVA_MISMATCH}: preflop action 1 is {first.action_type}, which "
+            f"commits no chips and cannot be the first voluntary action"
+        )
+    if first.seat_label != fva.get("seat_position_label"):
+        return (
+            f"{GATE_FVA_MISMATCH}: preflop action 1 is {first.seat_label}, but the "
+            f"fva block says {fva.get('seat_position_label')}"
+        )
+    if first.action_type != str(fva.get("action_type") or "").strip().lower():
+        return (
+            f"{GATE_FVA_MISMATCH}: preflop action 1 is {first.action_type}, but the "
+            f"fva block says {fva.get('action_type')}"
+        )
+    expected = fva.get("bet_amount")
+    if expected is not None and abs(first.bet_amount - float(expected)) > GATE_AMOUNT_TOLERANCE_BB:
+        return (
+            f"{GATE_FVA_MISMATCH}: preflop action 1 commits {first.bet_amount}, but "
+            f"the fva block says {expected}"
+        )
+    return None
+
+
+def _check_winners(replay, winning_positions: list[str], seat_labels: set[str]) -> str | None:
+    """P5-2 resolution and P5-6 plausibility. Emptiness is checked earlier."""
+    seen = set()
+    for label in winning_positions:
+        if label not in seat_labels:
+            return (
+                f"{GATE_WINNER_UNRESOLVED}: winner {label!r} is not a seat in this "
+                f"hand {sorted(seat_labels)}"
+            )
+        if label in seen:
+            return f"{GATE_WINNER_UNRESOLVED}: winner {label!r} appears twice"
+        seen.add(label)
+
+    still_in = set(replay.seats_still_in_at_end)
+    outside = seen - still_in
+    if outside:
+        return (
+            f"{GATE_IMPLAUSIBLE_WINNER}: {', '.join(sorted(outside))} won without "
+            f"being in the hand at the end (still in: {sorted(still_in)})"
+        )
+    if replay.hand_ended_on is not None and seen != still_in:
+        return (
+            f"{GATE_IMPLAUSIBLE_WINNER}: the hand ended by folds on "
+            f"{replay.hand_ended_on} leaving {sorted(still_in)}, but the winners "
+            f"are {sorted(seen)}"
+        )
+    if len(seen) > 1 and replay.hand_ended_on is not None:
+        return (
+            f"{GATE_IMPLAUSIBLE_WINNER}: {len(seen)} winners on a hand that ended "
+            f"by folds"
+        )
+    return None
+
+
+def check_step_d_output(
+    hand_setup_state: dict, fva: dict, streets: list[dict], winning_positions: list[str]
+) -> str | None:
+    """Every step-D gate, in order, first failure wins. None means it passed.
+
+    Runs before any step E call, so a hand that fails costs one clip call rather
+    than up to seven. Structural problems come first: once the replay cannot
+    walk the sequence, every derived number after it is meaningless, so there is
+    nothing to be gained by reporting a second opinion on it.
+    """
+    replay = replay_hand(hand_setup_state, fva, streets)
+    if replay.violation is not None:
+        gate = _VIOLATION_GATES[replay.violation.code]
+        return f"{gate}: {replay.violation.detail}"
+
+    seat_labels = {
+        p.get("seat_position_label") for p in hand_setup_state.get("players", [])
+    }
+    for reason in (
+        _check_amount_types(replay),
+        _check_all_in(replay),
+        _check_betting_legality(replay),
+        _check_street_completeness(replay),
+        _check_fva_cross_check(replay, fva),
+        _check_winners(replay, winning_positions, seat_labels),
+    ):
+        if reason is not None:
+            return reason
     return None
 
 
@@ -525,6 +791,24 @@ async def process_hand_start(
                     action.get("seat_position_label"), total_seat_count
                 )
             actions_by_street[street.get("street_name")] = actions
+
+        # Every step-D gate, before any step E call. A hand that fails here
+        # costs one clip call instead of up to seven, and a transient failure
+        # gets the retry that is the only way a bad step-D read can be
+        # recovered — dbt can flag it but never re-extract it.
+        gate_reason = check_step_d_output(
+            hs.hand_start_state["hand_setup"],
+            hs.hand_start_state["fva"],
+            d_result.get("streets") or [],
+            winning_positions,
+        )
+        if gate_reason is not None:
+            status = _transient_status(hs.consecutive_failures, max_attempts)
+            _write_attempt(
+                hs.hand_start_id, status, f"{status}: {gate_reason}",
+                project_id=project_id, dataset=dataset,
+            )
+            return status
 
         # Iterate the canonical order rather than D's, so a mis-ordered response
         # cannot make the turn scan run before the flop's timestamp is known.

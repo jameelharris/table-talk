@@ -21,6 +21,7 @@ from table_talk.hand_action_processing import (
     _street_timestamp_guard,
     _transient_status,
     check_preconditions,
+    check_step_d_output,
     process_hand_start,
     process_pending_hand_starts,
 )
@@ -89,14 +90,36 @@ _PREFLOP_ACTIONS = [
 ]
 
 
-def _d_result(street_names=("preflop",), winning_positions=("CO",), actions=None):
+# A legal, complete postflop street: both live seats act and end matched.
+#
+# The old fixture put [] on every postflop street, which is a physically
+# impossible hand — two seats live with chips, neither acting, and the hand
+# carrying on regardless. P5-7c catches exactly that, so the fixtures had to
+# become hands that could actually happen.
+_POSTFLOP_ACTIONS = [
+    {"action_order": 1, "seat_position_label": "BB", "action_type": "check", "bet_amount": 0.0},
+    {"action_order": 2, "seat_position_label": "CO", "action_type": "bet", "bet_amount": 3.0},
+    {"action_order": 3, "seat_position_label": "BB", "action_type": "call", "bet_amount": 3.0},
+]
+
+
+def _d_result(
+    street_names=("preflop",),
+    winning_positions=("CO",),
+    actions=None,
+    postflop_actions=None,
+):
+    """Step D output. Postflop streets get a complete check-bet-call by default;
+    pass postflop_actions=[] to build a runout (which must be preceded by a
+    called all-in preflop, or P5-7c will correctly reject it)."""
+    default_postflop = _POSTFLOP_ACTIONS if postflop_actions is None else postflop_actions
     return {
         "streets": [
             {
                 "street_name": name,
                 "actions": (actions if actions is not None else _PREFLOP_ACTIONS)
                 if name == "preflop"
-                else [],
+                else [dict(a) for a in default_postflop],
             }
             for name in street_names
         ],
@@ -840,6 +863,11 @@ def test_status_message_records_window_and_streets_on_clean_run():
 def test_heads_up_rewrites_sb_in_actions_and_winning_positions():
     state = _hand_start_state(
         total_seat_count=2,
+        # Phase 4 runs normalize_heads_up before writing, so a stored heads-up
+        # FVA is already BTN. The point of this test is that Phase 5 rewrites
+        # step D's "SB" to agree with it.
+        fva={"seat_position_label": "BTN", "seat_number": 3,
+             "action_type": "raise", "bet_amount": 2.5},
         players=[
             {"seat_number": 1, "seat_position_label": "BB", "stack_size": 100.0,
              "hole_cards": ["Ah", "Kd"]},
@@ -868,16 +896,31 @@ def test_heads_up_rewrites_sb_in_actions_and_winning_positions():
 
 
 def test_six_handed_sb_is_not_rewritten():
+    """The rewrite is heads-up only. At six-handed the SB is a real seat and
+    must survive untouched."""
+    state = _hand_start_state(
+        total_seat_count=6,
+        fva={"seat_position_label": "SB", "seat_number": 2,
+             "action_type": "raise", "bet_amount": 2.5},
+        players=[
+            {"seat_number": 1, "seat_position_label": "BB", "stack_size": 100.0,
+             "hole_cards": ["Ah", "Kd"]},
+            {"seat_number": 2, "seat_position_label": "SB", "stack_size": 90.0,
+             "hole_cards": ["Qs", "Qd"]},
+        ],
+    )
     d_result = _d_result(
         winning_positions=("SB",),
         actions=[
             {"action_order": 1, "seat_position_label": "SB",
              "action_type": "raise", "bet_amount": 2.5},
+            {"action_order": 2, "seat_position_label": "BB",
+             "action_type": "fold", "bet_amount": 0.0},
         ],
     )
 
     with _patched([d_result]) as mocks:
-        _call(_pending())
+        _call(_pending(hand_start_state=state))
 
     hand_action_state = _written_row(mocks).hand_action_state
     assert hand_action_state["winning_positions"] == ["SB"]
@@ -1679,3 +1722,372 @@ def test_provenance_hashes_are_the_ones_handed_in():
     assert prompts["prompts/extract_player_actions.md"] == (
         _P5_HASHES["prompts/extract_player_actions.md"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Step-D gates (P5-1 .. P5-9, P5-15)
+# ---------------------------------------------------------------------------
+
+_GATE_SETUP = {
+    "total_seat_count": 3,
+    "pot_size_bb": 1.5,
+    "players": [
+        {"seat_number": 1, "seat_position_label": "BB", "stack_size": 40.0},
+        {"seat_number": 2, "seat_position_label": "SB", "stack_size": 30.0},
+        {"seat_number": 3, "seat_position_label": "BTN", "stack_size": 20.0},
+    ],
+}
+_GATE_FVA = {
+    "seat_position_label": "BTN", "seat_number": 3,
+    "action_type": "raise", "bet_amount": 2.5,
+}
+
+
+def _acts(*rows):
+    return [
+        {"action_order": i, "seat_position_label": lb, "action_type": t, "bet_amount": amt}
+        for i, (lb, t, amt) in enumerate(rows, start=1)
+    ]
+
+
+def _gate(streets, winners=("BTN",), setup=None, fva=None):
+    return check_step_d_output(
+        setup or _GATE_SETUP, fva or _GATE_FVA, streets, list(winners)
+    )
+
+
+def _clean_preflop():
+    return {
+        "street_name": "preflop",
+        "actions": _acts(("BTN", "raise", 2.5), ("SB", "fold", 0.0), ("BB", "call", 2.5)),
+    }
+
+
+def test_a_clean_hand_passes_every_gate():
+    assert _gate([_clean_preflop()], winners=("BB",)) is None
+
+
+# --- P5-7c scoping: the case that forced it ------------------------------
+
+
+def test_a_called_all_in_runout_passes_even_though_the_caller_never_acts():
+    """The case P5-7c must not fire on, and the reason it is scoped to live
+    streets.
+
+    BB calls BTN's shove and is the deeper stack, so it still holds chips on
+    the flop and turn — and correctly never acts, because betting closed
+    preflop. Unscoped, "every seat still in with chips must act" would fail
+    this, and it measured 9 of 133 corpus hands.
+    """
+    streets = [
+        {"street_name": "preflop",
+         "actions": _acts(("BTN", "all_in", 20.0), ("SB", "fold", 0.0), ("BB", "call", 20.0))},
+        {"street_name": "flop", "actions": []},
+        {"street_name": "turn", "actions": []},
+        {"street_name": "river", "actions": []},
+    ]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "all_in", "bet_amount": 20.0}
+    assert _gate(streets, winners=("BB",), fva=fva) is None
+
+
+def test_an_empty_street_on_a_live_board_fails_p5_7c():
+    """The mirror image. Nobody is all-in, both seats have chips, and the flop
+    carries no actions — somebody had to act, even if only to check."""
+    streets = [
+        _clean_preflop(),
+        {"street_name": "flop", "actions": []},
+        {"street_name": "turn",
+         "actions": _acts(("BB", "check", 0.0), ("BTN", "check", 0.0))},
+    ]
+    reason = _gate(streets, winners=("BB",))
+    assert reason.startswith("P5-7: illegal_betting: (c) flop ")
+    assert "BB" in reason and "BTN" in reason
+
+
+def test_a_seat_that_never_acts_on_a_live_street_fails_p5_7c():
+    """The measured defect: step D omitted one seat's fold, so it reads as
+    still in with chips for the rest of the hand. Caught at preflop, the street
+    that actually went wrong."""
+    streets = [
+        {"street_name": "preflop",
+         "actions": _acts(("BTN", "raise", 2.5), ("BB", "call", 2.5))},   # SB never acts
+        {"street_name": "flop",
+         "actions": _acts(("BB", "check", 0.0), ("BTN", "check", 0.0))},
+    ]
+    reason = _gate(streets, winners=("BB",))
+    assert reason.startswith("P5-7: illegal_betting: (c) preflop ")
+    assert "SB" in reason
+
+
+# --- P5-1, P5-3, P5-4, P5-15: structural ---------------------------------
+
+
+def test_p5_1_an_action_by_a_seat_not_in_the_hand():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 2.5), ("CO", "call", 2.5))}]
+    assert _gate(streets).startswith("P5-1: action_label_unresolved: ")
+
+
+def test_p5_3_a_street_after_the_hand_ended_by_folds():
+    streets = [
+        {"street_name": "preflop",
+         "actions": _acts(("BTN", "raise", 2.5), ("SB", "fold", 0.0), ("BB", "fold", 0.0))},
+        {"street_name": "flop", "actions": []},
+    ]
+    assert _gate(streets).startswith("P5-3: action_after_hand_end: ")
+
+
+def test_p5_4_an_action_by_a_seat_that_already_folded():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 2.5), ("SB", "fold", 0.0),
+                                 ("SB", "call", 2.5))}]
+    assert _gate(streets).startswith("P5-4: action_after_fold_or_all_in: ")
+
+
+def test_p5_15_an_unrecognised_street_name():
+    streets = [_clean_preflop(), {"street_name": "turn2", "actions": []}]
+    assert _gate(streets, winners=("BB",)).startswith("P5-15: unknown_street: ")
+
+
+def test_street_names_and_action_types_are_normalized_before_comparison():
+    """A capitalised Turn from step D must not read as an unknown street, and a
+    RAISE must not read as an unknown action type. Both would fail a correct
+    hand on formatting alone."""
+    streets = [
+        {"street_name": "  PreFlop ",
+         "actions": [
+             {"action_order": 1, "seat_position_label": "BTN",
+              "action_type": "RAISE", "bet_amount": 2.5},
+             {"action_order": 2, "seat_position_label": "SB",
+              "action_type": "Fold", "bet_amount": 0.0},
+             {"action_order": 3, "seat_position_label": "BB",
+              "action_type": "Call", "bet_amount": 2.5},
+         ]},
+        {"street_name": "FLOP",
+         "actions": _acts(("BB", "check", 0.0), ("BTN", "check", 0.0))},
+    ]
+    assert _gate(streets, winners=("BB",)) is None
+
+
+# --- P5-9 amount vs type --------------------------------------------------
+
+
+@pytest.mark.parametrize("action_type", ["fold", "check"])
+def test_p5_9_a_fold_or_check_carrying_chips(action_type):
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 2.5), ("SB", action_type, 3.0))}]
+    assert _gate(streets).startswith("P5-9: amount_type_mismatch: ")
+
+
+def test_p5_9_a_commitment_of_zero():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 2.5), ("SB", "call", 0.0))}]
+    assert _gate(streets).startswith("P5-9: amount_type_mismatch: ")
+
+
+def test_p5_9_a_negative_amount():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 2.5), ("SB", "fold", -1.0))}]
+    assert _gate(streets).startswith("P5-9: amount_type_mismatch: ")
+
+
+# --- P5-5 all-in -----------------------------------------------------------
+
+
+def test_p5_5_an_all_in_that_leaves_chips_behind():
+    """The transposed pair: a shove recorded where a raise belongs."""
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "all_in", 5.0), ("SB", "fold", 0.0),
+                                 ("BB", "fold", 0.0))}]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "all_in", "bet_amount": 5.0}
+    reason = _gate(streets, fva=fva)
+    assert reason.startswith("P5-5: all_in_mismatch: ")
+    assert "leaves" in reason
+
+
+def test_p5_5_a_commitment_that_exhausts_the_stack_but_is_not_called_all_in():
+    """The reverse direction."""
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 20.0), ("SB", "fold", 0.0),
+                                 ("BB", "fold", 0.0))}]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "raise", "bet_amount": 20.0}
+    reason = _gate(streets, fva=fva)
+    assert reason.startswith("P5-5: all_in_mismatch: ")
+    assert "not recorded" in reason
+
+
+def test_p5_5_committing_more_than_the_stack():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 70.0), ("SB", "fold", 0.0),
+                                 ("BB", "fold", 0.0))}]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "raise", "bet_amount": 70.0}
+    reason = _gate(streets, fva=fva)
+    assert reason.startswith("P5-5: all_in_mismatch: ")
+    assert "beyond its stack" in reason
+
+
+# --- P5-7a betting legality ------------------------------------------------
+
+
+def test_p5_7a_a_check_while_owing():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 2.5), ("SB", "check", 0.0))}]
+    assert _gate(streets).startswith("P5-7: illegal_betting: (a) ")
+
+
+def test_p5_7a_a_raise_that_does_not_raise():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 2.5), ("SB", "raise", 2.5))}]
+    assert _gate(streets).startswith("P5-7: illegal_betting: (a) ")
+
+
+def test_p5_7a_a_bet_preflop():
+    """A bet is never legal preflop: the BB's post means something is owed."""
+    streets = [{"street_name": "preflop", "actions": _acts(("BTN", "bet", 2.5))}]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "bet", "bet_amount": 2.5}
+    assert _gate(streets, fva=fva).startswith("P5-7: illegal_betting: (a) ")
+
+
+def test_p5_7a_a_short_call_is_legal_when_it_is_all_in_for_less():
+    streets = [
+        {"street_name": "preflop",
+         "actions": _acts(("BTN", "raise", 20.0), ("SB", "fold", 0.0), ("BB", "call", 20.0))},
+    ]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "all_in", "bet_amount": 20.0}
+    # BTN's 20.0 exhausts its 20.0 stack, so it must be recorded all_in.
+    streets[0]["actions"][0]["action_type"] = "all_in"
+    assert _gate(streets, winners=("BB",), fva=fva) is None
+
+
+def test_p5_7a_the_bb_may_check_preflop_after_a_limp():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "call", 1.0), ("SB", "fold", 0.0),
+                                 ("BB", "check", 0.0))},
+               {"street_name": "flop",
+                "actions": _acts(("BB", "check", 0.0), ("BTN", "check", 0.0))}]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "call", "bet_amount": 1.0}
+    assert _gate(streets, winners=("BB",), fva=fva) is None
+
+
+# --- P5-8 FVA cross-check --------------------------------------------------
+
+
+def test_p5_8_the_documented_pre_fva_fold():
+    """The adjudicated case: the fva block reads SB call 1, and step D opens
+    with BTN fold anyway."""
+    setup = {
+        "total_seat_count": 3, "pot_size_bb": 1.5,
+        "players": [
+            {"seat_number": 1, "seat_position_label": "BB", "stack_size": 40.0},
+            {"seat_number": 2, "seat_position_label": "SB", "stack_size": 30.0},
+            {"seat_number": 3, "seat_position_label": "BTN", "stack_size": 20.0},
+        ],
+    }
+    fva = {"seat_position_label": "SB", "seat_number": 2,
+           "action_type": "call", "bet_amount": 1.0}
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "fold", 0.0), ("SB", "call", 1.0),
+                                 ("BB", "check", 0.0))}]
+    reason = check_step_d_output(setup, fva, streets, ["SB"])
+    # Caught by P5-4 rather than P5-8, and that is the better diagnosis. The BTN
+    # sits above the FVA seat in preflop acting order, so build_seats has it
+    # already folded before the sequence starts — the message says the seat
+    # cannot act at all, rather than that two records disagree. P5-8 would catch
+    # it too; the structural gate simply runs first.
+    assert reason.startswith("P5-4: action_after_fold_or_all_in: ")
+    assert "BTN" in reason
+
+
+def test_p5_8_a_disagreeing_amount():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 4.0), ("SB", "fold", 0.0),
+                                 ("BB", "fold", 0.0))}]
+    assert _gate(streets).startswith("P5-8: fva_mismatch: ")
+
+
+def test_p5_8_tolerates_a_rounding_difference():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 2.55), ("SB", "fold", 0.0),
+                                 ("BB", "fold", 0.0))}]
+    assert _gate(streets) is None
+
+
+# --- P5-2 and P5-6 winners -------------------------------------------------
+
+
+def test_p5_2_a_winner_that_is_not_a_seat_in_the_hand():
+    assert _gate([_clean_preflop()], winners=("CO",)).startswith(
+        "P5-2: winner_unresolved: "
+    )
+
+
+def test_p5_2_a_repeated_winner():
+    assert _gate([_clean_preflop()], winners=("BB", "BB")).startswith(
+        "P5-2: winner_unresolved: "
+    )
+
+
+def test_p5_6_a_winner_that_folded():
+    assert _gate([_clean_preflop()], winners=("SB",)).startswith(
+        "P5-6: implausible_winner: "
+    )
+
+
+def test_p5_6_folds_leaving_one_seat_means_that_seat_won():
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("BTN", "raise", 2.5), ("SB", "fold", 0.0),
+                                 ("BB", "fold", 0.0))}]
+    assert _gate(streets, winners=("BTN",)) is None
+    assert _gate(streets, winners=("BB",)).startswith("P5-6: implausible_winner: ")
+
+
+def test_p5_6_a_split_pot_is_allowed_at_showdown():
+    streets = [
+        {"street_name": "preflop",
+         "actions": _acts(("BTN", "all_in", 20.0), ("SB", "fold", 0.0), ("BB", "call", 20.0))},
+        {"street_name": "flop", "actions": []},
+        {"street_name": "turn", "actions": []},
+        {"street_name": "river", "actions": []},
+    ]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "all_in", "bet_amount": 20.0}
+    assert _gate(streets, winners=("BB", "BTN"), fva=fva) is None
+
+
+# --- ordering and cost -----------------------------------------------------
+
+
+def test_the_gate_runs_before_any_step_e_call():
+    """The whole point of gating here: a failing hand costs one clip call
+    rather than up to seven."""
+    bad = _d_result(actions=[
+        {"action_order": 1, "seat_position_label": "HJ",   # not a seat at this table
+         "action_type": "raise", "bet_amount": 2.5},
+    ])
+    with _patched([bad]) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_transient"
+    assert mocks.clip.call_count == 1      # step D only
+    mocks.frame.assert_not_called()
+    mocks.write_actions.assert_not_called()
+    assert "P5-1: action_label_unresolved: " in _attempt_row(mocks).status_message
+
+
+def test_a_gate_failure_parks_at_the_cap():
+    bad = _d_result(actions=[
+        {"action_order": 1, "seat_position_label": "HJ",   # not a seat at this table
+         "action_type": "raise", "bet_amount": 2.5},
+    ])
+    with _patched([bad]) as mocks:
+        outcome = _call(_pending(consecutive_failures=2))
+
+    assert outcome == "failed_parked"
+    assert "P5-1: action_label_unresolved: " in _attempt_row(mocks).status_message
