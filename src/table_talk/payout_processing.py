@@ -59,6 +59,17 @@ FRAME_FALLBACK_LADDER = (5, 30, 120)
 # ingested.
 MIN_LADDER_RANKS = 5
 
+# Gate identifiers for status_message. Same fixed "<gate_id>: <code>: " prefix
+# convention as the Phase 4 and Phase 5 gates, so the per-gate report can group
+# every phase's failures the same way.
+#
+# Named PAYOUT rather than numbered: this phase carries no number in the
+# pipeline, for the reason ARCHITECTURE records — it was designed after Phases
+# 1-5 but runs second, and renumbering everything downstream was not worth it.
+GATE_RANK_LADDER_MALFORMED = "PAYOUT-1: rank_ladder_malformed"
+GATE_UNUSABLE_PAYOUT = "PAYOUT-2: unusable_payout"
+GATE_BOUNTY_ON_NON_BOUNTY_PANEL = "PAYOUT-3: bounty_on_non_bounty_panel"
+
 _USER_TEXT = "Extract the tournament results panel from this frame."
 
 
@@ -207,6 +218,70 @@ def _normalize_panel(panel: dict) -> dict:
             "bounty": _parse_amount(row.get("bounty")),
         })
     return {**panel, "rows": normalized_rows}
+
+
+def check_ladder(normalized: dict) -> str | None:
+    """Ladder checks on a normalized panel. Returns a reason, or None if clean.
+
+    Transient, where _validate_panel's checks are permanent, and the split is
+    deliberate. _validate_panel rejects a panel that is structurally unusable —
+    a missing currency symbol, too few ranks, no rank 1 — which is a property of
+    the frame that was read and will not change on a re-read of the same rung.
+    These three are read failures on a panel that is present and legible, of
+    exactly the kind a second look resolves.
+
+    Runs on the NORMALIZED panel, after _parse_amount has turned '$406.25' into
+    a float. Checking the raw values would flag the string form the prompt
+    legitimately returns sometimes.
+
+    **Payout ORDER is deliberately not checked.** A deal can pay the winner less
+    than the runner-up, and on YzKyFMQ1avU ranks 1-3 depart from the flat ratio
+    that holds across 4-9. An ordering rule would fail exactly the ladders whose
+    shape is most interesting, and what it would be measuring is the tournament,
+    not the extraction.
+    """
+    rows = normalized.get("rows") or []
+
+    ranks = []
+    for row in rows:
+        raw = row.get("rank")
+        try:
+            ranks.append(int(str(raw).strip()))
+        except (TypeError, ValueError):
+            return f"{GATE_RANK_LADDER_MALFORMED}: rank {raw!r} is not an integer"
+
+    expected = list(range(1, len(ranks) + 1))
+    if sorted(ranks) != expected:
+        return (
+            f"{GATE_RANK_LADDER_MALFORMED}: ranks {sorted(ranks)} are not "
+            f"exactly 1..{len(ranks)} — the ladder has a gap, a repeat or a "
+            f"rank beyond its own length"
+        )
+
+    for row in rows:
+        payout = row.get("payout")
+        if payout is None:
+            return (
+                f"{GATE_UNUSABLE_PAYOUT}: rank {row.get('rank')} has no readable "
+                f"payout"
+            )
+        if payout <= 0:
+            return (
+                f"{GATE_UNUSABLE_PAYOUT}: rank {row.get('rank')} has payout "
+                f"{payout}, which is not a positive amount"
+            )
+
+    if not normalized.get("has_bounty_column"):
+        with_bounty = [
+            row.get("rank") for row in rows if row.get("bounty") is not None
+        ]
+        if with_bounty:
+            return (
+                f"{GATE_BOUNTY_ON_NON_BOUNTY_PANEL}: has_bounty_column is false "
+                f"but rank(s) {with_bounty} carry a bounty — the column was "
+                f"misread in one direction or the other"
+            )
+    return None
 
 
 def _validate_panel(panel: dict) -> None:
@@ -374,6 +449,17 @@ async def process_video(
             _validate_panel(panel)
             bounty_type = _derive_bounty_type(panel)
             normalized = _normalize_panel(panel)
+
+            # Before the upload, for the same reason _validate_panel is: a rung
+            # that failed leaves no object behind.
+            ladder_reason = check_ladder(normalized)
+            if ladder_reason is not None:
+                status = _transient_status(video.consecutive_failures, max_attempts)
+                _write_attempt(
+                    video.video_id, status, f"{status}: {ladder_reason}",
+                    project_id=project_id, dataset=dataset,
+                )
+                return status
 
             # Deterministic path with no ladder rung in it. frame_timestamp_seconds
             # already records which rung won; a timestamped path would orphan the

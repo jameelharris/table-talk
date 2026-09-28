@@ -19,6 +19,7 @@ from table_talk.payout_processing import (
     _normalize_panel,
     _parse_amount,
     _transient_status,
+    check_ladder,
     check_preconditions,
     process_pending_videos,
     process_video,
@@ -486,12 +487,15 @@ def test_written_row_carries_normalised_amounts():
         {"rank": 2, "payout": "*54407.04", "payout_marked": False, "bounty": None},
         {"rank": 3, "payout": 49632.96, "payout_marked": False, "bounty": None},
         {"rank": 4, "payout": 26271.31, "payout_marked": False, "bounty": None},
-        {"rank": 5, "payout": None, "payout_marked": False, "bounty": None},
+        # Rank 5 used to be None here. PAYOUT-2 now rejects an unreadable payout,
+        # and this test's subject is the string-to-float and asterisk handling,
+        # not the null — which test_parse_amount covers directly.
+        {"rank": 5, "payout": 18436.34, "payout_marked": False, "bounty": None},
     ])]) as mocks:
         _call(_pending())
 
     rows = _written_row(mocks).tournament_results_state["panel"]["rows"]
-    assert [r["payout"] for r in rows] == [62760.03, 54407.04, 49632.96, 26271.31, None]
+    assert [r["payout"] for r in rows] == [62760.03, 54407.04, 49632.96, 26271.31, 18436.34]
     assert [r["payout_marked"] for r in rows] == [True, True, False, False, False]
 
 
@@ -1122,3 +1126,197 @@ def test_provenance_records_the_frame_model_and_the_results_prompt():
     provenance = _written_row(mocks).tournament_results_state["provenance"]
     assert provenance["models"] == {"frame": FRAME_MODEL}
     assert provenance["prompts"] == _HASHES
+
+
+# ---------------------------------------------------------------------------
+# Payout ladder checks (PAYOUT-1 .. PAYOUT-3)
+#
+# Transient, where _validate_panel's checks are permanent: these are read
+# failures on a panel that is present and legible, of the kind a second look
+# resolves.
+# ---------------------------------------------------------------------------
+
+
+def _ladder(rows, has_bounty_column=False):
+    return _normalize_panel({
+        "panel_visible": True,
+        "has_bounty_column": has_bounty_column,
+        "currency_symbol": "$",
+        "rows": rows,
+    })
+
+
+def _rows(n=5, **overrides):
+    rows = [
+        {"rank": i, "payout": 1000.0 * (n - i + 1), "payout_marked": False, "bounty": None}
+        for i in range(1, n + 1)
+    ]
+    for index, patch_fields in overrides.items():
+        rows[int(index)].update(patch_fields)
+    return rows
+
+
+def test_a_clean_ladder_passes():
+    assert check_ladder(_ladder(_rows())) is None
+
+
+# --- PAYOUT-1 rank ladder ---------------------------------------------------
+
+
+def test_payout_1_a_gap_in_the_ladder():
+    rows = _rows(5)
+    rows[3]["rank"] = 9          # 1,2,3,9,5
+    reason = check_ladder(_ladder(rows))
+    assert reason.startswith("PAYOUT-1: rank_ladder_malformed: ")
+
+
+def test_payout_1_a_repeated_rank():
+    rows = _rows(5)
+    rows[3]["rank"] = 3          # 1,2,3,3,5
+    assert check_ladder(_ladder(rows)).startswith("PAYOUT-1: rank_ladder_malformed: ")
+
+
+def test_payout_1_a_non_integer_rank():
+    rows = _rows(5)
+    rows[2]["rank"] = "third"
+    reason = check_ladder(_ladder(rows))
+    assert reason.startswith("PAYOUT-1: rank_ladder_malformed: ")
+    assert "not an integer" in reason
+
+
+def test_payout_1_a_null_rank():
+    rows = _rows(5)
+    rows[2]["rank"] = None
+    assert check_ladder(_ladder(rows)).startswith("PAYOUT-1: rank_ladder_malformed: ")
+
+
+def test_payout_1_ranks_as_strings_are_accepted():
+    """_validate_panel already tolerates a string rank, so this must too, or a
+    panel that passes one check fails the next on formatting alone."""
+    rows = _rows(5)
+    for row in rows:
+        row["rank"] = str(row["rank"])
+    assert check_ladder(_ladder(rows)) is None
+
+
+def test_payout_1_ranks_out_of_order_are_fine():
+    """The ladder is a set of ranks, not a sequence — the panel may be read
+    bottom-up without that being a defect."""
+    rows = list(reversed(_rows(5)))
+    assert check_ladder(_ladder(rows)) is None
+
+
+# --- PAYOUT-2 payouts -------------------------------------------------------
+
+
+def test_payout_2_an_unreadable_payout():
+    """The case a null payout reaches: _parse_amount maps 'n/a' and None alike
+    to None, and a ladder missing a rung cannot be used."""
+    rows = _rows(5)
+    rows[4]["payout"] = None
+    reason = check_ladder(_ladder(rows))
+    assert reason.startswith("PAYOUT-2: unusable_payout: ")
+    assert "rank 5" in reason
+
+
+def test_payout_2_a_payout_that_did_not_parse():
+    rows = _rows(5)
+    rows[1]["payout"] = "n/a"
+    assert check_ladder(_ladder(rows)).startswith("PAYOUT-2: unusable_payout: ")
+
+
+@pytest.mark.parametrize("amount", [0, 0.0, -5.0])
+def test_payout_2_a_non_positive_payout(amount):
+    rows = _rows(5)
+    rows[2]["payout"] = amount
+    reason = check_ladder(_ladder(rows))
+    assert reason.startswith("PAYOUT-2: unusable_payout: ")
+    assert "not a positive amount" in reason
+
+
+def test_payout_2_a_marked_payout_still_passes():
+    """The asterisk is captured raw and interpreted nowhere; it must not make a
+    payout unusable."""
+    rows = _rows(5)
+    rows[0]["payout"] = "*62760.03"
+    assert check_ladder(_ladder(rows)) is None
+
+
+# --- PAYOUT-3 bounty column -------------------------------------------------
+
+
+def test_payout_3_a_bounty_on_a_non_bounty_panel():
+    rows = _rows(5)
+    rows[1]["bounty"] = 406.25
+    reason = check_ladder(_ladder(rows, has_bounty_column=False))
+    assert reason.startswith("PAYOUT-3: bounty_on_non_bounty_panel: ")
+    assert "2" in reason
+
+
+def test_payout_3_bounties_are_fine_when_the_column_is_present():
+    rows = _rows(5)
+    for row in rows:
+        row["bounty"] = 406.25
+    assert check_ladder(_ladder(rows, has_bounty_column=True)) is None
+
+
+def test_payout_3_a_bounty_column_with_no_bounties_is_not_checked():
+    """Only the false direction is gated. A knockout panel whose bounty column
+    reads empty is a different defect and not one this rule can tell from a
+    legitimately blank cell."""
+    assert check_ladder(_ladder(_rows(), has_bounty_column=True)) is None
+
+
+# --- ordering and wiring ----------------------------------------------------
+
+
+def test_payout_order_is_not_checked():
+    """A deal can pay the winner less than the runner-up, and on one corpus
+    video ranks 1-3 depart from the ratio that holds across 4-9. An ordering
+    rule would fail exactly the ladders whose shape is most interesting."""
+    rows = _rows(5)
+    rows[0]["payout"] = 100.0        # winner paid less than everyone below
+    rows[1]["payout"] = 90000.0
+    assert check_ladder(_ladder(rows)) is None
+
+
+def test_a_ladder_failure_is_transient_and_uploads_no_frame():
+    bad = _panel(rows=[
+        {"rank": 1, "payout": 62760.03, "payout_marked": False, "bounty": None},
+        {"rank": 2, "payout": None, "payout_marked": False, "bounty": None},
+        {"rank": 3, "payout": 49632.96, "payout_marked": False, "bounty": None},
+        {"rank": 4, "payout": 26271.31, "payout_marked": False, "bounty": None},
+        {"rank": 5, "payout": 18436.34, "payout_marked": False, "bounty": None},
+    ])
+    with _patched([bad]) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_transient"
+    mocks.upload.assert_not_called()
+    mocks.write_results.assert_not_called()
+    assert "PAYOUT-2: unusable_payout: " in _attempt_row(mocks).status_message
+
+
+def test_a_ladder_failure_parks_at_the_cap():
+    bad = _panel(rows=[
+        {"rank": 1, "payout": 62760.03, "payout_marked": False, "bounty": None},
+        {"rank": 2, "payout": 54407.04, "payout_marked": False, "bounty": None},
+        {"rank": 3, "payout": 49632.96, "payout_marked": False, "bounty": None},
+        {"rank": 4, "payout": 26271.31, "payout_marked": False, "bounty": None},
+        {"rank": 7, "payout": 18436.34, "payout_marked": False, "bounty": None},
+    ])
+    with _patched([bad]) as mocks:
+        outcome = _call(_pending(consecutive_failures=2), mocks_max_attempts=3)
+
+    assert outcome == "failed_parked"
+    assert "PAYOUT-1: rank_ladder_malformed: " in _attempt_row(mocks).status_message
+
+
+def test_validate_panel_failures_stay_permanent():
+    """The split this commit rests on: a structurally unusable panel is still
+    permanent, because a re-read of the same rung returns the same thing."""
+    with _patched([_panel(currency_symbol="")]) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_permanent"
+    assert "PAYOUT-" not in _attempt_row(mocks).status_message
