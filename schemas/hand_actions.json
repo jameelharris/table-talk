@@ -27,13 +27,13 @@
     "name": "hand_action_state",
     "type": "JSON",
     "mode": "REQUIRED",
-    "description": "Observed action sequence, community cards, and outcome for the hand. Structure: {hand_start: {...verbatim copy of hand_starts.hand_start_state}, streets: [{street_name: string, street_timestamp: int|null, community_cards: [string], actions: [{action_order: int, seat_position_label: string, action_type: string, bet_amount: number|null}]}], winning_positions: [string]}. street_timestamp is an offset from the start of the source video in whole seconds, and is null for preflop (there is no card-reveal moment). The embedded hand_start is a snapshot taken at write time; reprocessing Phase 4 does not update it. The provenance key is a sibling of this phase's own contribution and records the models that served each call mode and the git blob hash of every prompt file and reference image that contributed to this row."
+    "description": "Observed action sequence, community cards, and outcome for the hand. Structure: {hand_start: {...verbatim copy of hand_starts.hand_start_state}, streets: [{street_name: string, street_timestamp: int|null, community_cards: [string], extraction_status: string, actions: [{action_order: int, seat_position_label: string, action_type: string, bet_amount: number|null}]}], winning_positions: [string]}. street_timestamp is an offset from the start of the source video in whole seconds, and is null for preflop (there is no card-reveal moment). The embedded hand_start is a snapshot taken at write time; reprocessing Phase 4 does not update it. The provenance key is a sibling of this phase's own contribution and records the models that served each call mode and the git blob hash of every prompt file and reference image that contributed to this row. extraction_status is why community_cards are what they are: 'not_applicable' preflop, 'extracted' when step E located and read the street, 'skipped_inert' when betting had already closed so the cards carry no decisions and were deliberately not scanned, and 'unread' which is defined for completeness but never written — an unread contested street fails the attempt instead."
   },
   {
     "name": "street_frame_gcs_paths",
     "type": "STRING",
     "mode": "REPEATED",
-    "description": "Full gs://... URIs to the frames extracted shortly after each postflop street's reveal timestamp, one per resolved street, ordered flop then turn then river. Empty for a hand that ended preflop. Never NULL — an empty repeated column is an empty array."
+    "description": "Full gs://... URIs to the frames extracted shortly after each postflop street's reveal timestamp, one per street whose extraction_status is 'extracted', ordered flop then turn then river. Shorter than the streets array whenever a street was skipped as inert, so the two are not positionally aligned — map a path to its street by the street name in its filename, never by index. Empty for a hand that ended preflop. Never NULL — an empty repeated column is an empty array."
   },
   {
     "name": "detected_at",

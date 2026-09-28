@@ -80,6 +80,17 @@ SCAN_RETRY_ON_DISAGREEMENT = 1
 
 POSTFLOP_STREETS = ("flop", "turn", "river")
 
+# D3. Why a street's community_cards are what they are, recorded per street so
+# an empty array is never ambiguous between "no cards exist", "not looked for"
+# and "looked for and not found".
+EXTRACTION_NOT_APPLICABLE = "not_applicable"   # preflop: no community cards exist
+EXTRACTION_EXTRACTED = "extracted"             # step E located the street and read it
+EXTRACTION_SKIPPED_INERT = "skipped_inert"     # not scanned by design, per D1
+# Defined so the vocabulary is complete, not because it is written: after P5-14
+# an unread contested street fails the attempt, and an inert one is never
+# attempted. If this value ever appears in the corpus, something regressed.
+EXTRACTION_UNREAD = "unread"
+
 # Gate identifiers for status_message. The "<gate_id>: <code>: " prefix is fixed
 # and must stay stable across releases — the per-gate report groups the attempts
 # table by it, so renaming one silently splits its history in two.
@@ -99,6 +110,9 @@ GATE_ILLEGAL_BETTING = "P5-7: illegal_betting"
 GATE_FVA_MISMATCH = "P5-8: fva_mismatch"
 GATE_AMOUNT_TYPE_MISMATCH = "P5-9: amount_type_mismatch"
 GATE_UNKNOWN_STREET = "P5-15: unknown_street"
+GATE_DUPLICATE_BOARD_CARD = "P5-12: duplicate_board_card"
+GATE_STREET_TIMESTAMP_ORDER = "P5-13: street_timestamp_order"
+GATE_CONTESTED_STREET_UNREAD = "P5-14: contested_street_unread"
 
 # betting_state reports structure; this maps its vocabulary onto the gates that
 # own each one, so the replay stays ignorant of status messages.
@@ -277,20 +291,69 @@ def check_preconditions(hs: PendingHandStart) -> str | None:
     return None
 
 
+class StreetTimestampUnusable(Exception):
+    """A street reveal timestamp that cannot be right. Classified transient."""
+
+
 def _street_timestamp_guard(
-    street_timestamp: int, scan_start: int, window_end: int, street_name: str
+    street_timestamp: int, scan_start: int, window_end: int, street_name: str,
+    *, strict_after: bool,
 ) -> None:
-    """A reveal timestamp outside the scanned window is a hallucination.
+    """P5-13. A reveal timestamp outside the scanned window, or not after the
+    previous street's, is a hallucination.
 
     Without this, a bad timestamp yields a frame from the wrong moment and a
     plausible-looking wrong board — the silent failure this design exists to
     avoid. Mirrors Phase 4's FVA hallucination guard.
+
+    **Strict, not merely within-window.** `scan_start` is the previous street's
+    timestamp, so the existing bound already gave non-strict monotonicity; what
+    it allowed was two streets revealed in the same second, which cannot happen
+    — every scanned street now has betting between it and the one before, since
+    the runouts that had none are skipped as inert.
+
+    `strict_after` is False for the flop, whose scan_start is the FVA rather
+    than a previous reveal: a flop can legitimately land on the same second as
+    the first voluntary action.
+
+    **Transient, where this used to be permanent.** The classification changed
+    with the strictness. The only hallucinated timestamp ever observed — one
+    flop in the original corpus run — was caught here and then *resolved on a
+    rerun*, so permanent was the wrong class for the single instance there is
+    evidence about. A permanent failure also denies the retry to a defect that
+    reproduction showed to be stochastic.
     """
-    if not (scan_start <= street_timestamp <= window_end):
-        raise GeminiPermanentError(
-            f"{street_name} timestamp {street_timestamp}s outside scan window "
-            f"[{scan_start}, {window_end}] — treating as hallucination"
+    lower_ok = scan_start < street_timestamp if strict_after else scan_start <= street_timestamp
+    if not (lower_ok and street_timestamp <= window_end):
+        bound = "after" if strict_after else "at or after"
+        raise StreetTimestampUnusable(
+            f"{GATE_STREET_TIMESTAMP_ORDER}: {street_name} timestamp "
+            f"{street_timestamp}s is not {bound} {scan_start}s and within "
+            f"{window_end}s — treating as hallucination"
         )
+
+
+def _board_duplicate(prior_cards: list, new_cards: list) -> str | None:
+    """P5-12. A card cannot appear twice on one board.
+
+    Case-folded: normalize_card maps "10" to "T" and does nothing else, so "Ah"
+    and "AH" are distinct strings and a naive comparison would let a duplicate
+    through.
+
+    Board-against-hole-card duplicates are deliberately NOT checked here. A
+    Phase 5 retry re-reads only the board, and the documented case had the error
+    in the hole card — retrying would spend Pro calls re-reading the half that
+    was right. Those stay in dbt and go through the manual-correction workflow.
+    """
+    seen = {c.casefold() for c in prior_cards if c is not None}
+    for card in new_cards:
+        if card is None:
+            continue
+        key = card.casefold()
+        if key in seen:
+            return f"{GATE_DUPLICATE_BOARD_CARD}: {card} already on the board"
+        seen.add(key)
+    return None
 
 
 def _street_cards_unusable(new_cards: list, prior_count: int) -> str | None:
@@ -502,6 +565,20 @@ def _check_winners(replay, winning_positions: list[str], seat_labels: set[str]) 
     return None
 
 
+def inert_streets_for(hand_setup_state: dict, fva: dict, streets: list[dict]) -> frozenset[str]:
+    """Street names whose community cards carry no decisions, per D1.
+
+    Replays the hand a second time rather than having check_step_d_output hand
+    its state out. The replay is pure and costs microseconds, and the gate stays
+    a function that returns a reason or None — which is what every one of its
+    tests asserts against.
+
+    Only meaningful once the gates have passed: a hand whose replay hit a
+    violation has no trustworthy state to derive inertness from.
+    """
+    return frozenset(replay_hand(hand_setup_state, fva, streets).inert_streets())
+
+
 def check_step_d_output(
     hand_setup_state: dict, fva: dict, streets: list[dict], winning_positions: list[str]
 ) -> str | None:
@@ -629,7 +706,12 @@ async def _read_street_cards(
             label=f"step_e_read_{street_name}",
         )
         new_cards = normalize_cards(result.get("new_cards") or [])
-        reason = _street_cards_unusable(new_cards, len(prior_cards))
+        # Count and null check first, then the board-duplicate check: both are
+        # read failures the same retry can fix, so they share the attempt cap
+        # rather than each getting their own.
+        reason = _street_cards_unusable(new_cards, len(prior_cards)) or _board_duplicate(
+            prior_cards, new_cards
+        )
         if reason is None:
             return new_cards
     raise CommunityCardUnreadable(
@@ -648,6 +730,7 @@ async def _run_step_e(
     frame_prompt: str,
     reference_images: list[tuple[bytes, str, str]] | None,
     frame_tmpdir: str,
+    inert_streets: frozenset[str],
 ) -> tuple[dict, str | None]:
     """Resolve each postflop street's reveal timestamp and new community cards.
 
@@ -665,6 +748,16 @@ async def _run_step_e(
     current_scan_start = hs.fva_time_seconds
 
     for street_name in postflop_streets:
+        # P5-10. An inert street carries no decisions, so its cards have no
+        # analytical value and are not worth a ~13K-token scan plus a read. No
+        # call, no frame, no upload.
+        #
+        # Inert streets are always a suffix — D1 closure is monotone forward —
+        # so skipping them never leaves prior_cards short for a street that is
+        # still scanned, and the accumulator-keyed card-count rule is unaffected.
+        if street_name in inert_streets:
+            continue
+
         # A found: false in this loop always contradicts D — see _scan_for_street.
         # Neither prior_cards nor current_scan_start is touched until a scan has
         # succeeded, so a retry that succeeds advances them exactly as a
@@ -682,7 +775,12 @@ async def _run_step_e(
             return resolved, street_name
 
         street_timestamp = parse_timestamp(scan_result["timestamp"])
-        _street_timestamp_guard(street_timestamp, current_scan_start, window_end, street_name)
+        # The flop's scan_start is the FVA, not a previous reveal, so it may
+        # legitimately share a second with it.
+        _street_timestamp_guard(
+            street_timestamp, current_scan_start, window_end, street_name,
+            strict_after=bool(prior_cards),
+        )
 
         local_path = os.path.join(frame_tmpdir, f"{street_name}.jpg")
         await asyncio.to_thread(
@@ -810,6 +908,14 @@ async def process_hand_start(
             )
             return status
 
+        # Safe to derive only now: the gates above have established that the
+        # replay walked the whole sequence without contradiction.
+        inert = inert_streets_for(
+            hs.hand_start_state["hand_setup"],
+            hs.hand_start_state["fva"],
+            d_result.get("streets") or [],
+        )
+
         # Iterate the canonical order rather than D's, so a mis-ordered response
         # cannot make the turn scan run before the flop's timestamp is known.
         postflop_streets = [s for s in POSTFLOP_STREETS if s in actions_by_street]
@@ -827,9 +933,36 @@ async def process_hand_start(
                 extract_community_cards_from_frame_prompt,
                 reference_images,
                 frame_tmpdir,
+                inert,
             )
 
+            # P5-14. A street D reported, that is not inert, and that E could
+            # not locate. This used to be recorded in status_message and the row
+            # written anyway as `complete` — a hand that looks finished and ends
+            # a street early, which corrupts an aggregate rather than thinning
+            # it. Failing the attempt buys the retry instead.
+            #
+            # The population is far smaller than the raw truncation rate
+            # suggests: inert streets are no longer scanned at all, and the
+            # latest corpus run's truncations were all inert.
+            if truncated_at is not None:
+                scans = SCAN_RETRY_ON_DISAGREEMENT + 1
+                status = _transient_status(hs.consecutive_failures, max_attempts)
+                _write_attempt(
+                    hs.hand_start_id, status,
+                    f"{status}: {GATE_CONTESTED_STREET_UNREAD}: D reported "
+                    f"{truncated_at} but {scans} scans found none, and betting "
+                    f"was still live there",
+                    project_id=project_id, dataset=dataset,
+                )
+                return status
+
             # --- Merge E into D ---
+            #
+            # Iterates every street D reported rather than stopping at the first
+            # one absent from `resolved`. An inert street is deliberately absent
+            # and must still be recorded, so a `break` here would silently drop
+            # the whole runout.
             streets = []
             if "preflop" in actions_by_street:
                 streets.append({
@@ -837,16 +970,27 @@ async def process_hand_start(
                     "street_timestamp": None,  # no card-reveal moment preflop
                     "community_cards": [],
                     "actions": actions_by_street["preflop"],
+                    "extraction_status": EXTRACTION_NOT_APPLICABLE,
                 })
             for street_name in POSTFLOP_STREETS:
-                if street_name not in resolved:
-                    break  # the hand ended before this street
+                if street_name not in actions_by_street:
+                    continue  # D did not report it
+                if street_name in inert:
+                    streets.append({
+                        "street_name": street_name,
+                        "street_timestamp": None,
+                        "community_cards": [],
+                        "actions": actions_by_street[street_name],
+                        "extraction_status": EXTRACTION_SKIPPED_INERT,
+                    })
+                    continue
                 street_timestamp, community_cards, _ = resolved[street_name]
                 streets.append({
                     "street_name": street_name,
                     "street_timestamp": street_timestamp,
                     "community_cards": community_cards,
-                    "actions": actions_by_street.get(street_name, []),
+                    "actions": actions_by_street[street_name],
+                    "extraction_status": EXTRACTION_EXTRACTED,
                 })
 
             # Step E's prompts and reference images are listed only if step E
@@ -933,7 +1077,7 @@ async def process_hand_start(
             project_id=project_id, dataset=dataset,
         )
         return "failed_permanent"
-    except CommunityCardUnreadable as exc:
+    except (CommunityCardUnreadable, StreetTimestampUnusable) as exc:
         status = _transient_status(hs.consecutive_failures, max_attempts)
         _write_attempt(
             hs.hand_start_id, status, f"{status}: {str(exc)[:480]}",

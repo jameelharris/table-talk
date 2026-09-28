@@ -16,6 +16,8 @@ from table_talk.hand_action_processing import (
     MAX_WINDOW_SECONDS,
     CommunityCardUnreadable,
     PendingHandStart,
+    StreetTimestampUnusable,
+    _board_duplicate,
     _find_pending_hand_starts,
     _street_cards_unusable,
     _street_timestamp_guard,
@@ -254,18 +256,32 @@ def test_check_preconditions_window_check_wins_over_fva_check():
 
 
 def test_street_timestamp_guard_in_window_passes():
-    _street_timestamp_guard(120, 105, 160, "flop")
+    _street_timestamp_guard(120, 105, 160, "flop", strict_after=False)
 
 
 def test_street_timestamp_guard_boundaries_pass():
-    _street_timestamp_guard(105, 105, 160, "flop")
-    _street_timestamp_guard(160, 105, 160, "flop")
+    _street_timestamp_guard(105, 105, 160, "flop", strict_after=False)
+    _street_timestamp_guard(160, 105, 160, "flop", strict_after=False)
 
 
 @pytest.mark.parametrize("timestamp", [104, 161])
 def test_street_timestamp_guard_out_of_window_raises(timestamp):
-    with pytest.raises(GeminiPermanentError, match="hallucination"):
-        _street_timestamp_guard(timestamp, 105, 160, "turn")
+    with pytest.raises(StreetTimestampUnusable, match="hallucination"):
+        _street_timestamp_guard(timestamp, 105, 160, "turn", strict_after=True)
+
+
+def test_p5_13_a_later_street_must_be_strictly_after_the_one_before():
+    """Two reveals in the same second cannot happen: every scanned street now
+    has betting between it and the one before, because the runouts that had
+    none are skipped as inert."""
+    with pytest.raises(StreetTimestampUnusable, match="P5-13: street_timestamp_order"):
+        _street_timestamp_guard(120, 120, 160, "turn", strict_after=True)
+
+
+def test_p5_13_the_flop_may_share_a_second_with_the_fva():
+    """The flop's scan_start is the FVA, not a previous reveal, so equality
+    there is legitimate and must not be rejected."""
+    _street_timestamp_guard(105, 105, 160, "flop", strict_after=False)
 
 
 @pytest.mark.parametrize(
@@ -689,7 +705,15 @@ def test_community_card_unreadable_is_transient_not_permanent():
 # ---------------------------------------------------------------------------
 
 
-def test_scan_not_found_truncates_streets_and_still_completes():
+def test_an_unread_contested_street_fails_the_attempt():
+    """P5-14 reverses this hand's old outcome.
+
+    It used to write a `complete` row with the streets truncated at the turn
+    and the disagreement recorded only in status_message — a hand that looks
+    finished and ends a street early, which corrupts an aggregate rather than
+    thinning it. Betting was still live on the turn here, so the street is real
+    and the right answer is a retry.
+    """
     clip_results = [
         _d_result(street_names=("preflop", "flop", "turn", "river")),
         _scan(timestamp="02:00"),
@@ -701,20 +725,17 @@ def test_scan_not_found_truncates_streets_and_still_completes():
     with _patched(clip_results, frame_results) as mocks:
         outcome = _call(_pending())
 
-    assert outcome == "complete"
+    assert outcome == "failed_transient"
     # D + flop scan + two turn scans. The river is never scanned once the turn
     # is confirmed absent.
     assert mocks.clip.call_count == 4
+    # Failures never write a stage row, and never clear an existing one.
+    mocks.write_actions.assert_not_called()
 
-    row = _written_row(mocks)
-    assert [s["street_name"] for s in row.hand_action_state["streets"]] == ["preflop", "flop"]
-    assert len(row.street_frame_gcs_paths) == 1
-
-    # The D/E disagreement is the cross-check sequential execution preserves.
     message = _attempt_row(mocks).status_message
+    assert "P5-14: contested_street_unread: " in message
     assert "D reported turn" in message
     assert "2 scans found none" in message
-    assert "truncated" in message
 
 
 # ---------------------------------------------------------------------------
@@ -771,11 +792,10 @@ def test_scan_retry_gives_up_after_one_extra_attempt():
     with _patched(clip_results, frame_results) as mocks:
         outcome = _call(_pending())
 
-    assert outcome == "complete"
+    # The retry cap is what this test is about; P5-14 decides the outcome.
+    assert outcome == "failed_transient"
     assert mocks.clip.call_count == 4   # exactly one retry, not a loop
-    assert [s["street_name"] for s in _written_row(mocks).hand_action_state["streets"]] == [
-        "preflop", "flop",
-    ]
+    mocks.write_actions.assert_not_called()
     assert "2 scans found none" in _attempt_row(mocks).status_message
 
 
@@ -949,7 +969,14 @@ def test_gemini_transient_error_is_failed_transient():
     mocks.write_actions.assert_not_called()
 
 
-def test_hallucinated_street_timestamp_is_failed_permanent():
+def test_hallucinated_street_timestamp_is_failed_transient():
+    """Reclassified from permanent along with P5-13's strictness.
+
+    The only hallucinated timestamp ever observed — one flop in the original
+    corpus run — was caught by this guard and then resolved on a rerun, so
+    permanent was the wrong class for the single instance there is evidence
+    about, and it denied the retry that actually fixed it.
+    """
     clip_results = [
         _d_result(street_names=("preflop", "flop")),
         _scan(timestamp="09:99"),  # 599s, far outside [105, 160]
@@ -957,8 +984,10 @@ def test_hallucinated_street_timestamp_is_failed_permanent():
     with _patched(clip_results) as mocks:
         outcome = _call(_pending())
 
-    assert outcome == "failed_permanent"
-    assert "hallucination" in _attempt_row(mocks).status_message
+    assert outcome == "failed_transient"
+    message = _attempt_row(mocks).status_message
+    assert "P5-13: street_timestamp_order: " in message
+    assert "hallucination" in message
 
 
 def test_gemini_permanent_error_unaffected_by_retry_cap():
@@ -2091,3 +2120,150 @@ def test_a_gate_failure_parks_at_the_cap():
 
     assert outcome == "failed_parked"
     assert "P5-1: action_label_unresolved: " in _attempt_row(mocks).status_message
+
+
+# ---------------------------------------------------------------------------
+# P5-10 / D3 — the inert-street skip
+# ---------------------------------------------------------------------------
+
+
+def _runout_pending():
+    """A heads-up hand whose preflop all-in is called, so flop, turn and river
+    are all inert."""
+    state = _hand_start_state(
+        total_seat_count=2,
+        fva={"seat_position_label": "BTN", "seat_number": 3,
+             "action_type": "all_in", "bet_amount": 80.5},
+        players=[
+            {"seat_number": 1, "seat_position_label": "BB", "stack_size": 100.0,
+             "hole_cards": ["Ah", "Kd"]},
+            {"seat_number": 3, "seat_position_label": "BTN", "stack_size": 80.0,
+             "hole_cards": ["2c", "3c"]},
+        ],
+    )
+    d_result = _d_result(
+        street_names=("preflop", "flop", "turn", "river"),
+        winning_positions=("BB",),
+        actions=[
+            {"action_order": 1, "seat_position_label": "BTN",
+             "action_type": "all_in", "bet_amount": 80.5},
+            {"action_order": 2, "seat_position_label": "BB",
+             "action_type": "call", "bet_amount": 80.5},
+        ],
+        postflop_actions=[],
+    )
+    return _pending(hand_start_state=state), d_result
+
+
+def test_an_inert_street_makes_no_scan_and_no_frame_read():
+    pending, d_result = _runout_pending()
+    with _patched([d_result]) as mocks:
+        outcome = _call(pending)
+
+    assert outcome == "complete"
+    assert mocks.clip.call_count == 1      # step D only — no scans at all
+    mocks.frame.assert_not_called()
+    mocks.extract.assert_not_called()
+    mocks.upload.assert_not_called()
+
+
+def test_an_inert_street_is_recorded_with_no_cards_and_no_timestamp():
+    pending, d_result = _runout_pending()
+    with _patched([d_result]) as mocks:
+        _call(pending)
+
+    streets = _written_row(mocks).hand_action_state["streets"]
+    by_name = {s["street_name"]: s for s in streets}
+    assert [s["street_name"] for s in streets] == ["preflop", "flop", "turn", "river"]
+    for name in ("flop", "turn", "river"):
+        assert by_name[name]["extraction_status"] == "skipped_inert"
+        assert by_name[name]["community_cards"] == []
+        assert by_name[name]["street_timestamp"] is None
+
+
+def test_an_inert_street_uploads_no_frame():
+    pending, d_result = _runout_pending()
+    with _patched([d_result]) as mocks:
+        _call(pending)
+    assert _written_row(mocks).street_frame_gcs_paths == []
+
+
+def test_preflop_is_recorded_not_applicable():
+    with _patched([_d_result()]) as mocks:
+        _call(_pending())
+    streets = _written_row(mocks).hand_action_state["streets"]
+    assert streets[0]["street_name"] == "preflop"
+    assert streets[0]["extraction_status"] == "not_applicable"
+
+
+def test_a_live_street_is_scanned_and_recorded_extracted():
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    frame_results = [{"new_cards": ["5d", "8d", "As"]}]
+    with _patched(clip_results, frame_results) as mocks:
+        _call(_pending())
+
+    streets = _written_row(mocks).hand_action_state["streets"]
+    flop = next(s for s in streets if s["street_name"] == "flop")
+    assert flop["extraction_status"] == "extracted"
+    assert flop["community_cards"] == ["5d", "8d", "As"]
+    assert flop["street_timestamp"] == 120
+
+
+def test_the_inert_skip_keeps_the_actions_d_reported():
+    """Skipping the scan must not discard the street's action array — a runout
+    street legitimately has none, but the key stays."""
+    pending, d_result = _runout_pending()
+    with _patched([d_result]) as mocks:
+        _call(pending)
+    streets = _written_row(mocks).hand_action_state["streets"]
+    assert all("actions" in s for s in streets)
+
+
+def test_every_street_carries_an_extraction_status():
+    pending, d_result = _runout_pending()
+    with _patched([d_result]) as mocks:
+        _call(pending)
+    streets = _written_row(mocks).hand_action_state["streets"]
+    assert all(s["extraction_status"] for s in streets)
+    assert "unread" not in {s["extraction_status"] for s in streets}
+
+
+# ---------------------------------------------------------------------------
+# P5-12 — duplicate board card
+# ---------------------------------------------------------------------------
+
+
+def test_p5_12_a_card_repeated_on_the_board():
+    assert _board_duplicate(["Ah", "Kd", "2c"], ["Ah"]).startswith(
+        "P5-12: duplicate_board_card: "
+    )
+
+
+def test_p5_12_a_card_repeated_within_one_read():
+    assert _board_duplicate([], ["Ah", "Ah", "2c"]) is not None
+
+
+def test_p5_12_compares_case_folded():
+    """normalize_card maps '10' to 'T' and nothing else, so a naive comparison
+    would let this through."""
+    assert _board_duplicate(["Ah", "Kd", "2c"], ["AH"]) is not None
+
+
+def test_p5_12_a_clean_board_passes():
+    assert _board_duplicate(["Ah", "Kd", "2c"], ["Ts"]) is None
+
+
+def test_p5_12_ignores_nulls():
+    """A null is the card-count check's business, not this one's."""
+    assert _board_duplicate(["Ah", None], [None]) is None
+
+
+def test_p5_12_a_duplicate_exhausts_the_read_attempts_and_fails_transient():
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+    frame_results = [{"new_cards": ["5d", "5d", "As"]}] * CARD_READ_ATTEMPTS
+    with _patched(clip_results, frame_results) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "failed_transient"
+    assert mocks.frame.call_count == CARD_READ_ATTEMPTS
+    assert "P5-12: duplicate_board_card: " in _attempt_row(mocks).status_message
