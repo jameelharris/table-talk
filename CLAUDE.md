@@ -266,3 +266,52 @@ The principle is enforced by code review — there is no automated check.
 One narrow exception: a test may assert a **code-to-prompt interface contract** — that a string a Python function constructs appears verbatim in the prompt file that consumes it. `call_gemini_for_clip` labels each reference image `Reference image — {label}:`, and `extract_community_cards.md` describes the images by those exact names; a test asserts the rendered labels appear in the file. Reword either side and the descriptions silently unbind from the images, degrading extraction corpus-wide with no error anywhere.
 
 The line is between asserting a contract and asserting content. A test that checks a substitution slot exists, or that a constructed string matches what the prompt expects, is a contract test and is allowed. A test that asserts what a prompt *says* — its instructions, its examples, its wording — is not.
+
+### Where a validation check belongs
+
+A check can live in the orchestrator that produces the data, or in the dbt layer
+that decides what reaches the fact tables. It moves earlier when both hold:
+
+1. the phase already has all the information the check needs, and
+2. a failure guarantees the hand would be excluded in dbt anyway.
+
+Whether a retry could plausibly fix it decides *how*: yes → `failed_transient`,
+retried under the normal cap and parked at it; no → `failed_permanent`, or
+`complete_skipped` if it is a precondition that runs before any LLM call. The
+complete check always remains in dbt as a backstop. Every gate writes a fixed,
+distinctive `status_message` of the form `<gate_id>: <code>: <detail>`, where the
+`<gate_id>: <code>` prefix is stable across releases so the attempts tables can
+be grouped by it.
+
+The point of gating early is not tidiness. It is that a **retry is the only
+mechanism that can recover a bad extraction**, and by the time dbt runs the
+extraction is over — dbt can exclude a hand but never re-read the frame.
+
+**Condition 2 applies only to rules with settled definitions.** A rule whose
+correct behaviour is itself uncertain fails condition 2 for a reason the
+condition does not name: not that dbt would keep the hand, but that *nobody yet
+knows* whether the rule is right.
+
+A gate's false positive is **recoverable** — `tt mark-pending` un-parks the hand
+and a re-run replaces it — but recovery costs a Pro rerun of the whole phase for
+that hand, and it costs it per hand the rule was wrong about. The sharper
+asymmetry is visibility: a dbt exclusion lands in an outcomes table by
+construction, where a parked hand is only found if someone reads the per-gate
+report. A wrong gate is therefore quiet, and quiet is what makes it expensive.
+
+**Complex rules are proven in dbt first, then promoted.** dbt is where a rule can
+be wrong cheaply, recomputed against stored rows, and fixed without reprocessing
+anything. Promote only once a rule has run over a full corpus and its
+disagreements have been adjudicated. P5-7(b), the turn-order check, is the
+standing example: it is deferred to dbt because all-ins, incomplete raises and
+reopened betting make it the highest false-positive surface in the ruleset, and
+its promotion condition is zero unadjudicated false positives across a full
+corpus with those cases actually represented in the sample rather than merely
+absent from it.
+
+**A rule can also be right and still need scoping.** P5-7(c) — every seat still
+in with chips must act before a street ends — is correct on a live street and
+inverts on an inert one, where a called all-in leaves the deeper caller holding
+chips with nothing to do. Measured unscoped it would have failed 9 of 133 correct
+hands. Check a rule against the corpus before shipping it, and record what the
+measurement said.

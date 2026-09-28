@@ -148,6 +148,43 @@ One check, and unlike Phases 4 and 5 it runs *before* the download. Those phases
 
 A video no longer than the first ladder rung writes `complete_skipped`: it was examined and deliberately not processed, with zero LLM calls. That is a terminal success, not a failure — retrying would produce the same skip.
 
+### Ladder checks
+
+`check_ladder` runs on the normalized panel, after `_parse_amount` has turned
+`'$406.25'` into a float and before the frame upload — the same placement as
+`_validate_panel`, so a rung that fails leaves no object behind. Three checks,
+all `failed_transient`:
+
+- **PAYOUT-1 `rank_ladder_malformed`** — ranks are exactly 1..N, no gaps, no
+  repeats, every rank an integer. Ranks arriving as strings are accepted, since
+  `_validate_panel` already tolerates that and failing here would reject a panel
+  that passed the check before it on formatting alone.
+- **PAYOUT-2 `unusable_payout`** — every row has a readable payout greater
+  than 0.
+- **PAYOUT-3 `bounty_on_non_bounty_panel`** — when `has_bounty_column` is false,
+  no row may carry a bounty. Only that direction is gated: a knockout panel whose
+  bounty column reads empty is a different defect, and this rule could not
+  distinguish it from a legitimately blank cell.
+
+**Transient, where `_validate_panel`'s checks are permanent, and the split is the
+point.** `_validate_panel` rejects a panel that is structurally unusable — no
+currency symbol, too few ranks, no rank 1 — which is a property of the frame and
+will not change on a re-read of the same rung. These three are read failures on a
+panel that is present and legible, of exactly the kind a second look resolves.
+
+**Payout order is deliberately not checked.** A deal can pay the winner less than
+the runner-up, and on `YzKyFMQ1avU` ranks 1–3 already depart from the flat ratio
+holding across 4–9. An ordering rule would fail exactly the ladders whose shape is
+most interesting, and what it would measure is the tournament, not the
+extraction. See "The asterisk is captured raw and interpreted nowhere."
+
+Both stored `tournament_results` rows pass all three.
+
+The gate ids are named rather than numbered because this phase carries no number
+in the pipeline, for the reason given under "Pipeline overview". They follow the
+same `<gate_id>: <code>: <detail>` convention as the Phase 4 and Phase 5 gates so
+the per-gate report can group every phase the same way.
+
 ### Deriving `bounty_type`
 
 From `has_bounty_column` alone. Knockout events print an extra Bounty column in the results panel; non-knockout events do not.
@@ -396,7 +433,11 @@ Cost, measured on `MPBLfM4mwfE_001_001` nine-handed over three reps each: prompt
 
 `bounty` is parsed to a float by `_parse_bounty`, which strips `$` and `,`: the same prompt returned `'$406.25'` on one frame and `406.25` on another, so the addendum's "report it as a number" instruction alone is not sufficient. It is deliberately duplicated from `payout_processing._parse_amount` rather than shared — the duplication is a few lines and exact, the two can legitimately diverge (payout values carry a leading asterisk; badge values do not), and a shared module with one member is an abstraction for its own sake. Promote if a third caller appears.
 
-The field is **absent, not null**, on non-bounty videos — nothing asked for it. Neither `schemas/hand_setups.json` nor codegen nor Terraform changes: `hand_setup_state` is a JSON column passed as a `dict`, so `bq_param_type` (which has no float branch) is never reached. Phase 4 nests `hand_setup_state` verbatim, so `bounty` propagates to `hand_starts` and `hand_actions` with no change there, and Phase 4's `check_preconditions` does not inspect it — a null bounty is a gap, not a skip.
+The field is **absent, not null**, on non-bounty videos — nothing asked for it. Neither `schemas/hand_setups.json` nor codegen nor Terraform changes: `hand_setup_state` is a JSON column passed as a `dict`, so `bq_param_type` (which has no float branch) is never reached. Phase 4 nests `hand_setup_state` verbatim, so `bounty` propagates to `hand_starts` and `hand_actions` with no change there.
+
+**Reversed: a null bounty on a progressive video is now a skip, not a gap.** Phase 4's `check_preconditions` inspects it (P4-1), and a hand where any seat lacks a bounty is `complete_skipped`. The reasoning that made it a gap — that a missing value is merely incomplete rather than wrong — held only while nothing depended on it; under a Phase 6 gate such a hand is excluded anyway, and a missing badge does not reappear on a re-read of the same frame, so a skip costs nothing a retry would have recovered.
+
+It also closes a gap the null-stack precondition could not. The documented non-null phantom seat carried `stack_size = 0.38` with a *null bounty*, so it passed the stack check and was processed `complete`; P4-1 catches exactly that shape. See "Phantom seats and the checks that find them." The mirror check, P4-2, skips a hand carrying a bounty on a video whose `bounty_type` is not progressive — a value there means the one payout read misclassified the column, which no retry of this hand can change.
 
 **Reference images were considered and cut.** Phase 5's flop/turn/river references solve a *recognition* problem; this is not one — the spike read badge values 12/12 in isolation. They would add tokens to every per-hand call forever, create another code-to-prompt binding, and introduce a hallucination surface on concrete dollar values. They would only earn their place if one prompt had to serve both layouts, and the `bounty_type` gate means it does not.
 
@@ -500,6 +541,26 @@ The cap matters because a gap can be arbitrarily long — a break in play, a mis
 `check_preconditions` runs before any LLM call and returns a skip reason if `hand_setup_state` cannot support hand-start processing: any player with a null `stack_size`, any player with a null `seat_position_label`, `total_seat_count < 2`, or a zero/null `pot_size_bb`. Checks run in order and the first failure wins.
 
 A skip writes a `complete_skipped` attempt and zero `hand_starts` rows. It is a success, not a failure: the input is what it is, and retrying would skip again.
+
+Three further preconditions were added with the gates, after those four and in this order:
+
+- **P4-1 `null_bounty_progressive`** — on a video whose `bounty_type` is `progressive`, every player must carry a non-null `bounty` greater than 0.
+- **P4-2 `bounty_on_non_bounty_video`** — otherwise no player may carry one. The field is *absent*, not null, on a non-bounty video, so this is a presence check.
+- **P4-3 `invalid_label_set`** — the hand's seat labels must be exactly the canonical set for its `total_seat_count`, with nothing missing, repeated or foreign.
+
+`bounty_type` is not a `hand_setups` column: it reaches the pending query through a LEFT JOIN on `tournament_results`, and a null raises rather than filtering, exactly as Phase 3 does. **The join is LEFT on purpose** — an INNER JOIN would drop the row and the hand would silently stop being selected, turning a broken invariant into a quiet one.
+
+**What P4-3 does not catch, and the section should not be read as claiming:** a phantom seat whose `total_seat_count` was inflated to match still presents a self-consistent label set and passes. Seat-count monotonicity is the check for that class and is still unbuilt. P4-1 is what catches the documented non-null phantom.
+
+### Output checks
+
+After step A returns, before the frame work:
+
+- **P4-4 `invalid_fva_action_type`** → `failed_transient`. The FVA's `action_type` must be `call`, `raise` or `all_in`, **and its `seat_position_label` must resolve to a seat in the hand.** The second half is not decoration: an unresolvable label leaves `seat_number` null, which the eligible-seat calculation reads as "every seat", so a bad label silently widens the hole-card requirement to the whole table and P4-6 then fails the hand for seats that folded long before the FVA.
+- **P4-5 `duplicate_hole_card`** → `failed_transient`, after the in-attempt retry, **case-folded** (see D4).
+- **P4-6 `missing_hole_cards_live_seat`** → `failed_permanent`. See "Null hole cards on a seat that acted" for the reversal this represents.
+
+P4-4 fires before frame extraction and the hole-card call, so a bad FVA costs one clip call. When a hand carries both a duplicate and a missing card, P4-5 wins: giving the permanent gate precedence would discard a hand a retry could still fix.
 
 The null-stack check deliberately skips the **whole hand** when any single player has a null stack, rather than degrading to per-seat handling. Stacks are the per-seat anchor the hole-card prompt uses to identify seats, so a null stack means that seat's extraction context is unreliable. Whole-hand skip is preferred for simplicity, at an accepted small yield loss. Do not loosen this to per-seat handling without revisiting the hole-card prompt. A single-seat null stack also points at a per-seat gap in Phase 3's stack extraction for that frame.
 
@@ -643,6 +704,79 @@ Ordering comes from `STREET_REFERENCE_ORDER`, never a directory listing — `sor
 `_scan_for_street` now asks once more on `found: false`. The guard is structural rather than conditional: it is called only from the loop over the streets D reported, so an ordinary end-of-hand `found: false` never reaches it. D's claim gates only whether to ask again, never what the answer is — if both scans say no, E's answer stands.
 
 Motivated by `MPBLfM4mwfE_006_001_001`, an all-in runout where a turn was certainly dealt: D reported it, E's scan missed it, and the hand was silently short two streets. Reproduction against the real stored window found the street in 3 of 4 runs, so the miss is stochastic rather than a prompt defect. Later-street windows are also the narrowest in the phase, so this buys a retry where a missed street is most expensive and a call is cheapest.
+
+### Step-D gates
+
+Every gate runs immediately after step D returns, **before any step E call**, so
+a failing hand costs one clip call rather than up to seven. First failure wins.
+All are `failed_transient`: a retry is the only mechanism that can produce a
+correct sequence, and dbt cannot re-extract at all.
+
+`check_step_d_output` replays the hand through `betting_state` (D2), then runs:
+P5-1 `action_label_unresolved`, P5-2 `winner_unresolved`, P5-3
+`action_after_hand_end`, P5-4 `action_after_fold_or_all_in`, P5-5
+`all_in_mismatch`, P5-6 `implausible_winner`, P5-7 `illegal_betting`, P5-8
+`fva_mismatch`, P5-9 `amount_type_mismatch`, P5-15 `unknown_street`.
+
+Structural problems come first: once the replay cannot walk the sequence, every
+derived number after it is meaningless.
+
+**P5-7 ships as (a) action legality and (c) street completeness. Turn order (b)
+is deferred to dbt** with a promotion condition — see CLAUDE.md's "Where a
+validation check belongs". Minimum raise sizes are not checked at all: display
+rounding and incomplete all-in raises make them unenforceable against extracted
+amounts.
+
+**P5-7(c) is scoped to live streets, and the scoping is load-bearing.** As first
+written — every seat still in with chips must have acted before a street ends —
+it is correct on a live street and inverts on an inert one, where a called all-in
+leaves the deeper caller holding chips with nothing to do. Measured unscoped it
+failed **9 of 133 correct hands (7.5%)**. Scoped to streets not in
+`inert_streets()`, the population is 2 hands. D1 and P5-7(c) contradict each
+other on exactly the streets the inert skip targets, and the scoping is what
+resolves it.
+
+**P5-15 is out of sequence on purpose.** The numbering is the spec's allocation
+order, not execution order, and P5-11 (board card count) turned out to be already
+implemented as `_street_cards_unusable`, so its number is retired rather than
+recycled — reusing it would make the per-gate report ambiguous between two
+different checks.
+
+### Step-E gates
+
+- **P5-10** skips inert streets entirely — no scan, no frame, no upload. See
+  "Zero-action street extraction — lever taken."
+- **P5-12 `duplicate_board_card`**, case-folded, sharing the existing
+  `CARD_READ_ATTEMPTS` cap rather than adding its own: a duplicate and a short
+  read are both read failures the same retry can fix. **Board-against-hole-card
+  duplicates are deliberately not gated** — a Phase 5 retry re-reads only the
+  board, and the documented case had the error in the hole card, so retrying
+  would spend Pro calls re-reading the half that was right. Those stay in dbt and
+  go through the manual-correction workflow.
+- **P5-13 `street_timestamp_order`** tightens `_street_timestamp_guard` from
+  non-strict to strict. `scan_start` is the previous street's timestamp, so the
+  existing bound already gave non-strict monotonicity; what it allowed was two
+  reveals in the same second, which cannot happen now that every scanned street
+  has betting between it and the one before. **The flop is exempt**: its
+  `scan_start` is the FVA rather than a previous reveal, so it may legitimately
+  land on the same second as the first voluntary action.
+- **P5-14 `contested_street_unread`** fails the attempt where a non-inert street
+  step E cannot locate previously wrote a `complete` row truncated there.
+
+**P5-13 also reclassifies the guard from `failed_permanent` to
+`failed_transient`.** The only hallucinated timestamp ever observed — one flop in
+the original corpus run — was caught by this guard and then *resolved on a
+rerun*, so permanent was the wrong class for the single instance there is
+evidence about, and it denied the retry that actually fixed it. It raises its own
+`StreetTimestampUnusable` rather than reusing `GeminiPermanentError`, so the
+malformed-JSON path keeps its permanent classification.
+
+**P5-14's population is much smaller than the raw truncation rate suggests.** The
+latest `MPBLfM4mwfE` run recorded 6 truncations, *all inert* — under P5-10 those
+streets are never scanned, so none can truncate. What remains is contested
+truncations, which Pro recovered 5 of 7 times; the other 2 were D over-reporting
+a river on hands that ended with a fold on the turn, which **P5-3 now catches at
+step D before any E call**.
 
 ### Failure handling
 
@@ -858,9 +992,9 @@ Two things worth stating alongside the table.
 
 **The street scans collectively cost more than step D** — two to three per hand against one, at a comparable per-call input. That reverses the intuition that step D, the call over the whole hand window, dominates Phase 5's bill.
 
-It also sharpens the deferred lever under "Zero-action street extraction is a deferred cost lever." Skipping community cards on a no-action street saves a ~13K scan **plus** the ~1.7K read, not just the read — roughly 8x what that section's framing implies, since it was written treating the scan as the part worth keeping. The observability argument for keeping the scan is unchanged and is still the reason not to take the lever; what changes is the price of that decision.
+It also sharpened the lever under "Zero-action street extraction — lever taken." Skipping community cards on a no-action street saves a ~13K scan **plus** the ~1.7K read, not just the read — roughly 8x what that section's framing implied while it was still deferred, since it was written treating the scan as the part worth keeping. **The lever has since been taken**, and this measurement is part of why: it made the observability argument for keeping the scan eight times more expensive than it looked.
 
-**Every derived dollar figure in this document predates these measurements** and is stale in both directions: rates are lower than the Pro-only numbers assumed, token counts per call are lower, but there are more scan calls per hand than was assumed. The errors do not cancel and the sign of the total is not obvious. Figures affected: the ~$0.053 per hand and ~$3.20 per video under "What the corpus run established," the ~$1,060 20K-hand projection and the ~$300 saving under "Zero-action street extraction is a deferred cost lever," and the ≈$26 PKO-corpus figure under "Per-seat bounty capture." Treat each as an order-of-magnitude placeholder until recomputed against the table above.
+**Every derived dollar figure in this document predates these measurements** and is stale in both directions: rates are lower than the Pro-only numbers assumed, token counts per call are lower, but there are more scan calls per hand than was assumed. The errors do not cancel and the sign of the total is not obvious. Figures affected: the ~$0.053 per hand and ~$3.20 per video under "What the corpus run established," the ~$1,060 20K-hand projection and the ~$300 saving under "Zero-action street extraction — lever taken," and the ≈$26 PKO-corpus figure under "Per-seat bounty capture." Treat each as an order-of-magnitude placeholder until recomputed against the table above.
 
 ### Model selection is per call mode
 
@@ -905,7 +1039,7 @@ What remains is the scan itself. This is the case that moves Flash's scan weakne
 
 **How the scope is actually enforced, and it is not by the code.** `TT_CLIP_MODEL` is read once at import, so it applies to every clip-mode call in that process — it is scoped by *which command carries it*. On `tt process-hand-starts` it moves Phase 5's step D and step E scans only. On `tt process-hand-setups` it would also move Phase 4's step A; on `tt process-clips`, Phase 3's detection. The narrow scope is a property of the invocation, not a guarantee the primitive provides.
 
-**The scope is deliberately narrow.** Pro on Phase 5's clip calls only — not on Phase 3's detection or Phase 4's step A. Those are also scans, but they are different tasks, and both have independent checks that came back clean: detection variance is visible by comparing runs, and step A is cross-checked against step D on every hand. Applying Pro generically would extend a result from one scan type to three on an assumption, at roughly 3x the token cost of the two phases that make the most calls.
+**The scope is deliberately narrow.** Pro on Phase 5's clip calls only — not on Phase 3's detection or Phase 4's step A. Those are also scans, but they are different tasks, and both have independent checks that came back clean: detection variance is visible by comparing runs, and step A was said to be cross-checked against step D on every hand. **That second claim was false when written** — nothing compared them until P5-8 was built; see "Step D's action sequence is now validated against the `fva` block." It is true now, which happens to rescue the conclusion, but the argument rested on it before it was. Applying Pro generically would extend a result from one scan type to three on an assumption, at roughly 3x the token cost of the two phases that make the most calls.
 
 **What is not measured: whether step D specifically needs Pro.** If it does not, a narrower split saves roughly $360 across the projected corpus — but it requires threading a model parameter through a primitive that is deliberately ignorant of its caller, against the argument two paragraphs up. The comparison is already available in existing exports: the split run put Pro on all clip calls, the current corpus is all-Flash, and both post-date the prompt changes. So this wants a query, not new calls. On the follow-up list.
 
@@ -921,6 +1055,87 @@ The two-video truncation rate and the `_003_001_001` investigation above are a s
 
 - **t=584 is prompt ambiguity, not a model difference — and it was first recorded as the latter.** Flash read the SB's preflop re-raise as 4.55 and its flop shove as 6.55, against 7 and 4.55 in both stored Pro runs, so it went down as a Flash amount-read error. Re-running Pro against the *old* prompt produced Flash's answer, 4.55/6.55. Neither model is reliably on one side: both pairs are internally consistent against the SB's 11.1 displayed stack — Flash's sums to it exactly, Pro's reconciles under the inclusive blind convention — so no arithmetic check separates them, and the reading moves run to run. The broadcast confirms 7. This belongs to "`bet_amount` includes a posted blind" rather than to this comparison. The general lesson is worth more than the case: **a disagreement between two models can be a disagreement with an ambiguous prompt, read twice.** Attributing one to a model without re-running the other on the same prompt text will sometimes name the wrong cause.
 - **t=2529 is a fourth Pro seat swap.** The Pro rebuild puts the hand's 10.1 stack on SB where the broadcast, Pro run 1 and Flash all say BTN. Same class as the two seat attributions counted above — but it was found by three-way comparison across runs, not by the Pro-vs-Flash disagreement set, which is a concrete instance of the blind spot the caveat above describes.
+
+### Provenance
+
+Every row written by a phase that calls Gemini records which models and which
+prompt file versions produced it. This closes the gap recorded under "Per-row
+model provenance is unrecoverable": the model that served a call was emitted only
+on the `gemini_usage` stderr line, which is not persisted, so no query could
+attribute a row to a model — load-bearing once the corpus became a Flash/Pro
+mixture.
+
+A `provenance` key is a **sibling** of each phase's own contribution inside its
+existing JSON state column:
+
+```json
+"provenance": {
+  "models": {"clip": "gemini-2.5-pro", "frame": "gemini-3.8-flash"},
+  "prompts": {
+    "prompts/extract_player_actions.md": "3f9a1c2e7b10",
+    "references/river_reference.jpeg": "0c4e1f2a8d57"
+  }
+}
+```
+
+- `models` is keyed by **call mode**, not a single value. Every phase but payout
+  extraction makes both kinds of call and they can be served by different models;
+  that split is the whole reason `TT_CLIP_MODEL` and `TT_FRAME_MODEL` are
+  separate constants.
+- `prompts` lists only the files that contributed to **this row**. Phase 3 lists
+  the bounty addendum on progressive videos only; Phase 5 lists step E's prompts
+  and reference images only when step E ran. Listing a file a row never saw would
+  make the record say something false about how it was produced.
+- No code version is recorded.
+
+**No schema change.** All four state columns are JSON, BigQuery parses them
+server-side, and `bq_param_type`'s missing float and None branches are never
+reached — that limitation applies to scalar columns only. The column
+*descriptions* changed, which needs a `terraform apply` but produces no codegen
+diff, since `gen_schemas.py` reads name, type, mode and default expression and
+ignores descriptions entirely.
+
+**The chain falls out of nesting, with no code assembling it.** Phase 4 nests
+`hand_setup_state` by reference and Phase 5 nests `hand_start_state`, so one
+`hand_actions` row carries all three blocks — `hand_action_state.provenance`,
+`.hand_start.provenance`, and `.hand_start.hand_setup.provenance`. This does not
+break the `TO_JSON_STRING` staleness spike on the follow-up list: both sides of
+that comparison carry the same nested block, so equality is preserved and the
+comparison becomes strictly more sensitive.
+
+#### The hash
+
+The **git blob hash** of the file's bytes, truncated to 12 hex characters — what
+`git hash-object <file>` prints. SHA-1 over `b"blob " + len + b"\0" + data`,
+computed with `hashlib`, so it needs no git binary and no `.git` directory and
+works in Cloud Run.
+
+Its advantage over a plain content digest is the lookup: `git log
+--find-object=<hash>` names the commits containing that exact file version. A
+bare SHA-256 would identify the bytes without connecting them to history.
+
+**Hash the stored file, never the rendered prompt.** A rendered prompt carries
+per-hand context — seat lines, stacks, the FVA block — and would differ on every
+row, recording nothing about the version.
+
+`.gitattributes` pins `prompts/**` to `text eol=lf` so the recorded hash matches
+what git stored regardless of a contributor's `core.autocrlf`, and marks
+`references/**` as `-text`, because EOL normalization would corrupt a JPEG. A
+test asserts the helper agrees with `git hash-object` for all 12 files.
+
+**Provenance cannot reach a rendered prompt.** Every context builder in
+`prompt_context.py` selects fields by name and returns a string — no `**kwargs`,
+no `.format()`, no dict pass-through — and every substitution is a named
+`str.replace` over exactly five tokens. A test pins it, because the failure would
+be silent: a per-row hash map and a model id appearing in prompts corpus-wide.
+
+#### Hashing happens in the CLI, and that is a constraint not a choice
+
+Orchestrators receive prompt **text**, never paths: every `read_text()` is in
+`cli.py`. So the CLI computes the hash map and passes it down as one
+`prompt_hashes` parameter, which is a **required keyword-only argument** on every
+orchestrator. A default would let a production path silently write
+provenance-free rows, which is the one outcome the feature exists to prevent.
 
 ### Frames and orphaned GCS objects
 
@@ -976,6 +1191,8 @@ The corpus is two videos. Counts move whenever a phase is re-run, and they have 
 **An id is not a stable reference to a hand across runs.** `hand_setup_id` is positional — `{clip_id}_{NNN}` — so it renumbers whenever a clip's detection count changes, and `hand_start_id` and the `hand_actions` key inherit that. An id observed in one run may point at a different moment in the next, or not exist. Anything citing one as a test fixture or a reproduction target must **re-derive it by timestamp first**. This is the same property behind the content-staleness gap and the frame path-reuse case; see "Detection is not deterministic" and "Frames and orphaned GCS objects."
 
 The consequence for this document is that id-level findings are labelled with the run they were observed in rather than silently re-derived. A finding tied to a superseded run is still evidence about the pipeline — it is just not a pointer to a row that exists today.
+
+**These counts predate the gates and the rebuild.** Every figure in this section was produced before the Phase 4 and Phase 5 gates existed and before any row carried provenance. They are the baseline the rebuild replaces, not the current state — re-count after it and record the new figures here. A change is expected, because detection is not deterministic; a large change is itself a finding.
 
 **The latest `MPBLfM4mwfE` run is the quality reference.** Across its 57 `hand_setups`: 0 phantom seats, 0 pot mismatches, 0 duplicate hole cards, 0 FVA disagreements, 1 null-hole-cards-on-an-acting-seat, and 6 truncations all inert. Note what that does to the findings below — the three phantom seats and the misread pot that several sections analyse are **not in this corpus**. They were real when observed and the analysis of them stands; the ids do not.
 
@@ -1149,7 +1366,13 @@ Three observed causes:
 - **four-colour suit confusion** — already documented under "Observed extraction errors."
 - **a chat-bubble overlay covering a seat's cards at the FVA moment** — new, confirmed by inspecting the frame for `YzKyFMQ1avU_020_001_001`, where the FVA seat's own cards are obscured. This one is not a legibility or a recognition problem: the cards are not on screen to be read, and no prompt change or retry reaches them. A different verification frame would.
 
-**This is not gateable at extraction time.** Phase 4 cannot know which seats will act, because the actions do not exist until Phase 5 has run. The contradiction only exists once both phases have, which makes it a **DBT check, not a precondition** — the same shape as the step-D/`fva` cross-check and the all-in-exhausts-stack rule, and for the same reason: a precondition is permanent by construction, and this needs recomputing against data from a later phase. Recorded as reasoning rather than as a rule, because the reasoning is what generalises to the next check of this shape.
+**Reversed: this is gateable at extraction time, and is now gated (P4-6).** The argument against was that Phase 4 cannot know which seats will act, because the actions do not exist until Phase 5 has run. That is true and beside the point. Phase 4 does not need to know which seats *will* act — every seat still in the hand at the FVA either acts, even if only to fold, or is all-in from its post. That set is exactly `seat_number <= fva.seat_number`, which is already the set Phase 4 reads hole cards for, so the check needs nothing a later phase produces.
+
+It is `failed_permanent`, not a precondition: it runs after the LLM call and after the in-attempt retry, so a null here has already survived a second read of the same frame, and all three observed causes — frame-limited illegibility, four-colour suit confusion, and a chat-bubble overlay — are properties of that frame. Another attempt reads the same pixels.
+
+**The accepted cost is that a hand a different verification frame could have resolved is lost.** `mark-pending` is the way back for one that matters.
+
+A consequence worth stating because it removed code: `status_message` used to enumerate residual nulls on eligible seats, and that enumeration is now unreachable — it was computed over exactly the population P4-6 fails on. The general lesson survives the reversal: a check that seems to need a later phase's data may only need the *set* that phase will operate on, which an earlier phase often already knows.
 
 ### Observed extraction errors
 
@@ -1192,15 +1415,242 @@ The workflow is: DBT flags, the operator corrects `hand_starts.hand_start_state`
 
 This is the first sanctioned manual data path in the pipeline. A hand-corrected value is currently indistinguishable from an extracted one.
 
-### Zero-action street extraction is a deferred cost lever
+### Zero-action street extraction — lever taken
 
-Community cards on streets with no voluntary action are analytically inert: once players are all-in the runout decides the winner, but no decisions remain to evaluate. Skipping E once a zero-action street is reached would cut roughly 29% of Phase 5's calls — about $300 on a projected 20K-hand corpus costing ~$1,060.
+Community cards on streets with no voluntary action are analytically inert: once
+players are all-in the runout decides the winner, but no decisions remain to
+evaluate. This was recorded for a long time as a deferred cost lever. **It is now
+taken** — P5-10 skips them, per D1 under "Shared definitions".
 
-Not taken, and the reason is observability rather than completeness. E's scan is the only independent check on D's street list: `MPBLfM4mwfE_003_001_001` had D report a flop on a hand where everyone folded preflop, caught only because E searched and found none. On runout hands there is no betting context and nothing else to sanity-check against — precisely where a second observation is most valuable. Skipping would also make a genuine miss indistinguishable from a correctly short hand.
+**Measured on the corpus rather than estimated.** Across the 131 hands that pass
+the step-D gates, step D reported 104 postflop streets and **42 of them (40%) are
+inert**, spread over 21 hands. That is 42 scan calls and 42 frame reads avoided,
+about **25% of Phase 5's calls** — against the "roughly 29% of calls" this section
+estimated before it could be measured, so the estimate was in the right range.
+The skipped share of *streets* is higher than the share of *calls* because every
+hand still pays for its one step-D call whatever its shape.
 
-If cost ever forces it, the halves are separable: skip the frame *read* and keep the scan, preserving the cross-check and the timestamp.
+**The reason it was deferred was observability, and that argument has been
+partly, not wholly, answered.** E's scan was the only independent check on D's
+street list: `MPBLfM4mwfE_003_001_001` had D report a flop on a hand where
+everyone folded preflop, caught only because E searched and found none.
 
-**The saving was understated, and the separable half is the cheap one.** Measured token counts put a street scan at ~13K and a street read at ~1.7K, so skipping a runout street saves roughly 8x what keeping-the-scan saves. That makes the fallback above the *less* attractive half of the lever rather than a near-equivalent, and it makes the observability argument more expensive than it looked. The conclusion does not change — E's scan is still the only independent check on D's street list, and runout streets are where a second observation matters most — but the price is now known. See "Measured call costs."
+- **That case is now caught earlier and more precisely, by P5-3**, which fails a
+  hand reporting any street after folds left one seat — at step D, before any E
+  call at all.
+- **What is no longer checked** is a runout street D invents on a hand that
+  genuinely went all-in. Nothing looks for it now. The cost is bounded: those
+  cards are inert by definition, so a spurious `skipped_inert` entry carries no
+  data and corrupts no aggregate. It is a phantom street in the record, not a
+  wrong value.
+
+`extraction_status` (D3) is what keeps this from being a silent loss: a skipped
+street is labelled `skipped_inert`, so a genuine miss can never be mistaken for a
+correctly short hand — which was the other half of the original objection.
+
+### Accepted cost: showdown evaluation on all-in hands
+
+A future evaluator could check hole-card reads against the winner, and all-in
+showdowns are precisely where hole cards matter most, since they are the hands
+where cards are revealed. Skipping runouts puts those hands out of its reach, and
+recovering them would mean reprocessing.
+
+Accepted, on three grounds: the runout cards carry no decisions; their only
+current use — duplicate detection — is weak; and on Flash the runout failed to
+read 50–78% of the time anyway, so a large share of what is being given up did
+not exist in usable form. Recorded as a real cost rather than a free win, because
+if showdown evaluation is ever built this is the decision it will run into.
+
+
+### Pre-rebuild gate baseline
+
+Every gate was run against the stored corpus before the rebuild, so a cluster
+afterwards reads as a regression rather than as normal noise. Across 133
+`hand_actions` rows:
+
+| | |
+|---|---:|
+| Hands failing any step-D gate | **2 (1.5%)** |
+| Structural violations (P5-1, P5-3, P5-4, P5-15) | **0** |
+| P5-5, P5-6, P5-8, P5-9 hits | **0** |
+| Postflop streets skipped as inert | 42 of 104 (40%) |
+| `tournament_results` rows failing a ladder check | 0 of 2 |
+
+Both failing hands are P5-7(c), caught at **preflop** — the street that actually
+went wrong, not the flop where the symptom shows. Both are the same defect: step
+D omitted one seat's fold, so the seat reads as still in with chips for the rest
+of the hand.
+
+**One of the two is not a prompt defect at all.** `MPBLfM4mwfE` t=960 sits
+*exactly* on clip 005's `clip_start_time`, making it the clip-boundary
+re-detection fragment described under "Phase 3 re-detects an in-progress hand at
+the start of the next clip". The seats that acted before the clip opened are
+outside the window, so no prompt change could recover them. Excluding it leaves
+**1 genuine step-D omission in 133 hands (0.75%)**, on `YzKyFMQ1avU` t=1528,
+which sits 88 s inside its clip.
+
+That near-miss is worth recording as method: the two hits shared a striking
+pattern — in both, the omitted seat was the one acting immediately after the FVA
+— and it was tempting to report as a finding. Checking the clip manifest showed
+one of the two instances had an unrelated cause. **A pattern with n=2 survives
+one confound and stops being a pattern.**
+
+**The baseline is Flash.** These rows are almost entirely Flash step-D output and
+the rebuild runs step D on Pro, so the post-rebuild rate is not predicted by
+this. What it does establish is that the gates do not fire on correct hands at
+Flash's error profile, which is the failure mode that would have been expensive.
+
+### Short-blind handling is unexercised
+
+D2 treats a blind whose post exhausted its stack (`stack_size <= 0`) as in the
+hand but unable to act. **No hand in the corpus exercises this, and none comes
+close.** Across 153 hands — 153 BB seats and 153 SB seats, queried by role so
+heads-up is included — there is not one `stack_size` of 0, and the shortest blind
+observed still had **1.58 BB behind** after posting. The under-1-BB case is
+likewise unobserved: no blind seat sits between 0 and 1.
+
+So both branches rest on reasoning, not data. The reasoning is that getting it
+wrong is not harmless: counted as holding chips, such a seat keeps D1's condition
+3 from ever being satisfied, so a genuinely closed street reads as live and
+P5-7(c) fires on a correct hand. Three lines against that risk is worth it, but
+the first hand that exercises it will be doing so unverified.
+
+Queried by role rather than by label on purpose — `normalize_heads_up` rewrites
+the small blind to `BTN`, so a label-based query would have silently skipped
+every heads-up hand, which is exactly where a short blind is most likely.
+
+## Shared definitions
+
+Referenced by the extraction phases and by the DBT layer. Both must point at one
+text: a rule restated in two places drifts, and these are rules where a small
+difference in wording changes which hands survive.
+
+### D1 — the inert-street rule
+
+After the last action on the **preflop, flop or turn**, betting is *closed with
+no further action possible* when all three hold:
+
+1. At least two seats are still in the hand (not folded).
+2. Every seat still in has either matched the largest amount committed on that
+   street, or is all-in.
+3. At most one seat still in has chips remaining.
+
+When D1 holds, every later street is **inert**: it carries no decisions, so its
+community cards have no analytical value. The river is never inert under this
+rule — there is no street after it.
+
+| Situation | Later streets |
+|---|---|
+| Preflop: SB all-in, BB calls | Flop, turn, river inert |
+| Flop: BTN all-in, BB calls | Turn, river inert |
+| Turn: SB all-in, BB calls | River inert |
+| River: all-in and call | Nothing after it |
+| Preflop: CO all-in, BB has not yet acted | Not closed (condition 2) |
+| Preflop: short stack all-in, two larger stacks call | Not closed — two seats still hold chips and can contest a side pot (condition 3) |
+| Flop: short stack all-in, one larger stack calls, third player folded earlier | Closed — turn and river inert |
+
+**Condition 1 is the one that is easy to get wrong.** "One seat left after folds"
+means **the hand is over**, not "betting closed". A street after that point is an
+error (P5-3), never an inert skip. The distinguishing question is not "was anyone
+all-in?" but "did two or more seats still have live cards after the last action?"
+
+Closure is monotone forward — once no seat can act, none can act later — so inert
+streets are always a **suffix**. That is what keeps step E's prior-card
+accumulator consistent when they are skipped.
+
+### D2 — the running state
+
+A pure function over one hand's setup (`players`, `total_seat_count`, the `fva`
+block) and step D's `streets` / `actions`, implemented in `betting_state.py`.
+After each action it yields, per seat: chips remaining, folded, all-in; and per
+street: the current largest commitment, the seats still in, and the seats still
+holding chips.
+
+Conventions it encodes, each of which has cost debugging time at least once:
+
+- **`stack_size` is displayed net of forced posts.** The SB's 0.5 and the BB's
+  1 + ante have already left the seat when the stack is read.
+- **`bet_amount` is the seat's total in front on that street after the action**,
+  including a posted blind. Fold and check are always 0.0.
+- **The blind is in front only on the street it was posted.** Subtracting it on
+  postflop streets too understates what a postflop shove moved and makes a
+  genuinely all-in seat read as still holding its blind — which silently defeats
+  D1 condition 3 on every hand where the shove comes after the flop.
+- **Big blind ante.** The whole table's ante is posted by the BB and does not sit
+  in front of it, so it is already netted out of `stack_size` and never enters
+  the arithmetic. Do not subtract it per seat.
+- **The blinds are identified by role, never by label.** `normalize_heads_up`
+  rewrites the small blind to `BTN` before the row is written, so heads-up there
+  is no seat labelled `SB` at all and a label lookup charges it nothing. Seat 1
+  is the BB; the other blind is seat 2 at three-handed and above, seat 3
+  heads-up.
+- **A seat's commitment on a street is its highest `bet_amount` on that street**,
+  not its last — a seat that bets 3 and then folds to a raise committed 3, and
+  its fold carries 0.0.
+- **All-in when the chips gone from the stack equal `stack_size`** within D6.
+- **Preflop the amount owed starts at 1** (the BB). The blinds are mandatory
+  posts, not voluntary actions; every preflop voluntary action is a fold, call or
+  raise, and **a bet is never legal preflop**.
+- **Pre-FVA folds.** Seats before the FVA seat in preflop acting order — which,
+  since order is descending seat number, means seats numbered *above* it — folded
+  before the FVA and have no action rows. They are folded from the start.
+- **A blind all-in from its post** (`stack_size <= 0`) is in the hand but cannot
+  act. See "Short-blind handling is unexercised" under Cross-cutting.
+- **Acting order** comes from the canonical position ordering. Preflop starts at
+  the FVA seat and runs down to the BB. Postflop order is not computed at all:
+  only the deferred P5-7(b) would consume it, and its absence is deliberate.
+
+An extracted `all_in` is **interpreted** from the running state — nothing
+committed yet on the street → bet; at or below the current commitment → call
+(possibly for less); above it → raise — for the checks only. The stored
+`action_type` is never rewritten.
+
+### D3 — `extraction_status`
+
+A key on every object in `hand_action_state.streets[]`:
+
+| Value | Meaning |
+|---|---|
+| `not_applicable` | Preflop — no community cards exist |
+| `extracted` | Step E located the street and read its cards |
+| `skipped_inert` | Not scanned by design, per D1 |
+| `unread` | Step E attempted the street and could not locate or read it |
+
+`unread` is never written: an unread contested street fails the attempt (P5-14),
+and inert streets are never attempted. It is defined so the vocabulary is
+complete and its meaning unambiguous. **If it ever appears in the corpus,
+something regressed.**
+
+An empty `community_cards` array is therefore never ambiguous between "no cards
+exist", "not looked for" and "looked for and not found".
+
+### D4 — normalization
+
+Street names and action types trimmed and lowercased; position labels trimmed and
+uppercased; cards in canonical form (uppercase rank, lowercase suit, `10` → `T`).
+Formatting only — synonyms are never mapped.
+
+**Card case normalization belongs to the Phase 6 shred**, where cards are
+decomposed for the fact tables. `card_normalization.normalize_card` maps `10` to
+`T` and does nothing else; it does not touch rank or suit case. An earlier
+version of this section attributed the whole of D4 to that helper, which was
+wrong. The extraction-phase duplicate checks (P4-5, P5-12) therefore **case-fold
+at the point of comparison** rather than rewriting stored values, consistent with
+the rule that a gate interprets but never rewrites what was extracted.
+
+### D6 — amount tolerance
+
+`betting_state.GATE_AMOUNT_TOLERANCE_BB = 0.1`, shared by P5-5, P5-7 and P5-8.
+
+**Deliberately separate from, and looser than, the tolerance the DBT layer will
+calibrate.** The two serve opposite purposes: a dbt tolerance decides whether a
+hand is *usable* and should be tuned tight against the corpus, while a gate
+tolerance decides whether to spend Pro retries on a hand and eventually park it.
+
+Displayed values are rounded — at t=584 an SB with 4.6 behind shoved a recorded
+4.55 — and the rounding accumulates across streets, so the gate starts at double
+that single observed discrepancy. Phase 6 must not reuse this constant, and the
+name says so.
 
 ## Known follow-ups
 
@@ -1212,7 +1662,18 @@ Not blocking any current phase, but accumulated as the project has grown.
 - **Detection variance is quantified but not addressed** — roughly 5% of legitimate hands differ between two Phase 3 runs on identical input, in both directions, with nothing in the pipeline able to see it. See "Detection is not deterministic." Two pieces of work, in order. First the **open question**: are the misses random or systematic? A detector that loses a *kind* of hand biases every aggregate, where random misses only cost precision, and this bears directly on Phase 6's analytical premise — it decides whether the corpus can be read as a census at all. Answering it needs a third and fourth detection pass on one video and a look at what the differing hands have in common, not new machinery. Then the **cheap mitigation**: union across two detection passes, at the cost of the clip-mode calls only. It needs a cross-run dedup rule, and that rule is proximity in time — the same signal the clip-boundary duplicate below needs, which is an argument for doing them together.
 - **429 retry patience, and no cooldown between runs** — supersedes "429 backoff is untested at default concurrency," which is answered: three incidents in one session exercised the backoff, it absorbed 429s, and one case exhausted all five attempts and parked a clip. Its suggested target no longer applies either — `YzKyFMQ1avU` is fully processed. Two things remain. **Whether to raise `_RETRY_MAX_ATTEMPTS`:** five attempts is an expected total wait of ~65s against a dynamic shared quota that can stay saturated far longer, and Google's own example has no stop condition; the trade is a longer-blocked worker against a parked entity. **A cooldown between runs:** the consecutive-failure counter has none, so re-running immediately against saturated capacity parks healthy entities. The second is the one that blocks unattended operation. See "Vertex uses dynamic shared quota, and the console does not show it."
 - **Seat-count monotonicity is an unbuilt check** — the player count in `hand_setups` must not increase over `hand_setup_time_seconds` within a video. One window function on one stage table. It found five phantom seats when last run, but all five ids predate a re-detection and the latest `MPBLfM4mwfE` run carries none, so the check must be re-run to have current hits — its value is that it is cheap and repeatable, not that it has a standing hit list. See "Phantom seats and the checks that find them" for why the null-stack precondition does not cover it, and "Corpus state" on why the ids expired.
-- **Nothing validates step D's action sequence against the `fva` block it was handed** — preflop `action_order 1` should be the seat, action type and amount Phase 5 interpolated into the prompt, and no code compares them. ARCHITECTURE asserted this check existed until it was looked for; see the amendment under "`bet_amount` includes a posted blind." **The query has since been run by hand and returns 0 disagreements across ~132 hands**, so the implementation has a known-good reference to validate against — but a passing ad-hoc query is not a check, and it tests consistency between two readings of the same window rather than correctness against the broadcast. It already has known hits: 9 of 117 Pro hands open with a fold at `action_order 1`, which no amount is committed for and which therefore cannot be the FVA. It belongs in **DBT, not the orchestrator** — failing a hand for starting one action early would discard an otherwise-correct sequence, where a flagged row keeps the data and surfaces the defect. One comparison between `hand_action_state.streets[0].actions[0]` and `hand_action_state.hand_start.fva`, no join and no LLM. Keep it *after* the timestamp anchor landed, not instead of it: the anchor makes D trust Phase 4, so this is now the thing that catches a bad FVA propagating. See "Pre-FVA folds are recorded inconsistently."
+- **Step D's action sequence is now validated against the `fva` block** — closed by P5-8. The item previously read that nothing compared preflop `action_order 1` against the block Phase 5 interpolated into the prompt, and argued the check belonged in **DBT, not the orchestrator**, on the grounds that failing a hand for starting one action early would discard an otherwise-correct sequence where a flagged row keeps the data.
+
+  **That argument is reversed.** Under a Phase 6 gate a flagged hand is excluded from the fact tables anyway, so "the row keeps the data" buys nothing — and a retry is the only mechanism that can produce a *correct* sequence, which dbt cannot do at all. The check is implemented in `check_step_d_output` and fails `failed_transient`.
+
+  Two findings from building it. Run against all 133 stored `hand_actions` rows it returns **0 disagreements**, independently reproducing the ad-hoc query recorded above — the first time that result has come from code rather than by hand. And the documented pre-FVA fold case is caught by **P5-4, not P5-8**: the BTN sits above the FVA seat in preflop acting order, so the running state has it folded before the sequence starts, and the message says the seat cannot act at all rather than that two records disagree. P5-8 would catch it too; the structural gate simply runs first.
+
+- **Phase 3 builds its prompt text and its provenance file list from two functions that must agree** — `_player_info_prompt` concatenates the bounty addendum on a progressive video, and `_clip_prompt_files` lists it in the provenance block on the same condition. Nothing enforces that the two branches match. They sit adjacent and are commented, which is the weakest form of enforcement there is. One function returning both the composed prompt and the files that went into it would make the class of bug impossible; today a divergence would record a provenance that is quietly wrong, which is worse than one that is obviously missing.
+
+- **Review the per-gate report after the rebuild** — hits, recoveries and parks grouped by `<gate_id>: <code>`, with parked hands listed before any re-mark. This is where the stated assumption that the gated errors are stochastic gets its first real test: it is demonstrated only for step D's pre-FVA folds and one card read that cleared on retry, and is untested for P4-4, P4-5, the other step-D gates and P5-14 on Pro. Include the count of parked or failed hands whose `hand_setup_time_seconds` equals their clip's `clip_start_time` — if boundary fragments account for a meaningful share of gate failures, that is the argument for a Phase 3 precondition suppressing detections in the first seconds of a clip. One join against `clip_manifest`, no LLM.
+
+- **P5-7(b) promotion review** — implement turn order as a dbt check, run it over the rebuilt corpus, and adjudicate every hand it flags against the broadcast. Promote it to a Phase 5 gate when it produces zero unadjudicated false positives across a full corpus, with the all-in, incomplete-raise and reopened-betting cases actually represented in the sample rather than merely absent from it. Until then it stays in dbt, where the four documented Pro seat-attribution swaps get flagged without costing the hand. See CLAUDE.md's "Where a validation check belongs."
+
 - **Ruff baseline** — 189 errors across `src/`, `tests/` and `scripts/`, 164 of them E501 against the configured 100-char limit and the rest auto-fixable imports plus two decorative unused mocks. Ruff is not in CI, which is why they accumulated. With that many standing errors a new one is invisible.
 - **Notebook reproduction harnesses are untracked** — `*.ipynb` is gitignored, while `jupyterlab`, `ipykernel` and `pillow` are dev dependencies precisely because CLAUDE.md's regression guard for prompts is notebook reproduction. The harnesses themselves are not versioned, so each investigation rebuilds them.
 
@@ -1243,5 +1704,5 @@ Not blocking any current phase, but accumulated as the project has grown.
 ### Experiments
 
 - **Does step D specifically need Pro?** Supersedes "Revisit the clip-mode model default after the first multi-video ingest," which is answered: the rate is 15% across two videos, Pro recovers the contested truncations, and Phase 5 now runs on Pro. The open question is narrower. Phase 5 makes one step-D call and two to three step-E scans per hand; if only the scans need Pro, a per-step split saves roughly **$360** across the projected corpus. Against that, it means threading a model parameter through a primitive deliberately ignorant of its caller — see "Model selection is per call mode" on why that is resisted. **The comparison needs a query, not new calls:** the split run put Pro on all clip calls, the current corpus is all-Flash, and both post-date the prompt changes, so the arms already exist in stored exports.
-- **Per-row model provenance is unrecoverable** — the model that served a call is emitted only on the `gemini_usage` stderr line, which is not persisted, so no query can attribute a row to a model. This is now load-bearing rather than theoretical: seven `YzKyFMQ1avU` hands were produced on Pro and the rest of the corpus on Flash, and nothing in the tables distinguishes them. A `model` column on the stage tables would settle it, at the cost of a schema change to five tables; a cheaper option is recording it in `status_message`, which is already free-text and already read by operators.
+- **Per-row model provenance — closed.** Every row a Gemini-calling phase writes now records the model per call mode and the version of every prompt file and reference image that produced it. The item read that the model was emitted only on the unpersisted `gemini_usage` line, so no query could attribute a row to a model — load-bearing once seven `YzKyFMQ1avU` hands were produced on Pro and the rest of the corpus on Flash. The two options it weighed, a `model` column across five tables or a note in `status_message`, were both passed over for a `provenance` key inside the existing JSON columns: no schema change, and it carries prompt versions as well as the model. See "Provenance". **The rows produced before this landed remain unattributable**, which the rebuild resolves by replacing them.
 - **`user_text` may be unnecessary** — both system prompts are self-contained and end with the instruction the user turn repeats. Test a media-only user turn; if responses are unaffected, drop the second part from both callers entirely.
