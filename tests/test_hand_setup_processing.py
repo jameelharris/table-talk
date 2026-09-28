@@ -586,7 +586,8 @@ def test_provenance_records_both_call_modes():
 
     provenance = _run_one_clip_and_capture_provenance("none")
     assert provenance["models"] == {"clip": CLIP_MODEL, "frame": FRAME_MODEL}
-    assert provenance["prompts"]["prompts/identify_hand.md"] == _P3_HASHES["prompts/identify_hand.md"]
+    key = "prompts/identify_hand.md"
+    assert provenance["prompts"][key] == _P3_HASHES[key]
 
 
 def test_non_bounty_video_sends_the_unmodified_prompt():
@@ -766,7 +767,9 @@ def test_process_pending_clips_download_not_found_marks_clips_permanent():
         patch("table_talk.hand_setup_processing.process_clip", new_callable=AsyncMock) as mock_process,
         patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row") as mock_attempt,
     ):
-        stats = _run(process_pending_clips("proj", "ds", "vb", "hb", "ip", "ep", "addendum", _P3_HASHES))
+        stats = _run(process_pending_clips(
+            "proj", "ds", "vb", "hb", "ip", "ep", "addendum", _P3_HASHES,
+        ))
 
     mock_process.assert_not_called()
     assert stats["clips_processed"] == 2

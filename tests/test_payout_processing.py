@@ -721,7 +721,11 @@ def test_pending_videos_precondition_skip_never_downloads():
     # The whole point of checking ahead of the download: the entity IS the
     # video, so there is nothing to amortise a 100-200 MB fetch over.
     with _patched_orchestrator([_pending(duration_seconds=1)]) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
+        stats = _run(
+            process_pending_videos(
+                "proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES
+            )
+        )
 
     mocks.download.assert_not_called()
     mocks.process.assert_not_called()
@@ -732,7 +736,11 @@ def test_pending_videos_precondition_skip_never_downloads():
 
 def test_pending_videos_happy_path_downloads_then_processes():
     with _patched_orchestrator([_pending()]) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
+        stats = _run(
+            process_pending_videos(
+                "proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES
+            )
+        )
 
     mocks.download.assert_called_once()
     assert mocks.download.call_args[0][0] == "gs://vb/dQw4w9WgXcQ.mp4"
@@ -744,7 +752,11 @@ def test_pending_videos_download_404_is_permanent():
     with _patched_orchestrator(
         [_pending()], download_error=DownloadPermanentError("Video object not found")
     ) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
+        stats = _run(
+            process_pending_videos(
+                "proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES
+            )
+        )
 
     mocks.process.assert_not_called()
     assert stats["videos_failed_permanent"] == 1
@@ -757,7 +769,11 @@ def test_pending_videos_download_error_is_transient():
     with _patched_orchestrator(
         [_pending()], download_error=RuntimeError("connection reset")
     ) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
+        stats = _run(
+            process_pending_videos(
+                "proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES
+            )
+        )
 
     mocks.process.assert_not_called()
     assert stats["videos_failed_transient"] == 1
@@ -770,7 +786,11 @@ def test_pending_videos_download_error_at_the_cap_parks():
     with _patched_orchestrator(
         [_pending(consecutive_failures=2)], download_error=RuntimeError("connection reset")
     ) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
+        stats = _run(
+            process_pending_videos(
+                "proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES
+            )
+        )
 
     assert stats["videos_failed_parked"] == 1
     assert mocks.write_attempt.call_args[0][0].status == "failed_parked"
@@ -778,7 +798,12 @@ def test_pending_videos_download_error_at_the_cap_parks():
 
 def test_pending_videos_scopes_to_video_id():
     with _patched_orchestrator([]) as mocks:
-        _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES, video_id="somevid"))
+        _run(
+            process_pending_videos(
+                "proj", "ds", "vb", _BUCKET, _PROMPT,
+                prompt_hashes=_HASHES, video_id="somevid",
+            )
+        )
 
     assert mocks.find.call_args[1]["only_video_ids"] == ["somevid"]
 
@@ -792,7 +817,11 @@ def test_pending_videos_no_video_id_scopes_to_everything():
 
 def test_pending_videos_stats_shape_with_no_work():
     with _patched_orchestrator([]):
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
+        stats = _run(
+            process_pending_videos(
+                "proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES
+            )
+        )
 
     assert stats == {
         "videos_processed": 0,
@@ -813,7 +842,11 @@ def test_pending_videos_continues_past_a_failing_video():
     with _patched_orchestrator(
         [_pending(video_id="a"), _pending(video_id="b")], process_outcomes=_next
     ) as mocks:
-        stats = _run(process_pending_videos("proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES))
+        stats = _run(
+            process_pending_videos(
+                "proj", "ds", "vb", _BUCKET, _PROMPT, prompt_hashes=_HASHES
+            )
+        )
 
     assert mocks.process.call_count == 2
     assert stats["videos_processed"] == 2

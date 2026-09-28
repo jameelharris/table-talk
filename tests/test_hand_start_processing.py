@@ -374,7 +374,10 @@ def test_process_hand_setup_hole_card_no_match_is_none():
     # is SB, so BTN is non-eligible and P4-6 does not fire: this test is about
     # the matching loop, not about whether a null is tolerated.
     with (
-        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FVA_SB),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_clip",
+            return_value=_CLIP_RESULT_FVA_SB,
+        ),
         patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
         patch(
             "table_talk.hand_start_processing.call_gemini_for_frame",
@@ -601,7 +604,10 @@ def test_process_hand_setup_non_eligible_null_does_not_trigger_retry():
         ]
     }
     with (
-        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FVA_SB),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_clip",
+            return_value=_CLIP_RESULT_FVA_SB,
+        ),
         patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
         patch(
             "table_talk.hand_start_processing.call_gemini_for_frame",
@@ -1024,7 +1030,9 @@ def test_process_pending_hand_setups_no_video_id_means_no_video_scope():
         patch("table_talk.hand_start_processing.download_video"),
         patch("table_talk.hand_start_processing.process_hand_setup", new_callable=AsyncMock, return_value="complete"),
     ):
-        _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES))
+        _run(process_pending_hand_setups(
+            "proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES,
+        ))
 
     mock_find.assert_called_once_with(
         "proj", "ds",
@@ -1035,14 +1043,18 @@ def test_process_pending_hand_setups_no_video_id_means_no_video_scope():
 
 
 def test_process_pending_hand_setups_download_failure_marks_transient():
-    hand_setups = [PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0, "none")]
+    hand_setups = [
+        PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 0, "none")
+    ]
     with (
         patch("table_talk.hand_start_processing._find_pending_hand_setups", return_value=hand_setups),
         patch("table_talk.hand_start_processing.download_video", side_effect=Exception("network error")),
         patch("table_talk.hand_start_processing.process_hand_setup", new_callable=AsyncMock) as mock_process,
         patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
     ):
-        stats = _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES))
+        stats = _run(process_pending_hand_setups(
+            "proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES,
+        ))
 
     mock_process.assert_not_called()
     assert stats["hand_setups_processed"] == 1
@@ -1054,14 +1066,19 @@ def test_process_pending_hand_setups_download_failure_marks_transient():
 
 
 def test_process_pending_hand_setups_download_failure_parks_at_cap():
-    hand_setups = [PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 2, "none")]
+    hand_setups = [
+        PendingHandSetup("vid_a_001_001", "vid_a_001", "vid_a", 0, {}, 60, 60, 2, "none")
+    ]
     with (
         patch("table_talk.hand_start_processing._find_pending_hand_setups", return_value=hand_setups),
         patch("table_talk.hand_start_processing.download_video", side_effect=Exception("network error")),
         patch("table_talk.hand_start_processing.process_hand_setup", new_callable=AsyncMock) as mock_process,
         patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
     ):
-        stats = _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES, max_attempts=3))
+        stats = _run(process_pending_hand_setups(
+            "proj", "ds", "vb", "hb", "ip", "ep",
+            prompt_hashes=_P4_HASHES, max_attempts=3,
+        ))
 
     mock_process.assert_not_called()
     assert stats["hand_setups_failed_parked"] == 1
@@ -1080,7 +1097,9 @@ def test_process_pending_hand_setups_download_not_found_marks_permanent():
         patch("table_talk.hand_start_processing.process_hand_setup", new_callable=AsyncMock) as mock_process,
         patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
     ):
-        stats = _run(process_pending_hand_setups("proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES))
+        stats = _run(process_pending_hand_setups(
+            "proj", "ds", "vb", "hb", "ip", "ep", prompt_hashes=_P4_HASHES,
+        ))
 
     mock_process.assert_not_called()
     assert stats["hand_setups_processed"] == 2
@@ -1594,7 +1613,10 @@ def test_phase_3_provenance_rides_through_the_nested_hand_setup():
         _HS,
         hand_setup_state={
             **_HS.hand_setup_state,
-            "provenance": {"models": {"clip": "p3-model"}, "prompts": {"prompts/identify_hand.md": "abc"}},
+            "provenance": {
+                "models": {"clip": "p3-model"},
+                "prompts": {"prompts/identify_hand.md": "abc"},
+            },
         },
     )
     with (
