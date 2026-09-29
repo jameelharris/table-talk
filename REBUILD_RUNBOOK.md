@@ -38,6 +38,13 @@ change does, and applying it would delete the corpus.
 terraform apply
 ```
 
+**Column descriptions are capped at 1,024 characters** and BigQuery rejects the
+table update rather than truncating. The first apply of this change hit that on
+`hand_actions`, after the other three tables had already applied — so a re-run
+updates only `hand_actions`, and a plan showing one table left to change is the
+expected state, not a sign something was missed. `uv run pytest` now checks the
+limit, so it fails in the suite rather than at apply time.
+
 ---
 
 ## Step 1 — Mark pending, per video

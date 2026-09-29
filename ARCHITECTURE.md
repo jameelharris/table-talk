@@ -1095,6 +1095,16 @@ reached — that limitation applies to scalar columns only. The column
 diff, since `gen_schemas.py` reads name, type, mode and default expression and
 ignores descriptions entirely.
 
+**A column description is capped at 1,024 characters**, and BigQuery rejects the
+table update rather than truncating. Documenting `extraction_status` inline
+pushed `hand_action_state` to 1,221 and the apply failed on `hand_actions` after
+three tables had already succeeded — a partial migration, which is the worst
+shape for a change that is supposed to be inert. The detail moved to "Shared
+definitions" (D3) and the description points at it. `tests/test_schema_descriptions.py`
+now enforces the limit, because neither consumer of these files checks it:
+codegen ignores descriptions entirely, so an over-length one produces a clean
+codegen run, a green suite, and a failure at apply time.
+
 **The chain falls out of nesting, with no code assembling it.** Phase 4 nests
 `hand_setup_state` by reference and Phase 5 nests `hand_start_state`, so one
 `hand_actions` row carries all three blocks — `hand_action_state.provenance`,
