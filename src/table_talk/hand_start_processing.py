@@ -285,8 +285,9 @@ def check_fva(fva: dict, hand_setup_state: dict) -> str | None:
     The label check is not decoration. An unresolvable label leaves seat_number
     None, and the eligible-seat calculation below reads a None seat_number as
     "every seat is eligible" — so a bad label silently widens the hole-card read
-    to the whole table and would then make P4-6 demand cards for seats that
-    folded long before the FVA.
+    to the whole table. It also defeats build_seats, which marks the pre-FVA
+    folds by seat number, so P5-16 would then demand cards for seats that folded
+    long before the FVA.
     """
     action_type = fva.get("action_type")
     if action_type not in VALID_FVA_ACTION_TYPES:
@@ -330,8 +331,18 @@ def check_duplicate_hole_cards(eligible_players: list[dict]) -> str | None:
     return None
 
 
-def check_missing_hole_cards(eligible_players: list[dict]) -> str | None:
-    """P4-6. Return a reason a seat still in at the FVA has no cards, or None.
+def check_missing_hole_cards(eligible_players: list[dict], fva_label: str | None) -> str | None:
+    """P4-6, narrowed to the FVA seat's own cards. See H5.
+
+    H5 says a missing card costs the hand only on a seat that *stayed in* after
+    the FVA, and which seats those are is not knowable here: the actions do not
+    exist until step D has run. The FVA seat is the one exception — it is defined
+    by a chip commitment, so it stayed in by construction — and that is exactly
+    the scope this keeps. Every other seat is P5-16's business.
+
+    This replaces a version that failed the hand for any eligible seat's null.
+    Two of its hits had the unreadable seat fold at its first action after the
+    FVA, so both hands still carried their whole story.
 
     Permanent, unlike P4-5. This runs after the in-attempt retry, so a null here
     has already survived a second read of the same frame, and the three observed
@@ -340,16 +351,15 @@ def check_missing_hole_cards(eligible_players: list[dict]) -> str | None:
     attempt reads the same pixels. The accepted cost is that a hand a different
     verification frame could have resolved is lost; mark-pending is the way back.
     """
-    missing = [
-        p.get("seat_position_label") or "<unknown position>"
-        for p in eligible_players
-        if not p.get("hole_cards") or any(c is None for c in p["hole_cards"])
-    ]
-    if missing:
-        return (
-            f"{GATE_MISSING_HOLE_CARDS_LIVE_SEAT}: seat(s) still in at the FVA with "
-            f"no readable hole cards after retry — {', '.join(missing)}"
-        )
+    for player in eligible_players:
+        if player.get("seat_position_label") != fva_label:
+            continue
+        cards = player.get("hole_cards")
+        if not cards or any(c is None for c in cards):
+            return (
+                f"{GATE_MISSING_HOLE_CARDS_LIVE_SEAT}: the FVA seat {fva_label} has no "
+                f"readable hole cards after retry"
+            )
     return None
 
 
@@ -359,7 +369,7 @@ def eligible_seats_at_fva(hand_start_state: dict) -> list[dict]:
     Preflop acting order is descending seat number, so "the FVA seat and every
     seat after it" is exactly seat_number <= the FVA's. This is the same set
     build_hole_card_context feeds to the step-C prompt; the two must agree, or
-    P4-6 would demand cards for a seat that was never read.
+    P5-16 would demand cards for a seat that was never read.
     """
     fva_seat_number = hand_start_state["fva"]["seat_number"]
     players = hand_start_state["hand_setup"].get("players", [])
@@ -581,6 +591,10 @@ async def process_hand_setup(
             # both a duplicate and a null is retried rather than parked: the
             # duplicate is the recoverable half, and giving the permanent gate
             # precedence would discard a hand a retry could still fix.
+            #
+            # P4-6 judges the FVA seat alone. A null on any other eligible seat
+            # is carried into the row and judged by P5-16, once step D has said
+            # whether that seat stayed in after the FVA. See H5.
             duplicate_reason = check_duplicate_hole_cards(eligible_players)
             if duplicate_reason is not None:
                 status = _transient_status(hs.consecutive_failures, max_attempts)
@@ -590,7 +604,9 @@ async def process_hand_setup(
                 )
                 return status
 
-            missing_reason = check_missing_hole_cards(eligible_players)
+            missing_reason = check_missing_hole_cards(
+                eligible_players, hand_start_state["fva"]["seat_position_label"]
+            )
             if missing_reason is not None:
                 _write_attempt(
                     hs.hand_setup_id, "failed_permanent", missing_reason,

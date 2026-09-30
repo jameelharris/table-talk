@@ -371,8 +371,8 @@ def test_process_hand_setup_hole_card_no_match_is_none():
         bounty_type="none",
     )
     # Gemini's response omits BTN — its hole_cards should end up None. The FVA
-    # is SB, so BTN is non-eligible and P4-6 does not fire: this test is about
-    # the matching loop, not about whether a null is tolerated.
+    # is SB, so BTN is non-eligible and neither hole-card gate fires: this test
+    # is about the matching loop, not about whether a null is tolerated.
     with (
         patch(
             "table_talk.hand_start_processing.call_gemini_for_clip",
@@ -476,24 +476,23 @@ def test_process_hand_setup_retry_fills_eligible_null():
     assert "null hole_cards" not in attempt_row.status_message
 
 
-def test_process_hand_setup_retry_still_null_is_failed_permanent():
-    """P4-6 reverses the old behaviour here.
+def test_process_hand_setup_retry_still_null_on_the_fva_seat_is_failed_permanent():
+    """P4-6, on the one seat it still judges.
 
-    This hand used to complete with the residual null enumerated in
-    status_message. It now fails permanently: a null on a seat still in at the
-    FVA has already survived a second read of the same frame, and all three
-    observed causes are properties of that frame, so a further attempt reads the
-    same pixels. The accepted cost is that a hand another verification frame
-    could have resolved is lost.
+    The FVA is BTN and BTN is the seat that will not read. A null there has
+    already survived a second read of the same frame, and all three observed
+    causes are properties of that frame, so a further attempt reads the same
+    pixels. The accepted cost is that a hand another verification frame could
+    have resolved is lost.
     """
     hs = _three_seat_hs()
     first_response = {
         "players": [
             {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
-            {"seat_position_label": "BTN", "hole_cards": ["2c", "3c"]},
+            {"seat_position_label": "SB", "hole_cards": ["2c", "3c"]},
         ]
     }
-    second_response = {"players": []}  # retry also misses SB
+    second_response = {"players": []}  # retry also misses BTN
     with (
         patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),
         patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
@@ -521,7 +520,60 @@ def test_process_hand_setup_retry_still_null_is_failed_permanent():
     attempt_row = mock_write_attempt.call_args[0][0]
     assert attempt_row.status == "failed_permanent"
     assert attempt_row.status_message.startswith("P4-6: missing_hole_cards_live_seat: ")
-    assert "SB" in attempt_row.status_message
+    assert "BTN" in attempt_row.status_message
+
+
+def test_process_hand_setup_retry_still_null_off_the_fva_seat_completes():
+    """The narrowing, at the orchestrator. The FVA is BTN and it reads; SB does
+    not, and the hand completes with the null carried into hand_start_state for
+    P5-16 to judge once step D says whether SB stayed in after the FVA.
+
+    Two corpus hands this used to park had the unreadable seat fold at its first
+    action after the FVA, so both still carried their whole story.
+    """
+    hs = _three_seat_hs()
+    first_response = {
+        "players": [
+            {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+            {"seat_position_label": "BTN", "hole_cards": ["2c", "3c"]},
+        ]
+    }
+    second_response = {"players": []}  # retry also misses SB
+    with (
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_clip",
+            return_value=_CLIP_RESULT_FOUND,
+        ),
+        patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_frame",
+            side_effect=[first_response, second_response],
+        ) as mock_gemini_frame,
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch(
+            "table_talk.hand_start_processing.write_hand_setup_processing_attempt_row"
+        ) as mock_write_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            hs, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+        ))
+
+    assert outcome == "complete"
+    # The retry still ran: the read is attempted for every eligible seat, and
+    # only the judging narrowed.
+    assert mock_gemini_frame.call_count == 2
+
+    mock_write_starts.assert_called_once()
+    players = mock_write_starts.call_args[0][0][0].hand_start_state["hand_setup"]["players"]
+    by_label = {p["seat_position_label"]: p for p in players}
+    assert by_label["SB"]["hole_cards"] is None
+    assert by_label["BTN"]["hole_cards"] == ["2c", "3c"]
+
+    assert mock_write_attempt.call_args[0][0].status == "complete"
 
 
 def test_process_hand_setup_retry_does_not_clobber_first_call_answer():
@@ -600,7 +652,7 @@ def test_process_hand_setup_non_eligible_null_does_not_trigger_retry():
         "players": [
             {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
             {"seat_position_label": "SB", "hole_cards": ["2c", "3c"]},
-            # BTN omitted -> null, but non-eligible so P4-6 does not fire
+            # BTN omitted -> null, but non-eligible so no gate demands it
         ]
     }
     with (
@@ -1823,7 +1875,8 @@ def test_p4_5_compares_case_folded():
 
 
 def test_p4_5_ignores_nulls():
-    """A null is P4-6's business, not P4-5's — two nulls are not a duplicate."""
+    """A null is P4-6's or P5-16's business, not P4-5's — two nulls are not a
+    duplicate."""
     players = [
         {"seat_position_label": "BB", "hole_cards": [None, None]},
         {"seat_position_label": "SB", "hole_cards": [None, "3c"]},
@@ -1836,18 +1889,32 @@ def test_p4_6_all_eligible_seats_readable_passes():
         {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
         {"seat_position_label": "SB", "hole_cards": ["2c", "3c"]},
     ]
-    assert check_missing_hole_cards(players) is None
+    assert check_missing_hole_cards(players, "SB") is None
 
 
 @pytest.mark.parametrize("cards", [None, [], [None, None], ["Ah", None]])
-def test_p4_6_any_unreadable_card_on_a_live_seat_fails(cards):
+def test_p4_6_an_unreadable_card_on_the_fva_seat_fails(cards):
+    """The FVA seat committed chips, so it stayed in by construction — H5's
+    live-seat test needs no actions for this one seat."""
     players = [
         {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
         {"seat_position_label": "SB", "hole_cards": cards},
     ]
-    reason = check_missing_hole_cards(players)
+    reason = check_missing_hole_cards(players, "SB")
     assert reason.startswith("P4-6: missing_hole_cards_live_seat: ")
     assert "SB" in reason
+
+
+@pytest.mark.parametrize("cards", [None, [], [None, None], ["Ah", None]])
+def test_p4_6_ignores_an_unreadable_card_off_the_fva_seat(cards):
+    """The narrowing. Whether a non-FVA seat stayed in after the FVA depends on
+    actions that do not exist until step D has run, so P5-16 judges it — and two
+    hands this used to park had the unreadable seat fold at its first action."""
+    players = [
+        {"seat_position_label": "BB", "hole_cards": cards},
+        {"seat_position_label": "SB", "hole_cards": ["2c", "3c"]},
+    ]
+    assert check_missing_hole_cards(players, "SB") is None
 
 
 def test_eligible_seats_at_fva_is_the_seats_from_the_fva_onwards():

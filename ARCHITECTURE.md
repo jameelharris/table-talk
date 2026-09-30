@@ -556,9 +556,11 @@ Three further preconditions were added with the gates, after those four and in t
 
 After step A returns, before the frame work:
 
-- **P4-4 `invalid_fva_action_type`** → `failed_transient`. The FVA's `action_type` must be `call`, `raise` or `all_in`, **and its `seat_position_label` must resolve to a seat in the hand.** The second half is not decoration: an unresolvable label leaves `seat_number` null, which the eligible-seat calculation reads as "every seat", so a bad label silently widens the hole-card requirement to the whole table and P4-6 then fails the hand for seats that folded long before the FVA.
+- **P4-4 `invalid_fva_action_type`** → `failed_transient`. The FVA's `action_type` must be `call`, `raise` or `all_in`, **and its `seat_position_label` must resolve to a seat in the hand.** The second half is not decoration: an unresolvable label leaves `seat_number` null, which the eligible-seat calculation reads as "every seat", so a bad label silently widens the hole-card read to the whole table. It also defeats `build_seats`, which marks the pre-FVA folds by seat number — so a bad label would make P5-16 demand cards for seats that folded long before the FVA.
 - **P4-5 `duplicate_hole_card`** → `failed_transient`, after the in-attempt retry, **case-folded** (see D4).
-- **P4-6 `missing_hole_cards_live_seat`** → `failed_permanent`. See "Null hole cards on a seat that acted" for the reversal this represents.
+- **P4-6 `missing_hole_cards_live_seat`** → `failed_permanent`, **scoped to the FVA seat's own hole cards**. Every other seat's null is carried into the row and judged by P5-16 once step D has said whether that seat stayed in. See H5 for the rule and "Null hole cards on a seat that stayed in" for how the scope got here.
+
+**Why P4-6 keeps only the FVA seat.** H5 asks whether a seat *stayed in* after the FVA, and Phase 4 cannot answer that: the actions do not exist until Phase 5 has run. The FVA seat is the one seat where the answer is structural — it is defined by a chip commitment, so it stayed in by construction — and that is the whole of what this gate can decide on its own. The retry is unchanged and still fires for a null on any eligible seat; only the judging narrowed.
 
 P4-4 fires before frame extraction and the hole-card call, so a bad FVA costs one clip call. When a hand carries both a duplicate and a missing card, P4-5 wins: giving the permanent gate precedence would discard a hand a retry could still fix.
 
@@ -587,12 +589,12 @@ All three write zero `hand_starts` rows. The `complete_uncontested` branch calls
 
 Established by exhaustive validation over `MPBLfM4mwfE`: first across the 65 hands of the original run, then re-established across the 63 of the rebuild. Both are historical — the video has been re-detected again and now holds 57 `hand_setups` and 54 `hand_starts` (see "Corpus state"), against which this exhaustive validation has not been repeated. The guarantees below are properties of the phase and still hold; the counts and ids are properties of those two runs. The rebuild's outcome is 58 `complete` with rows, 2 `complete_uncontested` (`_010_002`, `_013_001`), 2 `complete_skipped` (`_005_005` on SB and `_009_005` on CO, both null stack), and 1 `failed_transient` (`_008_004`) — 63 hand setups in, 58 `hand_starts` rows out. The single failure is a clip-boundary fragment and is not unexplained; see "Retry caps", which also records why its twin from the original run, `_004_008`, completed this time. Both row counts are properties of a *run*, not of the video — see "Detection is not deterministic." Downstream phases must treat all of the following as **normal input**, not defects:
 
-- **Eligible-seat hole cards may be `null`** in a `complete` record (4 of 65 in the original run, 2 of 58 in the rebuild — `_004_008` on CO and `_005_001` on BTN, both enumerated in `status_message`). Read that as a range, not a trend: the rate moved across a re-detection with no prompt change between the runs. Most were on folded players and inconsequential. One was on a live player and is **frame-limited** — a six-time reproduction against the stored frame returned null every time while the adjacent seat read correctly, so the card is genuinely not legible at the FVA moment. More retries would not recover it.
+- **Eligible-seat hole cards may be `null`** in a `complete` record, on any seat but the FVA's — that one is P4-6's, and a null there is `failed_permanent` with no row at all. This is the narrowed gate's deliberate consequence, and it makes the guarantee below load-bearing for Phase 5 rather than merely advisory: the row exists, the null is in it, and P5-16 is what decides whether it costs the hand. The historical rates (4 of 65 in the original run, 2 of 58 in the rebuild — `_004_008` on CO and `_005_001` on BTN, both enumerated in `status_message`) predate both gates. Read them as a range, not a trend: the rate moved across a re-detection with no prompt change between the runs. Most were on folded players and inconsequential. One was on a live player and is **frame-limited** — a six-time reproduction against the stored frame returned null every time while the adjacent seat read correctly, so the card is genuinely not legible at the FVA moment. More retries would not recover it.
 - **Non-null hole cards may be wrong.** One hand returned `4d4s` for a seat holding `9s7d` — a hallucination, not a null. It landed on a folded seat, but the failure mode is real. `status_message` enumerates residual nulls and has **no signal** for wrong-but-non-null cards, so neither Phase 5 nor DBT can use status to filter bad data. The only mitigation would be consensus reads, which the pipeline does not do.
-- **`complete` does not guarantee complete hole-card data.** Inspect `hand_start_state` for nulls on players who acted; do not rely on status. That population is quantified — roughly 3% of hands, against a ~25% raw null rate that is mostly legitimate — under "Null hole cards on a seat that acted."
+- **`complete` does not guarantee complete hole-card data.** Inspect `hand_start_state` for nulls on players who acted; do not rely on status. `status_message` no longer enumerates them at all, and under the narrowed P4-6 it never will — a `complete` row may carry a null on any non-FVA seat. That population is quantified — roughly 3% of hands, against a ~25% raw null rate that is mostly legitimate — under "Null hole cards on a seat that stayed in."
 - **`fva.action_type ∈ {call, raise, all_in}`.** No `limp` — it is derivable as `call` with `bet_amount == 1.0` preflop. `fold` and `check` are unreachable because the FVA is defined by chip commitment.
 
-Whether a null or wrong card makes a hand unusable can only be judged against the assembled final hand state, which is downstream of Phase 5. So Phase 5 consumes possibly-null and possibly-wrong hole cards, tracks actions regardless, and DBT discards unusable hands. Observed consequential-error rate is roughly 3% — measured as 4 nulls on acting seats across 132 hands; see "Null hole cards on a seat that acted" for the denominators, which are easy to get wrong in both directions.
+Whether a null or wrong card makes a hand unusable can only be judged against the assembled final hand state, which is downstream of Phase 5. So Phase 5 consumes possibly-null and possibly-wrong hole cards, tracks actions regardless, and DBT discards unusable hands. Observed consequential-error rate is roughly 3% — measured as 4 nulls on acting seats across 132 hands; see "Null hole cards on a seat that stayed in" for the denominators, which are easy to get wrong in both directions.
 
 ### Hole-card retry
 
@@ -609,7 +611,7 @@ Per hand start: check preconditions, run step D over the whole hand window for t
 ### Production files
 
 - `cli.py` — `tt process-hand-starts` subcommand
-- `hand_action_processing.py` — orchestration: `PendingHandStart` (module-local frozen dataclass), `_find_pending_hand_starts`, `check_preconditions`, `_street_timestamp_guard`, `_scan_for_street`, `_read_street_cards`, `_transient_status`, `_write_attempt`, `process_hand_start` (async, atomic per hand start), `process_pending_hand_starts`
+- `hand_action_processing.py` — orchestration: `PendingHandStart` (module-local frozen dataclass), `_find_pending_hand_starts`, `check_preconditions`, `_street_timestamp_guard`, `_scan_for_street`, `_read_street_cards`, `check_step_d_output`, `check_missing_hole_cards`, `_transient_status`, `_write_attempt`, `process_hand_start` (async, atomic per hand start), `process_pending_hand_starts`
 - `hand_actions_writer.py` — `hand_actions` table writes (replace semantics keyed on `hand_start_id`; `street_frame_gcs_paths` is REPEATED and goes through `ArrayQueryParameter`, never `None`)
 - `hand_start_processing_attempts_writer.py` — `hand_start_processing_attempts` state table writes
 - `reference_images.py` — `load_reference_images`, `STREET_REFERENCE_ORDER`, `reference_image_filename`
@@ -712,6 +714,10 @@ a failing hand costs one clip call rather than up to seven. First failure wins.
 All are `failed_transient`: a retry is the only mechanism that can produce a
 correct sequence, and dbt cannot re-extract at all.
 
+P5-16 runs in the same place but is not one of them — see below, and note that
+its `failed_permanent` is why it sits outside `check_step_d_output` rather than
+inside it.
+
 `check_step_d_output` replays the hand through `betting_state` (D2), then runs:
 P5-1 `action_label_unresolved`, P5-2 `winner_unresolved`, P5-3
 `action_after_hand_end`, P5-4 `action_after_fold_or_all_in`, P5-5
@@ -740,7 +746,43 @@ resolves it.
 order, not execution order, and P5-11 (board card count) turned out to be already
 implemented as `_street_cards_unusable`, so its number is retired rather than
 recycled — reusing it would make the per-gate report ambiguous between two
-different checks.
+different checks. **P5-16 is therefore the next number allocated, not the
+second-to-last**, and P5-11 stays unused permanently.
+
+### P5-16 — the hole-card gate
+
+`check_missing_hole_cards` runs immediately after the step-D gates and before
+any step E call. It is **not** part of `check_step_d_output`, whose whole
+population is `failed_transient`; this one is `failed_permanent`, so folding it
+in would break that section's single classification.
+
+It applies H5 to every seat but the FVA's: a seat with no readable hole cards
+fails the hand if it took any action that was not a fold, or was still in when
+the replay ran out of actions. The second clause is what covers a showdown, a
+win, and a blind that is all-in from its post and so never gets to act. Winners
+need no separate test because P5-6 has already established that every winner is
+still in at the end — which is the second reason the gate must run after the
+step-D gates, the first being that a hand whose replay hit a violation has no
+trustworthy sequence to judge liveness from.
+
+**Permanent for a stronger reason than P4-6's.** Nothing in Phase 5 reads a hole
+card, so no retry of this phase can change the answer — the null is a property
+of Phase 4's FVA frame. The way back is `tt mark-pending --stage hand_starts`,
+which re-reads that frame.
+
+It reads the players from the hand's own `hand_setup` blob and replays the hand
+a second time rather than having `check_step_d_output` hand its state out — the
+same trade `inert_streets_for` makes, for the same reason.
+
+**Its live population is unmeasured, and the reason is structural.** The gate it
+splits from, P4-6 unnarrowed, failed every hand carrying an eligible-seat null
+permanently, so none of the 134 stored `hand_starts` rows carries one: 0 rows
+with a null on a non-FVA eligible seat. P5-16 can therefore fire only on rows
+written after this change. What *is* measured is the population it must not fire
+on, which is large and present — **231 nulls across 89 of the 134 rows**, every
+one on a seat above the FVA in preflop acting order, which `build_seats` marks
+folded from the start and which consequently never enters the stayed-in set. The
+first real measurement of hits comes from the rebuild's Phase 5 run.
 
 ### Step-E gates
 
@@ -1358,13 +1400,13 @@ Both sightings are historical to the 63-row rebuild and neither row exists today
 
 None of this is built. It is recorded because the checks are cheap, and because the class recurred across re-detections rather than appearing once.
 
-### Null hole cards on a seat that acted
+### Null hole cards on a seat that stayed in
 
-A null hole card is only a defect if the seat it belongs to **acted**. A seat that acted must have held cards, so a null there is a read failure. A seat that folded before the FVA has mucked, and the FVA frame correctly shows it no cards.
+A null hole card is only a defect if the seat it belongs to **stayed in the hand after the FVA**. A seat that kept its cards live must have held cards, so a null there is a read failure. A seat that folded — before the FVA, or at its first action after it — has mucked, and the FVA frame correctly shows it no cards. H5 states the rule precisely; this section is how it was arrived at, including one wrong turn.
 
 The rates are what make the rule worth stating:
 
-- **4 in 132 hands, roughly 3%** — nulls on a seat that acted. These are read failures.
+- **4 in 132 hands, roughly 3%** — nulls on a seat that acted. These are read failures. Measured against "acted", which H5 has since tightened to "stayed in", so read it as an upper bound.
 - **~150 nulls that are correct** — folded-and-mucked seats.
 - **~25% of seats null overall**, which is the number a naive query returns and which says nothing at all about extraction quality.
 
@@ -1376,13 +1418,17 @@ Three observed causes:
 - **four-colour suit confusion** — already documented under "Observed extraction errors."
 - **a chat-bubble overlay covering a seat's cards at the FVA moment** — new, confirmed by inspecting the frame for `YzKyFMQ1avU_020_001_001`, where the FVA seat's own cards are obscured. This one is not a legibility or a recognition problem: the cards are not on screen to be read, and no prompt change or retry reaches them. A different verification frame would.
 
-**Reversed: this is gateable at extraction time, and is now gated (P4-6).** The argument against was that Phase 4 cannot know which seats will act, because the actions do not exist until Phase 5 has run. That is true and beside the point. Phase 4 does not need to know which seats *will* act — every seat still in the hand at the FVA either acts, even if only to fold, or is all-in from its post. That set is exactly `seat_number <= fva.seat_number`, which is already the set Phase 4 reads hole cards for, so the check needs nothing a later phase produces.
+**Reversed: this is gateable at extraction time, and is now gated.** The argument against was that Phase 4 cannot know which seats will act, because the actions do not exist until Phase 5 has run. That is true and beside the point. Phase 4 does not need to know which seats *will* act — every seat still in the hand at the FVA either acts, even if only to fold, or is all-in from its post. That set is exactly `seat_number <= fva.seat_number`, which is already the set Phase 4 reads hole cards for, so the check needs nothing a later phase produces.
 
 It is `failed_permanent`, not a precondition: it runs after the LLM call and after the in-attempt retry, so a null here has already survived a second read of the same frame, and all three observed causes — frame-limited illegibility, four-colour suit confusion, and a chat-bubble overlay — are properties of that frame. Another attempt reads the same pixels.
 
-**The accepted cost is that a hand a different verification frame could have resolved is lost.** `mark-pending` is the way back for one that matters.
+**Narrowed again, and this is the second reversal on the same paragraph.** "Every seat still in the hand at the FVA either acts, even if only to fold" is true, and *acting only to fold is not a reason to lose the hand*. A seat whose first action after the FVA is a fold has mucked; its cards were never going to be part of the record. Two of the unnarrowed gate's seven hits were exactly that — `MPBLfM4mwfE_004_009` on CO and `MPBLfM4mwfE_005_003` on SB — and both hands still carried their whole story. The rule that replaces it is H5, under Shared definitions.
 
-A consequence worth stating because it removed code: `status_message` used to enumerate residual nulls on eligible seats, and that enumeration is now unreachable — it was computed over exactly the population P4-6 fails on. The general lesson survives the reversal: a check that seems to need a later phase's data may only need the *set* that phase will operate on, which an earlier phase often already knows.
+The split follows from where the information is. P4-6 keeps the FVA seat, whose chip commitment makes it live by construction. **P5-16** takes every other seat, because H5's question — did this seat *stay in* — is answerable only from step D's actions. The original argument's mistake was treating "the set of seats that will act" as the thing Phase 4 needed, when the rule actually needs to distinguish *how* each of them acted.
+
+**The accepted cost is that a hand a different verification frame could have resolved is lost.** `mark-pending` is the way back for one that matters — and after the split it is `--stage hand_starts` in both cases, since P5-16's null belongs to Phase 4's frame and no Phase 5 retry can re-read it.
+
+A consequence worth stating because it removed code: `status_message` used to enumerate residual nulls on eligible seats, and that enumeration is now unreachable — it was computed over the population the unnarrowed P4-6 failed on. It does not come back under the narrowing: a non-FVA null now rides in `hand_start_state` for P5-16 to judge rather than being described in free text. The general lesson survives both reversals: a check that seems to need a later phase's data may only need the *set* that phase will operate on — but check whether the rule needs the *contents* of that set too, because this one did.
 
 ### Observed extraction errors
 
@@ -1392,7 +1438,7 @@ The counterexample is `MPBLfM4mwfE_008_004`, whose pre-rebuild record put the BT
 
 **Hole-card errors are suit errors.** Two were found by spot-check across the original run's 60 hands: `MPBLfM4mwfE_002_002_001` recorded `AsJc` for an actual `AcJc`, and `MPBLfM4mwfE_009_004_001` recorded `Ah7s` for `Ad7s`. Rank was correct both times, and the seats' screen positions differed, so location is not the cause. Both are the four-colour-deck confusions `extract_hole_cards.md` explicitly warns about — clubs/spades and diamonds/hearts.
 
-Both ids are historical to the original run and have been through two re-detections since; re-derive by timestamp before treating either as a reproduction target. See "Corpus state." Four-colour confusion remains a live cause — it is one of the three behind a null on a seat that acted; see "Null hole cards on a seat that acted."
+Both ids are historical to the original run and have been through two re-detections since; re-derive by timestamp before treating either as a reproduction target. See "Corpus state." Four-colour confusion remains a live cause — it is one of the three behind a null on a seat that stayed in; see "Null hole cards on a seat that stayed in."
 
 Consequence depends entirely on the hand. `_002_002_001` ended preflop, so the wrong suit never collides with anything and the record stays useful. `_009_004_001`'s `Ah` also appears on the flop, correctly recorded — an impossible duplicate, and the hand is unusable.
 
@@ -1535,6 +1581,9 @@ Referenced by the extraction phases and by the DBT layer. Both must point at one
 text: a rule restated in two places drifts, and these are rules where a small
 difference in wording changes which hands survive.
 
+The ids are allocation ids, like the gate numbers: they are not a topic ordering
+and are never reused, so a gap is deliberate.
+
 ### D1 — the inert-street rule
 
 After the last action on the **preflop, flop or turn**, betting is *closed with
@@ -1662,6 +1711,47 @@ Displayed values are rounded — at t=584 an SB with 4.6 behind shoved a recorde
 that single observed discrepancy. Phase 6 must not reuse this constant, and the
 name says so.
 
+### H5 — when a missing hole card costs the hand
+
+A seat's null hole cards exclude the hand **only if that seat stayed in after
+the FVA**. It stayed in if any of these hold:
+
+1. It **checks, calls, bets or raises** at any point — any action that is not a
+   fold, `all_in` included.
+2. It **reaches showdown or wins** — it is still in the hand when the action
+   sequence ends.
+3. It is **all-in from its blind post** (`stack_size <= 0`), so it is in the
+   hand and cannot act at all.
+
+A seat whose first action after the FVA is a **fold** may have null hole cards,
+and so may a seat that folded before the FVA. Both have mucked; the FVA frame
+correctly shows them no cards, and their cards were never going to be part of
+the record.
+
+| Seat's actions after the FVA | Null cards |
+|---|---|
+| fold | allowed |
+| (none — folded before the FVA, seat number above the FVA's) | allowed |
+| check, then fold to a bet | excludes the hand |
+| call | excludes the hand |
+| (none — all-in from its blind post) | excludes the hand |
+| still in when the actions end | excludes the hand |
+
+Condition 2 subsumes winning and being all-in from a post, because neither can
+fold: **a seat is still in at the end exactly when it never folded.** The three
+conditions are kept separate anyway, because each names a distinct reason an
+operator reading a gate hit would expect to see.
+
+**Where it is enforced.** P4-6 applies it to the FVA seat, the one seat whose
+liveness is structural — it is defined by a chip commitment. P5-16 applies it to
+every other seat, which requires step D's actions. Both are `failed_permanent`:
+the null is a property of Phase 4's FVA frame, and `tt mark-pending --stage
+hand_starts` is the way back in both cases. **Phase 6 must apply the same rule**
+when it decides which hands reach the fact tables, and must not substitute "a
+seat that acted" — that reads a fold as a reason to lose the hand, which is
+where this rule started and is what it was narrowed to fix. See "Null hole cards
+on a seat that stayed in."
+
 ## Known follow-ups
 
 Not blocking any current phase, but accumulated as the project has grown.
@@ -1696,7 +1786,7 @@ Not blocking any current phase, but accumulated as the project has grown.
 ### Data and schema
 
 - **`_bq_param_type` narrowness** — `bq_param_type` handles `str`, `int`, and `dict`; REPEATED columns are handled separately via `ArrayQueryParameter` in `hand_starts_writer`. A `FLOAT64`, `BOOL`, or `BYTES` column would make this live. Note `bool` is a subclass of `int` and must be checked first if added.
-- **A null hole card on a seat that acted is an unbuilt DBT check** — a seat that acted must have held cards, so a null there is a read failure, at roughly 3% of hands against a ~25% raw null rate that is mostly legitimate. It cannot be a precondition: Phase 4 does not know which seats will act until Phase 5 has run. One comparison between `hand_action_state.streets[].actions[].seat_position_label` and the null hole cards in the nested `hand_start`, no join and no LLM. See "Null hole cards on a seat that acted" for the three observed causes, one of which — a chat-bubble overlay — no retry or prompt change can reach.
+- **Built: the null-hole-card check is now P4-6 plus P5-16**, not the unbuilt dbt check this item used to describe. Its reasoning was that the rule needed Phase 5's actions and so could not run at extraction time; it needed them for every seat but the FVA's, which is the split the two gates make. H5 is the rule. What remains for dbt is the backstop every promoted gate keeps, plus the three observed causes — one of which, a chat-bubble overlay, no retry or prompt change can reach. See "Null hole cards on a seat that stayed in."
 - **`status_message` truncation** — the 500-char limit can cut off ffmpeg or Gemini error detail before the useful tail. Either raise the limit or extract the tail.
 - **`status_message` description typo** in `schemas/clip_processing_attempts.json` ("reason.NULL" missing a space).
 - **Phase 3 re-detects an in-progress hand at the start of the next clip** — a hand a few seconds old still matches the hand-setup criteria, so Phase 3 writes a second `hand_setups` row for the same poker hand just after a clip boundary. The duplicate collapses the earlier row's Phase 4 LEAD window (down to one and five seconds in the two corpus instances, see "Retry caps") and adds a duplicate hand to the corpus — two of `MPBLfM4mwfE`'s original 65 `hand_setups` rows were such fragments, and one of the two survived re-detection into the rebuilt 63. The fix belongs in Phase 3 or Phase 2: suppress detections in the first few seconds of a clip, or deduplicate across clip boundaries. Deduplication cannot key on matching state, since the duplicate rows carry different stack snapshots a second apart; proximity in time across a clip boundary is the only usable signal. The failure mode is worse downstream than upstream — Phase 4 degrades visibly, as a failure, while a phase that needs the whole hand would see the fragment as a hand that ended early, a silent wrong answer rather than a loud one.

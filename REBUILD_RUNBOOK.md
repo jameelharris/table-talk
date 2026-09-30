@@ -124,6 +124,12 @@ Default models again, for the same reason.
 which did not exist before, so a higher skip count than the last run is expected
 rather than alarming. Run the per-gate report (below) to see which fired.
 
+**P4-6 now judges the FVA seat's hole cards only.** A null on any other seat
+completes here and is judged by P5-16 in step 5, so expect fewer P4-6 parks than
+the run that produced the current tables — and re-mark any hand parked by the
+unnarrowed gate before running this step, or it stays parked on a rule that no
+longer exists. See H5 in ARCHITECTURE.
+
 ---
 
 ## Step 5 — Phase 5, hand actions
@@ -143,6 +149,11 @@ Pro as well.
 `--max-attempts 4`, here and everywhere above: a mark is written as
 `failed_transient`, so it costs one retry slot and the default 3 would leave only
 two real attempts.
+
+**Check:** P5-16 is new and permanent — a null hole card on a seat that stayed in
+after the FVA. It is the first run in which it can fire at all (the gate it
+splits from suppressed its whole population), so its count is the measurement,
+not a regression signal. `--max-attempts` does not apply: it never retries.
 
 ---
 

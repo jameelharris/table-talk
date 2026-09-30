@@ -99,7 +99,8 @@ EXTRACTION_UNREAD = "unread"
 # order, not this file's execution order, and P5-11 (board card count) turned
 # out to be already implemented as _street_cards_unusable, so its number is
 # retired rather than recycled — reusing it would make the report ambiguous
-# between two different checks.
+# between two different checks. P5-16 is therefore the next number allocated,
+# not the second-to-last.
 GATE_ACTION_LABEL_UNRESOLVED = "P5-1: action_label_unresolved"
 GATE_WINNER_UNRESOLVED = "P5-2: winner_unresolved"
 GATE_ACTION_AFTER_HAND_END = "P5-3: action_after_hand_end"
@@ -113,6 +114,7 @@ GATE_UNKNOWN_STREET = "P5-15: unknown_street"
 GATE_DUPLICATE_BOARD_CARD = "P5-12: duplicate_board_card"
 GATE_STREET_TIMESTAMP_ORDER = "P5-13: street_timestamp_order"
 GATE_CONTESTED_STREET_UNREAD = "P5-14: contested_street_unread"
+GATE_MISSING_HOLE_CARDS_LIVE_SEAT = "P5-16: missing_hole_cards_live_seat"
 
 # betting_state reports structure; this maps its vocabulary onto the gates that
 # own each one, so the replay stays ignorant of status messages.
@@ -610,6 +612,62 @@ def check_step_d_output(
     return None
 
 
+def check_missing_hole_cards(
+    hand_setup_state: dict, fva: dict, streets: list[dict]
+) -> str | None:
+    """P5-16, H5. A seat other than the FVA's that stayed in after the FVA and
+    has no readable hole cards. Permanent.
+
+    H5's live-seat test needs the actions, which is why this cannot be a Phase 4
+    gate: P4-6 can only judge the FVA seat, whose commitment makes it live by
+    construction. Everything else waits for step D.
+
+    A seat stayed in if it took any action that was not a fold — check, call,
+    bet, raise or all-in — or if it was still in when the replay ran out of
+    actions. The second half is what covers a showdown, a win, and a blind that
+    is all-in from its post and so never gets to act at all; winners need no
+    separate test because P5-6 has already established that every winner is
+    still in at the end.
+
+    Permanent for a stronger reason than P4-6's. Nothing in Phase 5 reads a hole
+    card, so no retry of this phase can change the answer — the null is a
+    property of Phase 4's FVA frame. The way back is `tt mark-pending --stage
+    hand_starts`, which re-reads that frame.
+
+    Reads the players from the hand's own setup blob rather than a nested
+    snapshot, and replays the hand a second time rather than having
+    check_step_d_output hand its state out — the same trade inert_streets_for
+    makes, for the same reason: the replay is pure and costs microseconds, and
+    the gate stays a function that returns a reason or None.
+
+    Only meaningful once the step-D gates have passed. A hand whose replay hit a
+    violation has no trustworthy action sequence to judge liveness from, and the
+    winners P5-6 vouches for are what let this skip a winner test.
+    """
+    replay = replay_hand(hand_setup_state, fva, streets)
+    stayed_in = {
+        action.seat_label
+        for street in replay.streets
+        for action in street.actions
+        if action.action_type != "fold"
+    } | set(replay.seats_still_in_at_end)
+
+    fva_label = fva.get("seat_position_label")
+    missing = [
+        player.get("seat_position_label")
+        for player in hand_setup_state.get("players", [])
+        if player.get("seat_position_label") != fva_label
+        and player.get("seat_position_label") in stayed_in
+        and (not player.get("hole_cards") or any(c is None for c in player["hole_cards"]))
+    ]
+    if missing:
+        return (
+            f"{GATE_MISSING_HOLE_CARDS_LIVE_SEAT}: seat(s) that stayed in after the "
+            f"FVA with no readable hole cards — {', '.join(missing)}"
+        )
+    return None
+
+
 def _write_attempt(
     hand_start_id: str,
     status: str,
@@ -907,6 +965,25 @@ async def process_hand_start(
                 project_id=project_id, dataset=dataset,
             )
             return status
+
+        # P5-16. Phase 4 gates only the FVA seat's own hole cards; every other
+        # seat's null is a defect only if that seat stayed in after the FVA,
+        # which is not knowable until D has returned the actions. Permanent:
+        # nothing in Phase 5 reads a hole card, so no retry here can change the
+        # answer — the null belongs to Phase 4's frame, and mark-pending on
+        # --stage hand_starts is the way back. Runs after the step-D gates so
+        # the action sequence it judges liveness from has been vouched for.
+        missing_cards_reason = check_missing_hole_cards(
+            hs.hand_start_state["hand_setup"],
+            hs.hand_start_state["fva"],
+            d_result.get("streets") or [],
+        )
+        if missing_cards_reason is not None:
+            _write_attempt(
+                hs.hand_start_id, "failed_permanent", missing_cards_reason,
+                project_id=project_id, dataset=dataset,
+            )
+            return "failed_permanent"
 
         # Safe to derive only now: the gates above have established that the
         # replay walked the whole sequence without contradiction.

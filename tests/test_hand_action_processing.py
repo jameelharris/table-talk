@@ -22,6 +22,7 @@ from table_talk.hand_action_processing import (
     _street_cards_unusable,
     _street_timestamp_guard,
     _transient_status,
+    check_missing_hole_cards,
     check_preconditions,
     check_step_d_output,
     process_hand_start,
@@ -2267,3 +2268,145 @@ def test_p5_12_a_duplicate_exhausts_the_read_attempts_and_fails_transient():
     assert outcome == "failed_transient"
     assert mocks.frame.call_count == CARD_READ_ATTEMPTS
     assert "P5-12: duplicate_board_card: " in _attempt_row(mocks).status_message
+
+
+# ---------------------------------------------------------------------------
+# P5-16 — missing hole cards on a seat that stayed in (H5)
+# ---------------------------------------------------------------------------
+
+_P5_16_CARDS = {"BB": ["Ah", "Kd"], "SB": ["Qs", "Jh"], "BTN": ["2c", "3c"]}
+
+
+def _cards_setup(*unreadable, stacks=None):
+    """_GATE_SETUP with hole cards on every seat, null on the ones named."""
+    return {
+        **_GATE_SETUP,
+        "players": [
+            {
+                **player,
+                "stack_size": (stacks or {}).get(
+                    player["seat_position_label"], player["stack_size"]
+                ),
+                "hole_cards": (
+                    None
+                    if player["seat_position_label"] in unreadable
+                    else _P5_16_CARDS[player["seat_position_label"]]
+                ),
+            }
+            for player in _GATE_SETUP["players"]
+        ],
+    }
+
+
+def _missing(streets, *unreadable, fva=None, stacks=None):
+    return check_missing_hole_cards(
+        _cards_setup(*unreadable, stacks=stacks), fva or _GATE_FVA, streets
+    )
+
+
+def test_p5_16_a_fold_only_seat_may_have_null_cards():
+    """The whole point of the rule. SB's first and only action after the FVA is
+    a fold, so it mucked and the FVA frame correctly shows it no cards — the
+    hand still carries its whole story."""
+    assert _missing([_clean_preflop()], "SB") is None
+
+
+def test_p5_16_a_seat_that_calls_with_null_cards_fails():
+    """BB calls the FVA raise and is in for the rest of the hand."""
+    reason = _missing([_clean_preflop()], "BB")
+    assert reason.startswith("P5-16: missing_hole_cards_live_seat: ")
+    assert "BB" in reason
+
+
+def test_p5_16_a_seat_that_checks_with_null_cards_fails():
+    """A check commits no chips but keeps the seat's cards live, which is what
+    makes them a defect."""
+    streets = [
+        {"street_name": "preflop",
+         "actions": _acts(("BTN", "call", 1.0), ("SB", "fold", 0.0),
+                          ("BB", "check", 0.0))},
+        {"street_name": "flop",
+         "actions": _acts(("BB", "check", 0.0), ("BTN", "check", 0.0))},
+    ]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "call", "bet_amount": 1.0}
+    reason = _missing(streets, "BB", fva=fva)
+    assert reason.startswith("P5-16: missing_hole_cards_live_seat: ")
+    assert "BB" in reason
+
+
+def test_p5_16_a_seat_that_reaches_showdown_with_null_cards_fails():
+    """A called all-in runout: BB is still in when the actions run out, so its
+    cards are shown and read at the end."""
+    streets = [
+        {"street_name": "preflop",
+         "actions": _acts(("BTN", "all_in", 20.0), ("SB", "fold", 0.0),
+                          ("BB", "call", 20.0))},
+        {"street_name": "flop", "actions": []},
+        {"street_name": "turn", "actions": []},
+        {"street_name": "river", "actions": []},
+    ]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "all_in", "bet_amount": 20.0}
+    assert _missing(streets, "BB", fva=fva) is not None
+
+
+def test_p5_16_a_blind_all_in_from_its_post_with_null_cards_fails():
+    """It never acts at all — it cannot — but it is in the hand and its cards
+    are live, so a null there is a read failure like any other."""
+    streets = [
+        {"street_name": "preflop",
+         "actions": _acts(("BTN", "all_in", 20.0), ("SB", "fold", 0.0))},
+        {"street_name": "flop", "actions": []},
+        {"street_name": "turn", "actions": []},
+        {"street_name": "river", "actions": []},
+    ]
+    fva = {"seat_position_label": "BTN", "seat_number": 3,
+           "action_type": "all_in", "bet_amount": 20.0}
+    reason = _missing(streets, "BB", fva=fva, stacks={"BB": 0.0})
+    assert reason.startswith("P5-16: missing_hole_cards_live_seat: ")
+    assert "BB" in reason
+
+
+def test_p5_16_leaves_the_fva_seat_to_p4_6():
+    """One gate per seat. P4-6 already failed the hand permanently if the FVA's
+    own cards did not read, so a hand that reaches Phase 5 cannot have this —
+    and reporting it here would give the same defect two ids."""
+    assert _missing([_clean_preflop()], "BTN") is None
+
+
+def test_p5_16_a_pre_fva_fold_may_have_null_cards():
+    """A seat above the FVA in preflop acting order folded before the FVA frame
+    was taken, so its cards were never read and must not be demanded."""
+    fva = {"seat_position_label": "SB", "seat_number": 2,
+           "action_type": "raise", "bet_amount": 2.5}
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("SB", "raise", 2.5), ("BB", "call", 2.5))}]
+    assert _missing(streets, "BTN", fva=fva) is None
+
+
+def test_p5_16_a_hand_with_every_seat_readable_passes():
+    assert _missing([_clean_preflop()]) is None
+
+
+def test_p5_16_fails_permanent_after_step_d_and_before_step_e():
+    """At the orchestrator: one clip call spent, no frame read, no row."""
+    players = [
+        {"seat_number": 1, "seat_position_label": "BB", "stack_size": 100.0,
+         "hole_cards": [None, None]},
+        {"seat_number": 4, "seat_position_label": "CO", "stack_size": 80.0,
+         "hole_cards": ["2c", "3c"]},
+    ]
+    hs = _pending(hand_start_state=_hand_start_state(players=players))
+    with _patched([_d_result(street_names=("preflop", "flop"))]) as mocks:
+        outcome = _call(hs)
+
+    assert outcome == "failed_permanent"
+    mocks.write_actions.assert_not_called()
+    assert mocks.clip.call_count == 1
+    assert mocks.frame.call_count == 0
+
+    row = _attempt_row(mocks)
+    assert row.status == "failed_permanent"
+    assert row.status_message.startswith("P5-16: missing_hole_cards_live_seat: ")
+    assert "BB" in row.status_message
