@@ -40,9 +40,16 @@ def test_every_prompt_and_reference_is_covered():
     names = {p.name for p in _tracked_files()}
     assert "extract_player_actions.md" in names
     assert "flop_reference.jpeg" in names
-    # 9 prompts + 3 reference images at the time of writing; a new file must
+    # 9 prompts + 3 street references + 4 suit references; a new file must
     # arrive with a deliberate update here rather than silently unhashed.
-    assert len(names) == 12
+    #
+    # The four suit PNGs are measured-and-rejected candidates that no phase
+    # loads (see ARCHITECTURE, "Suit misreads are a resolution problem"). They
+    # are counted because they are on disk, which is what this assertion is for.
+    # They are committed rather than deleted because the harness needs them to
+    # reproduce the rejected arms. If they are ever removed, this goes back
+    # to 12 in the same change.
+    assert len(names) == 16
 
 
 def test_blob_hash_is_not_a_bare_sha1_of_the_content():
@@ -79,5 +86,26 @@ def test_select_raises_on_an_unknown_path():
 
 
 def test_build_provenance_shape():
-    block = build_provenance({"clip": "m1"}, {"prompts/x.md": "abc"})
-    assert block == {"models": {"clip": "m1"}, "prompts": {"prompts/x.md": "abc"}}
+    block = build_provenance(
+        {"clip": "m1"}, {"clip": "MEDIA_RESOLUTION_UNSPECIFIED"}, {"prompts/x.md": "abc"}
+    )
+    assert block == {
+        "models": {"clip": "m1"},
+        "media_resolution": {"clip": "MEDIA_RESOLUTION_UNSPECIFIED"},
+        "prompts": {"prompts/x.md": "abc"},
+    }
+
+
+def test_media_resolution_must_cover_the_same_call_modes_as_models():
+    """A row that records a model for a mode must record its resolution too.
+
+    The two are read together — "which rows were produced at ULTRA_HIGH" is only
+    answerable if every row naming a frame call also names its resolution. A
+    mismatch here means a phase added a call mode to one dict and not the other,
+    which would leave a silent hole in exactly the query this block exists for.
+    """
+    with pytest.raises(ValueError, match="same call modes"):
+        build_provenance({"clip": "m1", "frame": "m2"}, {"clip": "LOW"}, {})
+
+    with pytest.raises(ValueError, match="same call modes"):
+        build_provenance({"frame": "m2"}, {"clip": "LOW", "frame": "HIGH"}, {})

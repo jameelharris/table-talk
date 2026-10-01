@@ -10,7 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from table_talk.gemini_caller import GeminiPermanentError, GeminiTransientError
+from table_talk.gemini_caller import (
+    CLIP_MEDIA_RESOLUTION,
+    FRAME_RESOLUTION_ULTRA_HIGH,
+    GeminiPermanentError,
+    GeminiTransientError,
+)
 from table_talk.hand_action_processing import (
     CARD_READ_ATTEMPTS,
     MAX_WINDOW_SECONDS,
@@ -658,6 +663,24 @@ def test_short_flop_read_fails_hand():
 
     assert outcome == "failed_transient"
     assert "expected 3 new card(s), got 2" in _attempt_row(mocks).status_message
+
+
+def test_street_cards_are_read_at_ultra_high_resolution():
+    """Same resolution as Phase 4's step C, and for the same reason.
+
+    No board misread reproduced in the baseline, so this is prophylactic rather
+    than a measured repair here — but it is the same frame read of the same
+    four-colour deck, and a board error invalidates the hand for every player
+    rather than one seat.
+    """
+    clip_results = [_d_result(street_names=("preflop", "flop")), _scan(timestamp="02:00")]
+
+    with _patched(clip_results, [{"new_cards": ["5d", "8d", "As"]}]) as mocks:
+        outcome = _call(_pending())
+
+    assert outcome == "complete"
+    read_call = mocks.frame.call_args_list[0]
+    assert read_call.kwargs["frame_media_resolution"] == FRAME_RESOLUTION_ULTRA_HIGH
 
 
 def test_card_read_retries_then_succeeds():
@@ -1729,6 +1752,41 @@ def test_hand_reaching_the_flop_lists_step_e_prompts_and_references():
     }
     # The card read is a frame-mode call; the scan is clip-mode.
     assert set(provenance["models"]) == {"clip", "frame"}
+
+
+def test_provenance_records_media_resolution_per_call_mode():
+    """Step E's frame read is ULTRA_HIGH; the scans are clip-mode and unset.
+
+    Resolution changes what a read returns while leaving the model id and every
+    prompt hash untouched, so without this a corpus read at two resolutions is
+    indistinguishable in the data. Keys must match `models` exactly.
+    """
+    with _patched(
+        [_d_result(("preflop", "flop")), _scan()],
+        frame_results=[{"new_cards": ["Ah", "Kd", "2c"]}],
+    ) as mocks:
+        _call(_pending())
+
+    provenance = _provenance_from(mocks)
+    assert provenance["media_resolution"] == {
+        "clip": CLIP_MEDIA_RESOLUTION,
+        "frame": FRAME_RESOLUTION_ULTRA_HIGH,
+    }
+    assert set(provenance["media_resolution"]) == set(provenance["models"])
+
+
+def test_preflop_only_hand_records_no_frame_resolution():
+    """Step E never ran, so there is no frame call to describe.
+
+    Same rule as the step-E prompts and references: naming a call mode the row
+    did not use would make the record say something false about how it was made.
+    """
+    with _patched([_d_result(("preflop",))]) as mocks:
+        _call(_pending())
+
+    provenance = _provenance_from(mocks)
+    assert provenance["media_resolution"] == {"clip": CLIP_MEDIA_RESOLUTION}
+    assert set(provenance["media_resolution"]) == set(provenance["models"])
 
 
 def test_all_three_references_are_listed_even_for_a_flop_only_hand():

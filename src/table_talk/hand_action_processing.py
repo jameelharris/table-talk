@@ -36,8 +36,10 @@ from .card_normalization import normalize_cards
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
 from .gemini_caller import (
+    CLIP_MEDIA_RESOLUTION,
     CLIP_MODEL,
     FRAME_MODEL,
+    FRAME_RESOLUTION_ULTRA_HIGH,
     GeminiPermanentError,
     call_gemini_for_clip,
     call_gemini_for_frame,
@@ -753,6 +755,11 @@ async def _read_street_cards(
     filled_prompt = frame_prompt.replace(
         "{prior_cards}", build_prior_cards_context(prior_cards)
     )
+    # ULTRA_HIGH for the same reason as Phase 4's step C, and prophylactically:
+    # no board misread was reproduced in the baseline, but this is the same kind
+    # of frame read of the same four-colour deck, and a board error invalidates
+    # the hand for every player rather than one seat. See ARCHITECTURE, "Suit
+    # misreads are a resolution problem."
     reason = None
     for _ in range(CARD_READ_ATTEMPTS):
         result = await asyncio.to_thread(
@@ -761,6 +768,7 @@ async def _read_street_cards(
             frame_bytes,
             project_id,
             user_text="Identify the new community cards visible in this frame.",
+            frame_media_resolution=FRAME_RESOLUTION_ULTRA_HIGH,
             label=f"step_e_read_{street_name}",
         )
         new_cards = normalize_cards(result.get("new_cards") or [])
@@ -1077,6 +1085,7 @@ async def process_hand_start(
             step_e_ran = bool(resolved)
             prompt_files = ["prompts/extract_player_actions.md"]
             models = {"clip": CLIP_MODEL}
+            media_resolution = {"clip": CLIP_MEDIA_RESOLUTION}
             if step_e_ran:
                 prompt_files += [
                     "prompts/extract_community_cards.md",
@@ -1088,6 +1097,7 @@ async def process_hand_start(
                 ]
                 # The card reads are frame-mode calls; the scans are clip-mode.
                 models["frame"] = FRAME_MODEL
+                media_resolution["frame"] = FRAME_RESOLUTION_ULTRA_HIGH
 
             hand_action_state = {
                 "hand_start": hs.hand_start_state,
@@ -1095,6 +1105,7 @@ async def process_hand_start(
                 "winning_positions": winning_positions,
                 "provenance": build_provenance(
                     models=models,
+                    media_resolution=media_resolution,
                     prompts=select(prompt_hashes, *prompt_files),
                 ),
             }

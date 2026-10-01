@@ -21,6 +21,12 @@ Videos: `MPBLfM4mwfE`, `YzKyFMQ1avU`.
 
 ## Step 0 — Terraform
 
+**Four more descriptions changed since this runbook was written** — the JSON
+state column on `tournament_results`, `hand_setups`, `hand_starts` and
+`hand_actions` all now document `provenance.media_resolution`. Same shape as
+before: descriptions only, no column, type or mode changes, and codegen output
+byte-identical. Apply before Step 1.
+
 Six schema **descriptions** changed across this work: four for `provenance`
 (Commit 1) and two on `hand_actions` for `extraction_status` and
 `street_frame_gcs_paths` (Commit 5). No columns, types or modes changed, and
@@ -120,6 +126,25 @@ tt process-hand-setups --project $PROJECT --dataset $DATASET \
 
 Default models again, for the same reason.
 
+**The hole-card read now runs at `MEDIA_RESOLUTION_ULTRA_HIGH`**, which is the
+measured fix for spade-face-cards-read-as-hearts. It costs roughly +1,200 input
+tokens per frame read and changes no prompt, so `extract_hole_cards.md`'s hash is
+unchanged from the previous run. The provenance block now carries the resolution
+alongside the model, so rows from this run are still distinguishable from earlier
+ones:
+
+```sql
+SELECT JSON_VALUE(hand_start_state, '$.provenance.media_resolution.frame') AS res,
+       COUNT(*)
+FROM `table-talk-497020.table_talk_dev.hand_starts`
+GROUP BY res
+```
+
+Expect `MEDIA_RESOLUTION_ULTRA_HIGH` for every row after this run. Rows written
+before the field existed have no `media_resolution` key at all, which reads as
+NULL and is the correct answer for them. See ARCHITECTURE, "Suit misreads are a
+resolution problem."
+
 **Check:** the stats line. `complete_skipped` now includes P4-1, P4-2 and P4-3,
 which did not exist before, so a higher skip count than the last run is expected
 rather than alarming. Run the per-gate report (below) to see which fired.
@@ -140,6 +165,9 @@ TT_CLIP_MODEL=gemini-2.5-pro tt process-hand-starts \
   --videos-bucket $VIDEOS --hand-actions-bucket $ACTIONS \
   --video-id <VIDEO> --max-attempts 4
 ```
+
+Step E's community-card read also runs at `MEDIA_RESOLUTION_ULTRA_HIGH` now. No
+board misread was ever reproduced, so this one is prophylactic.
 
 **`TT_CLIP_MODEL` is written inline on this command, never exported.** It is
 read once at import, so its scope is whichever command carries it. Exported for

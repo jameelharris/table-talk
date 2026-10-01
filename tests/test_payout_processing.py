@@ -9,7 +9,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from table_talk.gemini_caller import GeminiPermanentError, GeminiTransientError
+from table_talk.gemini_caller import (
+    FRAME_MEDIA_RESOLUTION,
+    GeminiPermanentError,
+    GeminiTransientError,
+)
 from table_talk.payout_processing import (
     FRAME_FALLBACK_LADDER,
     MIN_LADDER_RANKS,
@@ -1159,6 +1163,18 @@ def test_provenance_records_the_frame_model_and_the_results_prompt():
     provenance = _written_row(mocks).tournament_results_state["provenance"]
     assert provenance["models"] == {"frame": FRAME_MODEL}
     assert provenance["prompts"] == _HASHES
+    # Resolution is recorded in every phase so the block has one shape, even
+    # where it has not changed. No clip key: this phase makes no clip call, and
+    # a mode a row never used must not appear.
+    assert provenance["media_resolution"] == {"frame": FRAME_MEDIA_RESOLUTION}
+
+    # What was SENT, not just what was recorded. No override means the panel
+    # read inherits call_gemini_for_frame's request-level default, which is what
+    # the block above claims. Without this, adding ULTRA_HIGH here and leaving
+    # the provenance dict alone would make every row say HIGH while reading at
+    # ULTRA_HIGH — provenance lying, with a green suite. Only the two card reads
+    # override; see ARCHITECTURE, "Suit misreads are a resolution problem."
+    assert mocks.frame.call_args.kwargs.get("frame_media_resolution") is None
 
 
 # ---------------------------------------------------------------------------

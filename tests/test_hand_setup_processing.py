@@ -550,7 +550,10 @@ def _run_one_clip_and_capture_provenance(bounty_type):
         patch("table_talk.hand_setup_processing.download_video"),
         patch("table_talk.hand_setup_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_ONE_SETUP),
         patch("table_talk.hand_setup_processing.extract_frame", side_effect=_fake_extract_frame),
-        patch("table_talk.hand_setup_processing.call_gemini_for_frame", return_value=_PLAYER_INFO),
+        patch(
+            "table_talk.hand_setup_processing.call_gemini_for_frame",
+            return_value=_PLAYER_INFO,
+        ) as mock_frame,
         patch("table_talk.hand_setup_processing.upload_frame"),
         patch("table_talk.hand_setup_processing.write_hand_setups") as mock_write,
         patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row"),
@@ -559,20 +562,51 @@ def _run_one_clip_and_capture_provenance(bounty_type):
             "proj", "ds", "vb", "hb", "BASE PROMPT", "BASE PROMPT", "BOUNTY ADDENDUM",
             _P3_HASHES,
         ))
-    return mock_write.call_args[0][0][0].hand_setup_state["provenance"]
+    return mock_write.call_args[0][0][0].hand_setup_state["provenance"], mock_frame
+
+
+def _provenance_only(bounty_type):
+    return _run_one_clip_and_capture_provenance(bounty_type)[0]
+
+
+def test_provenance_records_media_resolution_for_both_call_modes():
+    """Unchanged by the card-read work, recorded so the block is one shape.
+
+    This phase's frame call keeps the caller's default. Recording it anyway
+    means a future change here shows up in the data instead of being silent, the
+    way the card reads' move to ULTRA_HIGH originally was.
+    """
+    from table_talk.gemini_caller import CLIP_MEDIA_RESOLUTION, FRAME_MEDIA_RESOLUTION
+
+    provenance, mock_frame = _run_one_clip_and_capture_provenance("none")
+
+    assert provenance["media_resolution"] == {
+        "clip": CLIP_MEDIA_RESOLUTION,
+        "frame": FRAME_MEDIA_RESOLUTION,
+    }
+    assert set(provenance["media_resolution"]) == set(provenance["models"])
+
+    # What was SENT, not just what was recorded. Passing no override means this
+    # read inherits call_gemini_for_frame's request-level default, which is what
+    # the block above claims. Without this, adding ULTRA_HIGH to this call site
+    # and leaving the provenance dict alone would make every row say HIGH while
+    # reading at ULTRA_HIGH — provenance lying, with a green suite. The card
+    # reads are the only sites that override; see ARCHITECTURE, "Suit misreads
+    # are a resolution problem."
+    assert mock_frame.call_args.kwargs.get("frame_media_resolution") is None
 
 
 def test_provenance_lists_the_bounty_addendum_only_on_a_progressive_video():
     """The addendum contributes to the row only when it was concatenated. The
     branch here must mirror _player_info_prompt's, and nothing else checks it."""
-    progressive = _run_one_clip_and_capture_provenance("progressive")
+    progressive = _provenance_only("progressive")
     assert set(progressive["prompts"]) == {
         "prompts/identify_hand.md",
         "prompts/extract_player_info.md",
         "prompts/extract_player_info_bounty_addendum.md",
     }
 
-    non_bounty = _run_one_clip_and_capture_provenance("none")
+    non_bounty = _provenance_only("none")
     assert set(non_bounty["prompts"]) == {
         "prompts/identify_hand.md",
         "prompts/extract_player_info.md",
@@ -584,7 +618,7 @@ def test_provenance_records_both_call_modes():
     the two can be served by different models."""
     from table_talk.gemini_caller import CLIP_MODEL, FRAME_MODEL
 
-    provenance = _run_one_clip_and_capture_provenance("none")
+    provenance = _provenance_only("none")
     assert provenance["models"] == {"clip": CLIP_MODEL, "frame": FRAME_MODEL}
     key = "prompts/identify_hand.md"
     assert provenance["prompts"][key] == _P3_HASHES[key]

@@ -35,7 +35,12 @@ from ._generated.tournament_results_processing_attempts_row import (
 from ._generated.tournament_results_row import TournamentResultsRow
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
-from .gemini_caller import FRAME_MODEL, GeminiPermanentError, call_gemini_for_frame
+from .gemini_caller import (
+    FRAME_MEDIA_RESOLUTION,
+    FRAME_MODEL,
+    GeminiPermanentError,
+    call_gemini_for_frame,
+)
 from .provenance import build_provenance, select
 from .tournament_results_processing_attempts_writer import (
     write_tournament_results_processing_attempt_row,
@@ -483,6 +488,10 @@ async def process_video(
                     # no upstream blob to nest.
                     "provenance": build_provenance(
                         models={"frame": FRAME_MODEL},
+                        # No clip key: this phase makes no clip call, and a mode
+                        # a row never used must not appear. Unchanged by the
+                        # card-read work; recorded for shape consistency.
+                        media_resolution={"frame": FRAME_MEDIA_RESOLUTION},
                         prompts=select(prompt_hashes, "prompts/extract_results.md"),
                     ),
                 },

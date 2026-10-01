@@ -9,7 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from table_talk.gemini_caller import GeminiPermanentError, GeminiTransientError
+from table_talk.gemini_caller import (
+    CLIP_MEDIA_RESOLUTION,
+    FRAME_RESOLUTION_ULTRA_HIGH,
+    GeminiPermanentError,
+    GeminiTransientError,
+)
 from table_talk.hand_start_processing import (
     PendingHandSetup,
     _find_pending_hand_setups,
@@ -425,6 +430,55 @@ def _three_seat_hs():
         consecutive_failures=0,
         bounty_type="none",
     )
+
+
+def test_step_c_reads_the_fva_frame_at_ultra_high_resolution():
+    """Both step C calls, the first read and the gap-fill retry.
+
+    Suit misreads on face cards are a resolution problem, not a prompt problem:
+    measured over the four known misreads, the baseline missed 4 of 160 cards
+    and a prompt instruction moved nothing, while ULTRA_HIGH read 0 of 640. Set
+    per call site, so Phase 3's player info and the payout panel read are
+    unaffected. Reverting this silently restores the misreads.
+    """
+    hs = _three_seat_hs()
+    first_response = {
+        "players": [
+            {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+            {"seat_position_label": "BTN", "hole_cards": ["2c", "3c"]},
+            # SB omitted -> null on the first call, so the retry fires too.
+        ]
+    }
+    second_response = {
+        "players": [{"seat_position_label": "SB", "hole_cards": ["Th", "9h"]}]
+    }
+    with (
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_clip",
+            return_value=_CLIP_RESULT_FOUND,
+        ),
+        patch(
+            "table_talk.hand_start_processing.extract_frame",
+            side_effect=_fake_extract_frame,
+        ),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_frame",
+            side_effect=[first_response, second_response],
+        ) as mock_gemini_frame,
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts"),
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row"),
+    ):
+        _run(process_hand_setup(
+            hs, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+        ))
+
+    assert mock_gemini_frame.call_count == 2
+    for call_args in mock_gemini_frame.call_args_list:
+        assert call_args.kwargs["frame_media_resolution"] == FRAME_RESOLUTION_ULTRA_HIGH
 
 
 def test_process_hand_setup_retry_fills_eligible_null():
@@ -1655,6 +1709,53 @@ def test_provenance_is_a_sibling_and_lists_both_prompts():
         "prompts/identify_hand_start.md",
         "prompts/extract_hole_cards.md",
     }
+
+
+def test_provenance_records_the_step_c_read_resolution():
+    """Step C reads at ULTRA_HIGH, and the row has to say so.
+
+    The change to ULTRA_HIGH altered extraction behaviour without touching the
+    model id or either prompt hash, so rows either side of it were previously
+    byte-identical in provenance. This is what tells them apart.
+    """
+    hs = _three_seat_hs()
+    frame_result = {
+        "players": [
+            {"seat_position_label": "BB", "hole_cards": ["Ah", "Kd"]},
+            {"seat_position_label": "SB", "hole_cards": ["Th", "9h"]},
+            {"seat_position_label": "BTN", "hole_cards": ["2c", "3c"]},
+        ]
+    }
+    with (
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_clip",
+            return_value=_CLIP_RESULT_FOUND,
+        ),
+        patch(
+            "table_talk.hand_start_processing.extract_frame",
+            side_effect=_fake_extract_frame,
+        ),
+        patch(
+            "table_talk.hand_start_processing.call_gemini_for_frame",
+            return_value=frame_result,
+        ),
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row"),
+    ):
+        _run(process_hand_setup(
+            hs, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+        ))
+
+    provenance = mock_write_starts.call_args[0][0][0].hand_start_state["provenance"]
+    assert provenance["media_resolution"] == {
+        "clip": CLIP_MEDIA_RESOLUTION,
+        "frame": FRAME_RESOLUTION_ULTRA_HIGH,
+    }
+    assert set(provenance["media_resolution"]) == set(provenance["models"])
 
 
 def test_phase_3_provenance_rides_through_the_nested_hand_setup():

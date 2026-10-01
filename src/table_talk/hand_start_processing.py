@@ -25,8 +25,10 @@ from .card_normalization import normalize_cards
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
 from .gemini_caller import (
+    CLIP_MEDIA_RESOLUTION,
     CLIP_MODEL,
     FRAME_MODEL,
+    FRAME_RESOLUTION_ULTRA_HIGH,
     GeminiPermanentError,
     call_gemini_for_clip,
     call_gemini_for_frame,
@@ -495,6 +497,13 @@ async def process_hand_setup(
             # row records both layers without this phase assembling anything.
             "provenance": build_provenance(
                 models={"clip": CLIP_MODEL, "frame": FRAME_MODEL},
+                # The frame call is step C, which overrides the caller's default
+                # per part. Recorded because resolution changes what a read
+                # returns and is invisible in the model id and the prompt hash.
+                media_resolution={
+                    "clip": CLIP_MEDIA_RESOLUTION,
+                    "frame": FRAME_RESOLUTION_ULTRA_HIGH,
+                },
                 prompts=select(
                     prompt_hashes,
                     "prompts/identify_hand_start.md",
@@ -535,12 +544,23 @@ async def process_hand_setup(
                     extract_hole_cards_prompt
                     .replace("{hole_card_context}", build_hole_card_context(hand_start_state))
                 )
+                # ULTRA_HIGH is the measured fix for suit misreads on face
+                # cards, where the corner pip is small and the artwork is red on
+                # every suit. Measured over the four known misreads: the
+                # baseline missed 4 of 160 cards and prompt wording moved
+                # nothing (3 of 160), while this read 0 of 640 across 20 reps.
+                # It costs roughly +1,200 input tokens per read, so it is set
+                # per call site rather than on the caller — Phase 3's player
+                # info and the payout panel read keep HIGH, where no benefit has
+                # been measured. See ARCHITECTURE, "Suit misreads are a
+                # resolution problem."
                 hole_cards_result = await asyncio.to_thread(
                     call_gemini_for_frame,
                     filled_hole_cards_prompt,
                     frame_bytes,
                     project_id,
                     user_text="Extract hole cards for all eligible players from this frame.",
+                    frame_media_resolution=FRAME_RESOLUTION_ULTRA_HIGH,
                 )
                 return fva_frame_local_path, filled_hole_cards_prompt, frame_bytes, hole_cards_result
 
@@ -576,6 +596,7 @@ async def process_hand_setup(
                     frame_bytes,
                     project_id,
                     user_text="Extract hole cards for all eligible players from this frame.",
+                    frame_media_resolution=FRAME_RESOLUTION_ULTRA_HIGH,
                 )
                 retry_by_label = {
                     p.get("seat_position_label"): p for p in retry_hole_cards_result.get("players", [])

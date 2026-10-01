@@ -11,9 +11,10 @@ from google.genai import errors as genai_errors
 from google.genai import types
 
 from table_talk.gemini_caller import (
+    _RETRY_MAX_ATTEMPTS,
+    FRAME_RESOLUTION_ULTRA_HIGH,
     GeminiPermanentError,
     GeminiTransientError,
-    _RETRY_MAX_ATTEMPTS,
     _classify_genai_error,
     _genai_status_code,
     _is_rate_limited,
@@ -115,6 +116,96 @@ def test_frame_request_structure():
     assert contents.parts[1].text == USER_TEXT
 
     assert kw["config"].media_resolution == types.MediaResolution.MEDIA_RESOLUTION_HIGH
+
+    # Omitting both new arguments must reproduce the original two-part request:
+    # one blob carrying no per-part resolution, then the user turn.
+    assert len(contents.parts) == 2
+    assert contents.parts[0].media_resolution is None
+
+
+def test_frame_per_part_resolution_reaches_the_blob():
+    """ULTRA_HIGH is only reachable per part, never through the request config.
+
+    config.media_resolution is a MediaResolution, which stops at HIGH; the blob
+    carries a PartMediaResolution, whose level enum adds ULTRA_HIGH. Setting one
+    does not set the other, so the request-level HIGH stays put and this asserts
+    both halves.
+    """
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        call_gemini_for_frame(
+            prompt=PROMPT,
+            frame_bytes=FRAME_BYTES,
+            project_id=PROJECT,
+            user_text=USER_TEXT,
+            frame_media_resolution=FRAME_RESOLUTION_ULTRA_HIGH,
+        )
+
+    kw = mock_client_inst.models.generate_content.call_args.kwargs
+    level = kw["contents"].parts[0].media_resolution.level
+    assert level == types.PartMediaResolutionLevel.MEDIA_RESOLUTION_ULTRA_HIGH
+    assert kw["config"].media_resolution == types.MediaResolution.MEDIA_RESOLUTION_HIGH
+
+
+def test_frame_with_reference_images_labels_each_blob_and_keeps_text_last():
+    """Same part shape as the clip caller, for the same reason.
+
+    The card-reading prompts describe the references by name, so each blob is
+    preceded by a text part naming it rather than left to be identified by
+    arrival order. References are pinned LOW: they illustrate a shape, and the
+    frame is the only part that needs resolution spent on it.
+    """
+    images = [
+        (b"\x01spade", "image/png", "spades"),
+        (b"\x02heart", "image/png", "hearts"),
+    ]
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        call_gemini_for_frame(
+            prompt=PROMPT,
+            frame_bytes=FRAME_BYTES,
+            project_id=PROJECT,
+            user_text=USER_TEXT,
+            reference_images=images,
+        )
+
+    contents = mock_client_inst.models.generate_content.call_args.kwargs["contents"]
+    # frame + (label, blob) x 2 + user turn
+    assert len(contents.parts) == 6
+    assert contents.parts[0].inline_data.data == FRAME_BYTES
+
+    for i, (expected_bytes, expected_mime, expected_label) in enumerate(images):
+        label_part = contents.parts[1 + i * 2]
+        blob_part = contents.parts[2 + i * 2]
+        assert label_part.text == f"Reference image — {expected_label}:"
+        assert label_part.inline_data is None
+        assert blob_part.inline_data.data == expected_bytes
+        assert blob_part.inline_data.mime_type == expected_mime
+        assert blob_part.text is None
+        assert (
+            blob_part.media_resolution.level
+            == types.PartMediaResolutionLevel.MEDIA_RESOLUTION_LOW
+        )
+
+    assert contents.parts[5].text == USER_TEXT
+
+
+def test_frame_without_reference_images_sends_two_parts():
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        call_gemini_for_frame(
+            prompt=PROMPT,
+            frame_bytes=FRAME_BYTES,
+            project_id=PROJECT,
+            user_text=USER_TEXT,
+            reference_images=[],
+        )
+
+    contents = mock_client_inst.models.generate_content.call_args.kwargs["contents"]
+    assert len(contents.parts) == 2
 
 
 def test_clip_user_text_override():

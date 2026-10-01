@@ -590,7 +590,7 @@ All three write zero `hand_starts` rows. The `complete_uncontested` branch calls
 Established by exhaustive validation over `MPBLfM4mwfE`: first across the 65 hands of the original run, then re-established across the 63 of the rebuild. Both are historical — the video has been re-detected again and now holds 57 `hand_setups` and 54 `hand_starts` (see "Corpus state"), against which this exhaustive validation has not been repeated. The guarantees below are properties of the phase and still hold; the counts and ids are properties of those two runs. The rebuild's outcome is 58 `complete` with rows, 2 `complete_uncontested` (`_010_002`, `_013_001`), 2 `complete_skipped` (`_005_005` on SB and `_009_005` on CO, both null stack), and 1 `failed_transient` (`_008_004`) — 63 hand setups in, 58 `hand_starts` rows out. The single failure is a clip-boundary fragment and is not unexplained; see "Retry caps", which also records why its twin from the original run, `_004_008`, completed this time. Both row counts are properties of a *run*, not of the video — see "Detection is not deterministic." Downstream phases must treat all of the following as **normal input**, not defects:
 
 - **Eligible-seat hole cards may be `null`** in a `complete` record, on any seat but the FVA's — that one is P4-6's, and a null there is `failed_permanent` with no row at all. This is the narrowed gate's deliberate consequence, and it makes the guarantee below load-bearing for Phase 5 rather than merely advisory: the row exists, the null is in it, and P5-16 is what decides whether it costs the hand. The historical rates (4 of 65 in the original run, 2 of 58 in the rebuild — `_004_008` on CO and `_005_001` on BTN, both enumerated in `status_message`) predate both gates. Read them as a range, not a trend: the rate moved across a re-detection with no prompt change between the runs. Most were on folded players and inconsequential. One was on a live player and is **frame-limited** — a six-time reproduction against the stored frame returned null every time while the adjacent seat read correctly, so the card is genuinely not legible at the FVA moment. More retries would not recover it.
-- **Non-null hole cards may be wrong.** One hand returned `4d4s` for a seat holding `9s7d` — a hallucination, not a null. It landed on a folded seat, but the failure mode is real. `status_message` enumerates residual nulls and has **no signal** for wrong-but-non-null cards, so neither Phase 5 nor DBT can use status to filter bad data. The only mitigation would be consensus reads, which the pipeline does not do.
+- **Non-null hole cards may be wrong, and suit is where they go wrong.** Reduced, not eliminated: the card reads now run at `MEDIA_RESOLUTION_ULTRA_HIGH`, which took the reproduction of the four known suit misreads to zero over 640 cards, but nearly all that signal came from one card on one frame and nothing in the pipeline detects a wrong-but-non-null card either way. A silent suit error remains possible on any row. See "Suit misreads are a resolution problem." One hand returned `4d4s` for a seat holding `9s7d` — a hallucination, not a null. It landed on a folded seat, but the failure mode is real. `status_message` enumerates residual nulls and has **no signal** for wrong-but-non-null cards, so neither Phase 5 nor DBT can use status to filter bad data. The only mitigation would be consensus reads, which the pipeline does not do.
 - **`complete` does not guarantee complete hole-card data.** Inspect `hand_start_state` for nulls on players who acted; do not rely on status. `status_message` no longer enumerates them at all, and under the narrowed P4-6 it never will — a `complete` row may carry a null on any non-FVA seat. That population is quantified — roughly 3% of hands, against a ~25% raw null rate that is mostly legitimate — under "Null hole cards on a seat that stayed in."
 - **`fva.action_type ∈ {call, raise, all_in}`.** No `limp` — it is derivable as `call` with `bet_amount == 1.0` preflop. `fold` and `check` are unreachable because the FVA is defined by chip commitment.
 
@@ -601,6 +601,150 @@ Whether a null or wrong card makes a hand unusable can only be judged against th
 Step C sometimes returns null for a legible card. A single retry reuses the identical frame and prompt, fills gaps only, and never overwrites a non-null first answer. A narrower single-seat retry prompt was tried and rejected — it returned another player's cards mislabeled onto the retried seat.
 
 The retry was built before the step-C stack-anchor prompt fix, which largely cured the null-hedging it was catching. It now fires rarely. If a future exhaustive run shows it effectively never fires, reconsider whether it earns its complexity.
+
+### Suit misreads are a resolution problem
+
+Both card reads — Phase 4's step C and Phase 5's step E frame read — send the
+frame at **`MEDIA_RESOLUTION_ULTRA_HIGH`**, set per call site rather than on the
+caller. This is the measured fix for the suit misreads recorded under "Observed
+extraction errors."
+
+**The finding.** Comparing the rebuilt Phase 4 against `hand_starts_pre_rebuild`,
+all 128 matched hands agreed on every FVA and every card *rank*. Four hole-card
+*suit* disagreements remained, all on `YzKyFMQ1avU`, all a spade face card read
+as a heart — and the disagreement ran in **both directions**, the rebuilt run
+wrong on three and the pre-rebuild run wrong on the fourth. The same frame read
+correctly in one run and wrong in the other, so the cause is a marginal signal,
+not a prompt defect.
+
+Looking at the frames explains it. The deck is four-colour, and **face-card
+artwork is heavily red in every suit** — a K♠'s centre panel is red and black,
+and a Q♠ reads as a red card at a glance. The corner pip is the only unambiguous
+evidence of suit, and it is small.
+
+**The measurement.** Six arms over twelve frames — the four known misreads, four
+hole-card controls where the two runs agree on every seat, four board controls
+eye-checked against the extracted frame — covering all four suits, face and
+non-face, both videos. Frames are re-extracted from the source video through
+`frame_extractor`, so what is measured is the pixels production reads.
+
+| arm | prompt instruction | ULTRA_HIGH | suit references | misreads | avg input tokens |
+|---|---|---|---|---:|---:|
+| A (baseline) | — | — | — | 4 / 160 | 1,997 |
+| B | ✓ | — | — | 3 / 160 | 2,090 |
+| C | ✓ | ✓ | — | **0 / 640** | 3,302 |
+| D | ✓ | ✓ | ✓ | **0 / 640** | 4,465 |
+| E | ✓ | — | ✓ | 6 / 160 | 3,253 |
+| **F (shipped)** | — | ✓ | — | **0 / 640** | 3,209 |
+
+Denominators differ deliberately: all six ran 5 reps over all twelve frames, then
+C, D and F ran 20 further reps over the four known misreads, which is where every
+error in the study occurred. **Null rate was 0 in every arm across 2,600 scored
+cards**, and controls were clean everywhere.
+
+**Resolution is the whole effect.** A prompt instruction to read the suit from
+the pip directly under the rank — the hypothesis the investigation began with —
+moved 4 misreads to 3, which is noise. Adding suit reference images made it
+*worse*, at 6. Every arm carrying ULTRA_HIGH went to zero and stayed there. F
+ships because it is the cheapest arm that works and the only one that changes no
+prompt: no new code-to-prompt contract, nothing to keep in sync between a prompt
+and a loader, and no null-hedging clause to regress on.
+
+**Three limits on what this establishes.**
+
+- **Nearly all the signal is one card.** Every misread in the study — 13 across
+  all arms — is on the frame at `YzKyFMQ1avU` t=1716, and 10 of 13 are one card,
+  the BTN's Q♠. The other three known-misread frames read correctly in all 25
+  reps of all five arms. "0 of 640" means that card was read right 20 times in a
+  row, not that a broad population was swept clean.
+- **That frame also fails the other documented way.** The HJ's Q♦ was read as Q♠
+  four times (twice in A, twice in E) — diamond-to-spade, blue-to-black. The
+  frame is marginal in both four-colour confusion pairs, not just one.
+- **The board half is precautionary, not a fix for an observed error.** State
+  that plainly: no board misread was ever reproduced. All three ULTRA_HIGH arms
+  read the board controls 0 wrong in 50 cards, and so did the baseline. Step E's
+  ULTRA_HIGH repairs nothing demonstrated.
+
+  It is set anyway, on three grounds. It is the **same frame read of the same
+  four-colour deck** as step C, which did demonstrably fail — the board controls
+  simply never landed on a marginal card the way `YzKyFMQ1avU` t=1716 did, and
+  absence of a reproduction over 50 cards is not evidence of immunity. A board
+  error is **categorically worse**: the board is shared, so one wrong card
+  invalidates the hand for every player, where a hole-card error costs one seat.
+  And the decision is **not cheaply reversible in the other direction** — adding
+  it later, after Phase 5 has run, means re-running Phase 5, whose clip calls are
+  on Pro. Setting it now costs Flash frame tokens; setting it later costs a Pro
+  rebuild of the corpus.
+
+  So the asymmetry decides it, not the evidence. If the token cost is ever
+  reviewed, this is the half with nothing measured behind it, and the review
+  should start by reproducing board reads against frames chosen for marginal
+  face cards rather than against these four.
+
+**Cost.** Roughly **+1,200 input tokens per frame read**, on every card read
+corpus-wide and forever. That is why it is a per-call-site argument and not a
+default on `call_gemini_for_frame`: Phase 3's per-hand player-info read and the
+payout panel read keep `MEDIA_RESOLUTION_HIGH`, where no benefit has been
+measured and the volume is highest.
+
+**ULTRA_HIGH is reachable only per part.** `GenerateContentConfig.media_resolution`
+is a `MediaResolution`, whose enum stops at HIGH; only the per-`Part`
+`PartMediaResolutionLevel` carries `MEDIA_RESOLUTION_ULTRA_HIGH`. Setting one
+does not set the other, and `PartMediaResolutionLevel` *warns rather than raises*
+on an unknown value — so the level is named by the `FRAME_RESOLUTION_ULTRA_HIGH`
+constant and never written as a bare string, or a typo would degrade every read
+silently.
+
+**The four suit reference PNGs in `references/` are committed as harness assets,
+not production inputs.** They were added as candidates, measured as arm E, and
+rejected — they made misreads worse, at 6 of 160 against a baseline 4, and cost
+~1,160 input tokens per call, not the ~256 a LOW-resolution thumbnail budget
+suggests.
+
+They are kept, and tracked, because `scripts/repro_card_read.py` needs them to
+reproduce arms D and E; a rejected option that cannot be re-measured is a
+finding that has to be taken on trust. `call_gemini_for_frame` keeps its
+`reference_images` parameter for the same reason and no production caller passes
+it. Delete the files only together with that parameter and the harness's D and E
+arms.
+
+Two consequences. They are **not** loaded by `reference_images.py`, which serves
+Phase 5's street references only — `STREET_REFERENCE_ORDER` is unchanged, and
+nothing resolves a suit PNG at runtime. And they are counted by
+`test_provenance.py`'s file-census assertion, which is at 16 rather than 12
+precisely so a file cannot sit in `references/` unaccounted for; deleting them
+means moving that count back to 12 in the same change.
+
+**What this does not fix.** Silent suit errors remain possible. The mechanism —
+a small pip against loud artwork — is reduced, not removed, and nothing in the
+pipeline detects a wrong-but-non-null card. See "What `hand_starts` guarantees,
+and what it does not."
+
+### The reproduction harness
+
+`scripts/repro_card_read.py` replays either card read against real stored
+content, scoring misreads and nulls separately and reporting input tokens per
+call. It renders prompts with the production context builders and calls the
+production `gemini_caller`, so what it measures is what the pipeline does.
+
+Three properties worth preserving:
+
+- **The manifest is keyed by `(video_id, timestamp)`**, never by a row id or a
+  stored frame path. Ids are positional and renumber on re-detection, and a
+  Phase 4 re-run overwrites `fva.jpg` at exactly the paths a stored-frame
+  manifest would name — either anchor would silently come to point at different
+  pixels. The source video does not change.
+- **Versions interleave within each repetition.** Every arm sees each frame back
+  to back before the loop moves on, so drift in the service is shared across arms
+  rather than confounded with the difference between them.
+- **API failures are counted apart and never scored.** A 5xx or a reset is
+  neither a misread nor a null; counting it as either would move an arm's rate
+  for a reason that has nothing to do with the prompt. `GeminiPermanentError` is
+  deliberately not retried, so an arm that produces malformed JSON stays visible.
+
+This partly closes the standing "notebook reproduction harnesses are untracked"
+follow-up: the card reads now have a versioned harness, the video-window calls
+still do not.
 
 ## Phase 5: Player actions and community cards
 
@@ -1113,6 +1257,10 @@ existing JSON state column:
 ```json
 "provenance": {
   "models": {"clip": "gemini-2.5-pro", "frame": "gemini-3.8-flash"},
+  "media_resolution": {
+    "clip": "MEDIA_RESOLUTION_UNSPECIFIED",
+    "frame": "MEDIA_RESOLUTION_ULTRA_HIGH"
+  },
   "prompts": {
     "prompts/extract_player_actions.md": "3f9a1c2e7b10",
     "references/river_reference.jpeg": "0c4e1f2a8d57"
@@ -1128,7 +1276,45 @@ existing JSON state column:
   the bounty addendum on progressive videos only; Phase 5 lists step E's prompts
   and reference images only when step E ran. Listing a file a row never saw would
   make the record say something false about how it was produced.
+- `media_resolution` is keyed by call mode too, and its keys must match
+  `models` exactly — `build_provenance` raises if they diverge. A phase that
+  adds a call mode to one dict and not the other would leave a hole in the one
+  query this field exists to answer, and the failure would otherwise be silent.
+  Phase 5 omits `frame` from both when step E did not run, the same rule that
+  governs which prompts it lists.
 - No code version is recorded.
+
+**Why media resolution is in the block.** It is a request parameter, and the only
+one recorded — because it is the only one that has already changed extraction
+behaviour corpus-wide while leaving every other recorded value untouched. When
+the two card reads moved to `MEDIA_RESOLUTION_ULTRA_HIGH` the models were the
+same and every prompt hash was the same, so rows either side of the change
+carried **byte-identical provenance** and nothing in the data distinguished them.
+`detected_at` separated them only by the accident of the change coinciding with a
+rebuild. This closes that gap; the fix was to record the parameter rather than to
+require future changes of that shape to ride a prompt edit.
+
+It is recorded in **all four** Gemini-calling phases, including Phase 3 and
+payout extraction, where the value has not changed. Uniform shape is the point: a
+reader comparing two rows should not have to know which phases bothered, and a
+future change in a phase that currently uses the default becomes visible in the
+data instead of silent. The values come from constants in `gemini_caller`, which
+are also what the callers send, so what is recorded cannot drift from what was
+requested.
+
+What the values mean: `MEDIA_RESOLUTION_UNSPECIFIED` for clip mode records that
+`call_gemini_for_clip` sets none, written under the API's own name rather than as
+`null` so every call mode reads the same way. Frame mode records the *effective*
+resolution of the frame — the caller's request-level `MEDIA_RESOLUTION_HIGH`, or
+the per-part `MEDIA_RESOLUTION_ULTRA_HIGH` where a card read overrides it. The
+reference images' own LOW is not recorded; no production caller sends any.
+
+**This changed four column descriptions and needs a `terraform apply`.** No
+column, type or mode changed and codegen output is byte-identical, exactly as the
+provenance work itself was. Lengths after the edit are 797, 489, 482 and 989
+against BigQuery's 1,024-character cap, with `hand_actions` again the tight one —
+`tests/test_schema_descriptions.py` enforces the limit so it fails in the suite
+rather than halfway through an apply.
 
 **No schema change.** All four state columns are JSON, BigQuery parses them
 server-side, and `bq_param_type`'s missing float and None branches are never
@@ -1439,6 +1625,8 @@ The counterexample is `MPBLfM4mwfE_008_004`, whose pre-rebuild record put the BT
 **Hole-card errors are suit errors.** Two were found by spot-check across the original run's 60 hands: `MPBLfM4mwfE_002_002_001` recorded `AsJc` for an actual `AcJc`, and `MPBLfM4mwfE_009_004_001` recorded `Ah7s` for `Ad7s`. Rank was correct both times, and the seats' screen positions differed, so location is not the cause. Both are the four-colour-deck confusions `extract_hole_cards.md` explicitly warns about — clubs/spades and diamonds/hearts.
 
 Both ids are historical to the original run and have been through two re-detections since; re-derive by timestamp before treating either as a reproduction target. See "Corpus state." Four-colour confusion remains a live cause — it is one of the three behind a null on a seat that stayed in; see "Null hole cards on a seat that stayed in."
+
+**Measured and substantially fixed, by resolution rather than by wording.** The rebuild-versus-`hand_starts_pre_rebuild` comparison put the residual population at four suit disagreements across 128 matched hands, with every rank correct — and the disagreement ran in both directions, which is what identified the cause as a marginal signal rather than a prompt defect. Face-card artwork is red in every suit in this broadcast, so the corner pip is the only unambiguous evidence and it is small. Sending the frame at `MEDIA_RESOLUTION_ULTRA_HIGH` took the reproduction from 4 misreads in 160 cards to 0 in 640; a prompt instruction naming the pip moved nothing, and suit reference images made it worse. See "Suit misreads are a resolution problem" for the full arm table and the three limits on what it establishes. **Rank remains the reliable half and suit the fragile one** — that asymmetry is unchanged, only its rate has moved.
 
 Consequence depends entirely on the hand. `_002_002_001` ended preflop, so the wrong suit never collides with anything and the record stays useful. `_009_004_001`'s `Ah` also appears on the flop, correctly recorded — an impossible duplicate, and the hand is unusable.
 
@@ -1775,7 +1963,7 @@ Not blocking any current phase, but accumulated as the project has grown.
 - **P5-7(b) promotion review** — implement turn order as a dbt check, run it over the rebuilt corpus, and adjudicate every hand it flags against the broadcast. Promote it to a Phase 5 gate when it produces zero unadjudicated false positives across a full corpus, with the all-in, incomplete-raise and reopened-betting cases actually represented in the sample rather than merely absent from it. Until then it stays in dbt, where the four documented Pro seat-attribution swaps get flagged without costing the hand. See CLAUDE.md's "Where a validation check belongs."
 
 - **Ruff baseline** — 189 errors across `src/`, `tests/` and `scripts/`, 164 of them E501 against the configured 100-char limit and the rest auto-fixable imports plus two decorative unused mocks. Ruff is not in CI, which is why they accumulated. With that many standing errors a new one is invisible.
-- **Notebook reproduction harnesses are untracked** — `*.ipynb` is gitignored, while `jupyterlab`, `ipykernel` and `pillow` are dev dependencies precisely because CLAUDE.md's regression guard for prompts is notebook reproduction. The harnesses themselves are not versioned, so each investigation rebuilds them.
+- **Notebook reproduction harnesses are untracked — partly closed.** `scripts/repro_card_read.py` is the versioned harness for the two frame-mode card reads, built for the suit-misread study and reusable for any future change to either prompt; see "The reproduction harness." What remains unversioned is the **video-window** calls — Phase 3 detection, Phase 4 step A, Phase 5 step D and the street scans — where `*.ipynb` is still gitignored and each investigation rebuilds its own. `jupyterlab`, `ipykernel` and `pillow` stay dev dependencies for that half.
 
 ### CLI ergonomics
 
@@ -1805,4 +1993,6 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 - **Does step D specifically need Pro?** Supersedes "Revisit the clip-mode model default after the first multi-video ingest," which is answered: the rate is 15% across two videos, Pro recovers the contested truncations, and Phase 5 now runs on Pro. The open question is narrower. Phase 5 makes one step-D call and two to three step-E scans per hand; if only the scans need Pro, a per-step split saves roughly **$360** across the projected corpus. Against that, it means threading a model parameter through a primitive deliberately ignorant of its caller — see "Model selection is per call mode" on why that is resisted. **The comparison needs a query, not new calls:** the split run put Pro on all clip calls, the current corpus is all-Flash, and both post-date the prompt changes, so the arms already exist in stored exports.
 - **Per-row model provenance — closed.** Every row a Gemini-calling phase writes now records the model per call mode and the version of every prompt file and reference image that produced it. The item read that the model was emitted only on the unpersisted `gemini_usage` line, so no query could attribute a row to a model — load-bearing once seven `YzKyFMQ1avU` hands were produced on Pro and the rest of the corpus on Flash. The two options it weighed, a `model` column across five tables or a note in `status_message`, were both passed over for a `provenance` key inside the existing JSON columns: no schema change, and it carries prompt versions as well as the model. See "Provenance". **The rows produced before this landed remain unattributable**, which the rebuild resolves by replacing them.
+- **Suit reference images — closed, rejected.** Four per-suit crops were added to `references/` as candidates and measured: they made misreads *worse* (6 of 160 against a baseline 4) and cost ~1,160 input tokens per call. The four PNGs remain on disk, unused by any phase, pending a decision to delete them. Do not re-propose them without reading "Suit misreads are a resolution problem" first.
+- **A combined single reference image was designed and never needed.** Stitching the four crops into one labelled strip would have cut their token cost by about three-quarters, but it only mattered if a reference-bearing arm won, and none did.
 - **`user_text` may be unnecessary** — both system prompts are self-contained and end with the instruction the user turn repeats. Test a media-only user turn; if responses are unaffected, drop the second part from both callers entirely.

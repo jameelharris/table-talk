@@ -64,6 +64,32 @@ from google.genai import types
 CLIP_MODEL = os.environ.get("TT_CLIP_MODEL", "gemini-3.8-flash")
 FRAME_MODEL = os.environ.get("TT_FRAME_MODEL", "gemini-3.8-flash")
 
+# Media resolution, named here so call sites never carry a bare string and so
+# the value sent is the value recorded. PartMediaResolutionLevel *warns* rather
+# than raises on an unknown value, so a typo in a literal would degrade a read
+# with no error anywhere.
+#
+# These are also what the provenance block stores: media resolution is a request
+# parameter, and a change to one alters extraction behaviour corpus-wide without
+# touching a model id or a prompt hash. Before they were recorded, rows read at
+# HIGH and at ULTRA_HIGH carried byte-identical provenance and nothing in the
+# data could tell them apart. See ARCHITECTURE, "Provenance."
+
+# What call_gemini_for_clip sends: nothing. The config carries no
+# media_resolution, which the API treats as unspecified. Recorded under the
+# API's own name rather than as null, so every call mode reads the same way.
+CLIP_MEDIA_RESOLUTION = "MEDIA_RESOLUTION_UNSPECIFIED"
+
+# call_gemini_for_frame's request-level default, applying to any image part that
+# does not override it per part.
+FRAME_MEDIA_RESOLUTION = "MEDIA_RESOLUTION_HIGH"
+
+# The per-part override the two card reads pass. See ARCHITECTURE, "Suit
+# misreads are a resolution problem."
+FRAME_RESOLUTION_ULTRA_HIGH = "MEDIA_RESOLUTION_ULTRA_HIGH"
+
+REFERENCE_MEDIA_RESOLUTION = "MEDIA_RESOLUTION_LOW"
+
 _RETRY_MAX_ATTEMPTS = 5
 _RETRY_BASE_DELAY_SECONDS = 5.0
 _RETRY_MAX_DELAY_SECONDS = 60.0
@@ -280,13 +306,54 @@ def call_gemini_for_frame(
     mime_type: str = "image/jpeg",
     *,
     user_text: str,
+    reference_images: list[tuple[bytes, str, str]] | None = None,
+    frame_media_resolution: str | None = None,
     label: str | None = None,
 ) -> dict:
     client = genai.Client(vertexai=True, project=project_id, location=location)
 
-    part1 = types.Part(inline_data=types.Blob(data=frame_bytes, mime_type=mime_type))
-    part2 = types.Part(text=user_text)
-    request_contents = types.Content(role="user", parts=[part1, part2])
+    # Per-part resolution, not the request-level config below. The two are
+    # different enums: config.media_resolution stops at HIGH, and only the
+    # per-part PartMediaResolutionLevel offers ULTRA_HIGH. Leaving this None
+    # reproduces the original request exactly, so the default is correct for
+    # every caller rather than a silently-inherited value — the same reasoning
+    # that keeps reference_images optional on call_gemini_for_clip.
+    frame_part = types.Part(
+        inline_data=types.Blob(data=frame_bytes, mime_type=mime_type),
+        media_resolution=(
+            types.PartMediaResolution(level=frame_media_resolution)
+            if frame_media_resolution
+            else None
+        ),
+    )
+
+    # Frame first, then the reference images as (bytes, mime_type, label), then
+    # the user turn — the same order and the same labelling as the clip caller,
+    # because the prompts describe the images by name and anonymous blobs would
+    # leave the model inferring which is which from arrival order. The label
+    # string must stay exactly "Reference image — {label}:", em dash included;
+    # it is matched against the prompt's own wording. Do not reword it.
+    #
+    # References are pinned LOW: they illustrate a shape, and paying the frame's
+    # resolution for a thumbnail would cost tokens on every read forever.
+    #
+    # NO PRODUCTION CALLER PASSES reference_images TODAY. Suit references were
+    # measured and rejected — they made misreads worse, not better (version E,
+    # 6 of 160 against a baseline 4) — and the parameter is kept so
+    # scripts/repro_card_read.py can still reproduce that result. Delete it only
+    # together with that harness's D and E arms. See ARCHITECTURE, "Suit
+    # misreads are a resolution problem."
+    parts = [frame_part]
+    for image_bytes, image_mime_type, image_label in (reference_images or []):
+        parts.append(types.Part(text=f"Reference image — {image_label}:"))
+        parts.append(
+            types.Part(
+                inline_data=types.Blob(data=image_bytes, mime_type=image_mime_type),
+                media_resolution=types.PartMediaResolution(level=REFERENCE_MEDIA_RESOLUTION),
+            )
+        )
+    parts.append(types.Part(text=user_text))
+    request_contents = types.Content(role="user", parts=parts)
 
     try:
         response = _call_with_retry(
@@ -294,7 +361,7 @@ def call_gemini_for_frame(
                 model=FRAME_MODEL,
                 config=types.GenerateContentConfig(
                     system_instruction=prompt,
-                    media_resolution=types.MediaResolution.MEDIA_RESOLUTION_HIGH,
+                    media_resolution=FRAME_MEDIA_RESOLUTION,
                 ),
                 contents=request_contents,
             )

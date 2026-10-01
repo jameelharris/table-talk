@@ -22,7 +22,9 @@ from .clip_processing_attempts_writer import write_clip_processing_attempt_row
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
 from .gemini_caller import (
+    CLIP_MEDIA_RESOLUTION,
     CLIP_MODEL,
+    FRAME_MEDIA_RESOLUTION,
     FRAME_MODEL,
     GeminiPermanentError,
     call_gemini_for_clip,
@@ -293,6 +295,14 @@ async def process_clip(
                     "players": players,
                     "provenance": build_provenance(
                         models={"clip": CLIP_MODEL, "frame": FRAME_MODEL},
+                        # Unchanged by the card-read work — this phase's frame
+                        # call keeps the caller's default. Recorded anyway so the
+                        # block has one shape across phases and a future change
+                        # here is visible rather than silent.
+                        media_resolution={
+                            "clip": CLIP_MEDIA_RESOLUTION,
+                            "frame": FRAME_MEDIA_RESOLUTION,
+                        },
                         prompts=prompt_hashes,
                     ),
                 }

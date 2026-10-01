@@ -61,7 +61,11 @@ def hash_files(paths: Iterable[Path], repo_root: Path) -> dict[str, str]:
     return hashes
 
 
-def build_provenance(models: dict[str, str], prompts: dict[str, str]) -> dict:
+def build_provenance(
+    models: dict[str, str],
+    media_resolution: dict[str, str],
+    prompts: dict[str, str],
+) -> dict:
     """The provenance block written as a sibling of a phase's own contribution.
 
     `models` is keyed by call mode ("clip", "frame") rather than holding one
@@ -69,13 +73,34 @@ def build_provenance(models: dict[str, str], prompts: dict[str, str]) -> dict:
     they can be served by different models — that split is the whole point of
     TT_CLIP_MODEL and TT_FRAME_MODEL being separate.
 
+    `media_resolution` is keyed the same way and for the same reason, and it is
+    **required rather than defaulted**. Resolution is a request parameter that
+    changes extraction behaviour corpus-wide without touching a model id or a
+    prompt hash: when the card reads moved to ULTRA_HIGH, rows either side of the
+    change carried byte-identical provenance and nothing in the data
+    distinguished them. A default here would let a phase silently reintroduce
+    exactly that gap, which is the same reasoning that makes prompt_hashes a
+    required keyword-only argument on every orchestrator.
+
+    Its keys must match `models`: a call mode a row did not use appears in
+    neither. Phase 5 omits "frame" from both when step E did not run.
+
     `prompts` must contain only the files that actually contributed to THIS row.
     Phase 3 lists the bounty addendum on progressive videos only; Phase 5 lists
     step E's prompts and reference images only when step E ran. Listing a file a
     row never saw would make the record say something false about how it was
     produced.
     """
-    return {"models": models, "prompts": prompts}
+    if set(models) != set(media_resolution):
+        raise ValueError(
+            f"models and media_resolution must cover the same call modes: "
+            f"{sorted(models)} vs {sorted(media_resolution)}"
+        )
+    return {
+        "models": models,
+        "media_resolution": media_resolution,
+        "prompts": prompts,
+    }
 
 
 def select(hashes: dict[str, str], *paths: str) -> dict[str, str]:
