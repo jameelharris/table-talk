@@ -94,6 +94,14 @@ _SPEC = {spec.output_table: spec for spec in PHASES}
 # `--max-attempts 4` on a rebuild run if the full three matter.
 _MARK_STATUS = "failed_transient"
 
+# The message every mark carries, before the stage name. Public and defined once
+# because two things now read it: an audit reader, who must not mistake a
+# deliberate reprocess for a rate-limit incident, and Phase 5's pending query,
+# which skips marks when it looks for the previous *real* attempt. If the text and
+# that query's pattern ever diverge, a mark counts as a real attempt and a first
+# genuine failure reads as an identical repeat.
+MARK_MESSAGE_PREFIX = "mark-pending: rebuilding "
+
 # Gemini calls one re-run makes per marked entity. The estimate exists to make
 # someone hesitate, so order of magnitude is the useful part.
 _CALLS_PER_ENTITY: dict[str, float] = {
@@ -468,8 +476,8 @@ def execute(
 
     # The one trace distinguishing a synthetic mark from a real failure. Keep it
     # greppable: an audit reader must not mistake a deliberate reprocess for a
-    # rate-limit incident.
-    message = f"mark-pending: rebuilding {plan.stage}"
+    # rate-limit incident, and Phase 5's pending query matches on the prefix.
+    message = f"{MARK_MESSAGE_PREFIX}{plan.stage}"
     for attempts_table, ids in resolution.mark_ids:
         row_class, write = _MARK_WRITERS[attempts_table]
         key_column = _key_column_for(row_class)

@@ -895,8 +895,11 @@ Motivated by `MPBLfM4mwfE_006_001_001`, an all-in runout where a turn was certai
 
 Every gate runs immediately after step D returns, **before any step E call**, so
 a failing hand costs one clip call rather than up to seven. First failure wins.
-All are `failed_transient`: a retry is the only mechanism that can produce a
-correct sequence, and dbt cannot re-extract at all.
+All are `failed_transient` on their first hit: a retry is the only mechanism that
+can produce a correct sequence, and dbt cannot re-extract at all. **That argument
+holds only for an error made in this phase**, which is why a gate failure
+identical to the previous real attempt's becomes `failed_permanent` — see "An
+identical gate repeat is permanent."
 
 P5-16 runs in the same place but is not one of them — see below, and note that
 its `failed_permanent` is why it sits outside `check_step_d_output` rather than
@@ -1037,6 +1040,67 @@ truncations, which Pro recovered 5 of 7 times; the other 2 were D over-reporting
 a river on hands that ended with a fold on the turn, which **P5-3 now catches at
 step D before any E call**.
 
+### An identical gate repeat is permanent
+
+A step-D gate failure whose `<gate_id>: <code>: <detail>` is **exactly identical**
+to the hand's previous real attempt's message is recorded `failed_permanent`, with
+a detail saying it repeated identically and to review upstream. The statuses are
+unchanged; no new one was added.
+
+**Why identity is the signal.** A stochastic step-D slip varies — a different
+seat, a different amount, a different street. An error in the *input* does not:
+the gate recomputes the same contradiction from the same stored row every time,
+and no retry of this phase can reach the cause. Three attempt histories make the
+case, all from the rebuild:
+
+- `YzKyFMQ1avU_004_001` recorded `P5-5: all_in_mismatch: preflop action 3 BB
+  all_in 9.28 leaves 10.00 BB behind` **three times running** and is still
+  failing. The cause is Phase 3 reading the BB's stack as 18.28 where it is 8.28.
+- `YzKyFMQ1avU_014_003` recorded the same P5-8 twice. What resolved it was a mark
+  on `hand_starts` and a Phase 4 redo — see P4-7, which now catches it a phase
+  earlier.
+- `YzKyFMQ1avU_013_003` is the control: a 429, then a P5-5 hit, then `complete`.
+  The messages differ, so the rule does not fire, which is correct — the 429 is
+  not a judgement about the hand.
+
+Each repeat cost a full step-D call on Pro to learn nothing.
+
+**Permanent is not a dead end.** `tt mark-pending --stage hand_actions` (or
+`hand_starts`, when the fault is Phase 4's) is the way back, and on `014_003` it
+was already the route that worked. The gain is that the hand stops billing for
+attempts that cannot succeed, and lands in a bucket whose message names the
+diagnosis rather than reading as a third rate-limit incident.
+
+**It outranks the retry cap.** A repeat at the cap records `failed_permanent`
+rather than `failed_parked`. Both are terminal and neither is re-selected; this
+one carries the reason.
+
+**Scope: the step-D gates only** — P5-1 … P5-9 and P5-15. Three deliberate
+exclusions:
+
+- **P5-14** is a step-E scan failure whose message names only a street, so a
+  *stochastic* miss repeats byte-identically and would be ended an attempt early.
+  Pro recovered 5 of 7 contested truncations on retry, so the retry is earning its
+  cost there. The asymmetry is the whole argument: among the step-D gates,
+  identity distinguishes the deterministic case; in P5-14's message it cannot.
+- **P5-12 and P5-13** reach the handler as `CommunityCardUnreadable` /
+  `StreetTimestampUnusable`, whose text does not begin with a gate id, so they
+  never match. Both are read failures a retry demonstrably fixes.
+- **Infrastructure** — 429s, 5xx, resets, download failures, and the unnumbered
+  "no winning position observed" check. These legitimately repeat.
+
+The mechanism is the message shape rather than a list: `_gate_failure_outcome`
+compares only a `P5-<n>: ` prefixed message, having stripped the status prefix the
+write sites add, so a `failed_parked` predecessor on an un-parked hand still
+compares equal. A new gate is therefore in scope the moment it is written through
+that path and out of scope if it raises instead — which is the same reasoning the
+`failed%` prefix uses to keep `blocked_upstream` out of the retry counter.
+
+**The previous message is carried on `PendingHandStart`,** computed in the pending
+query beside `consecutive_failures` and for the same reason: the failure handler
+runs precisely when BigQuery may be unreachable, so it must not read there. Marks
+are skipped when finding it — see "Reprocessing and the mark-pending cascade."
+
 ### Failure handling
 
 The same five statuses as Phase 4. Two things Phase 4 does not share:
@@ -1160,6 +1224,8 @@ Two stages feed `hand_setups` and neither feeds the other: materialization is ar
 
 Marks carry `status_message = "mark-pending: rebuilding {stage}"`. That string is the only trace distinguishing a synthetic mark from a real failure, and it matters — an audit reader must not read a deliberate reprocess as a rate-limit incident.
 
+It now has a second reader. Phase 5's pending query skips marks when it looks for the previous *real* attempt, so the text is defined once as `mark_pending.MARK_MESSAGE_PREFIX` and bound into that query as a parameter rather than copied into it. If the two ever diverged, a mark would count as a real attempt: a mark between two identical failures would hide the repeat, and a mark after a success would make the first genuine failure read as one.
+
 **`--video-id` is mandatory, single, and there is no all-videos mode.** This makes terminal entities eligible again, which costs real money when the phases run; an accidental corpus-wide invocation at 150 videos would be a large unintended expense. `--id` and `--status` narrow within the video. No status is excluded by default: whether a `failed_permanent` is recoverable is context-dependent — a malformed-JSON response may well be fixed by a prompt change, while the two clip-boundary fragments can never complete — so the dry-run reports the status composition and the operator decides. An unnarrowed run scopes its deletes by `video_id` alone, which additionally sweeps orphaned downstream rows that an id list could never reach, since an orphan's parent is by definition not in the entity set.
 
 `videos` is not a valid stage. Re-running Phase 1 is re-acquisition, not reprocessing: it re-downloads from YouTube, may get a different encode, and Phase 1's status vocabulary predates the common one. Replacing a source file is a delete-and-re-ingest operation, rare enough not to build for.
@@ -1167,6 +1233,8 @@ Marks carry `status_message = "mark-pending: rebuilding {stage}"`. That string i
 ### Retry caps
 
 Orchestrators park an entity after N consecutive failures rather than retrying forever. See CLAUDE.md's "Retry caps and terminal parking" for the rules.
+
+**Phase 5 can also terminate before the cap.** A step-D gate failure identical to the previous real attempt's is recorded `failed_permanent` rather than counted toward the cap, because the error is in the input and no retry of that phase can reach it. See "An identical gate repeat is permanent." Nothing else in the pipeline does this, and it is specific to a phase whose retries cost Pro clip calls.
 
 **Everything below is historical to the original run and the 63-row rebuild.** `MPBLfM4mwfE` has been re-detected since and `hand_setup_id` is positional, so `_008_004`, `_004_008`, `_005_001` and `_009_001` do not reliably resolve to the moments described here — see "Corpus state." The narrative is kept in full because it is the evidence behind the retry cap and behind the clip-boundary follow-up, and because its central finding does not depend on the rows surviving. Re-derive by timestamp before using any of these as a reproduction target.
 

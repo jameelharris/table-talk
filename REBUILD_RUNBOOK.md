@@ -186,6 +186,15 @@ Pro as well.
 `failed_transient`, so it costs one retry slot and the default 3 would leave only
 two real attempts.
 
+**A step-D gate failure identical to the previous real attempt's now ends the hand
+`failed_permanent`**, so `--max-attempts 4` no longer implies four step-D calls on
+Pro for an error that lives upstream — the second identical hit is the last one.
+Marks are not counted as real attempts for this, so re-marking between runs does
+not reset it. Read such a park as "review Phase 3 or Phase 4 for this hand," not
+as a Phase 5 defect: `tt mark-pending --stage hand_starts` after fixing the
+upstream value is the way back. Gate failures only — a repeated 429 or a repeated
+card-read failure still retries.
+
 **Check:** P5-16 is new and permanent — a null hole card on a seat that stayed in
 after the FVA. It is the first run in which it can fire at all (the gate it
 splits from suppressed its whole population), so its count is the measurement,

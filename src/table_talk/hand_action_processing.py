@@ -22,6 +22,7 @@
 
 import asyncio
 import os
+import re
 import sys
 import tempfile
 import uuid
@@ -46,6 +47,7 @@ from .gemini_caller import (
 )
 from .hand_actions_writer import write_hand_actions
 from .hand_start_processing_attempts_writer import write_hand_start_processing_attempt_row
+from .mark_pending import MARK_MESSAGE_PREFIX
 from .prompt_context import build_action_context, build_fva_context, build_prior_cards_context
 from .provenance import build_provenance, select
 from .reference_images import STREET_REFERENCE_ORDER, reference_image_filename
@@ -159,6 +161,11 @@ class PendingHandStart:
     hand_start_state: dict
     raw_lead_gap_seconds: int
     consecutive_failures: int
+    # The status_message of the previous attempt that was not a mark-pending row.
+    # Carried here, never re-read in a failure handler, for the same reason
+    # consecutive_failures is: the handler runs precisely when BigQuery may be
+    # unreachable. None when the hand has never really been attempted.
+    previous_status_message: str | None
 
 
 def _find_pending_hand_starts(
@@ -192,7 +199,11 @@ def _find_pending_hand_starts(
 
     video_filter = ""
     hand_start_filter = ""
-    params: list = []
+    # Bound rather than interpolated, so the mark message has exactly one
+    # definition and it lives with the code that writes it.
+    params: list = [
+        bigquery.ScalarQueryParameter("mark_message_prefix", "STRING", MARK_MESSAGE_PREFIX)
+    ]
     if only_video_ids is not None:
         video_filter = "AND h.video_id IN UNNEST(@only_video_ids)"
         params.append(bigquery.ArrayQueryParameter("only_video_ids", "STRING", only_video_ids))
@@ -219,7 +230,7 @@ def _find_pending_hand_starts(
         ),
         attempt_marks AS (
           SELECT
-            hand_start_id, status, attempted_at,
+            hand_start_id, status, status_message, attempted_at,
             MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL)) OVER (
               PARTITION BY hand_start_id
             ) AS last_non_failure_at
@@ -229,6 +240,15 @@ def _find_pending_hand_starts(
           SELECT
             hand_start_id,
             ARRAY_AGG(status ORDER BY attempted_at DESC LIMIT 1)[OFFSET(0)] AS latest_status,
+            -- The latest attempt that is not a mark. A mark is a deliberate
+            -- reprocess, not an outcome, so it must not stand in for the
+            -- previous real attempt — otherwise a mark between two identical
+            -- failures would hide the repeat, and a mark after a success would
+            -- make the first real failure look like one.
+            ARRAY_AGG(
+              IF(status_message LIKE CONCAT(@mark_message_prefix, '%'), NULL, status_message)
+              IGNORE NULLS ORDER BY attempted_at DESC LIMIT 1
+            )[SAFE_OFFSET(0)] AS previous_status_message,
             COUNTIF(
               status = 'failed_transient'
               AND (last_non_failure_at IS NULL OR attempted_at > last_non_failure_at)
@@ -245,7 +265,8 @@ def _find_pending_hand_starts(
           h.fva_time_seconds,
           w.hand_setup_time_seconds,
           w.raw_lead_gap_seconds,
-          COALESCE(a.consecutive_failures, 0) AS consecutive_failures
+          COALESCE(a.consecutive_failures, 0) AS consecutive_failures,
+          a.previous_status_message
         FROM `{project_id}.{dataset}.hand_starts` h
         INNER JOIN windowed w USING (hand_setup_id)
         LEFT JOIN attempt_state a USING (hand_start_id)
@@ -266,6 +287,7 @@ def _find_pending_hand_starts(
             hand_start_state=row.hand_start_state,
             raw_lead_gap_seconds=row.raw_lead_gap_seconds,
             consecutive_failures=row.consecutive_failures,
+            previous_status_message=row.previous_status_message,
         )
         for row in rows
     ]
@@ -701,6 +723,65 @@ def _transient_status(consecutive_failures: int, max_attempts: int) -> str:
     return "failed_parked" if consecutive_failures + 1 >= max_attempts else "failed_transient"
 
 
+# A stored status_message's gate part, behind the status prefix the gate write
+# sites put in front of it. Only a gate message matches, because the fixed
+# "<gate_id>: <code>: " shape is in the pattern — so an infrastructure message
+# ("rate limited by Vertex AI (429); retries exhausted") can never compare equal
+# to one by accident, however often it recurs.
+_GATE_MESSAGE = re.compile(r"^(?:[a-z_]+: )?(P5-\d+: .+)$")
+
+
+def _repeats_previous_gate_failure(
+    gate_reason: str, previous_status_message: str | None
+) -> bool:
+    """Whether this gate failure is the one the previous real attempt recorded.
+
+    Compares the gate part alone, so a predecessor stored as `failed_parked` — a
+    hand since un-parked by a mark — still compares equal to the
+    `failed_transient` being written now.
+    """
+    if previous_status_message is None:
+        return False
+    match = _GATE_MESSAGE.match(previous_status_message)
+    return match is not None and match.group(1) == gate_reason
+
+
+def _gate_failure_outcome(
+    gate_reason: str,
+    previous_status_message: str | None,
+    consecutive_failures: int,
+    max_attempts: int,
+) -> tuple[str, str]:
+    """The status and status_message for a step-D gate failure.
+
+    **An identical repeat is permanent.** A gate failure that reproduces the
+    previous real attempt's message word for word is not a stochastic step-D
+    slip — those vary — it is a defect in the input, which no retry of this phase
+    can reach. `YzKyFMQ1avU_004_001` recorded `P5-5: … BB all_in 9.28 leaves
+    10.00 BB behind` three times running, the cause being a Phase 3 stack read of
+    18.28 for 8.28; `014_003` recorded the same P5-8 twice, and what resolved it
+    was a mark on `hand_starts` and a Phase 4 redo. Each repeat cost a full step-D
+    call on Pro to learn nothing.
+
+    Permanent is not a dead end: `tt mark-pending` is the way back from it, and on
+    `014_003` that was already the route that worked. It takes precedence over the
+    retry cap, so a repeat at the cap records `failed_permanent` rather than
+    `failed_parked` — both terminal, and this one carries the diagnosis.
+
+    Scoped to the step-D gates. Not P5-14, whose message names only a street, so a
+    stochastic scan miss repeats byte-identically and Pro recovered 5 of 7
+    contested truncations on retry. Not infrastructure, which legitimately
+    repeats. The pattern above is what draws that line.
+    """
+    if _repeats_previous_gate_failure(gate_reason, previous_status_message):
+        return "failed_permanent", (
+            f"failed_permanent: {gate_reason} — repeated identically from the "
+            f"previous attempt, so a retry cannot fix it; review upstream"
+        )
+    status = _transient_status(consecutive_failures, max_attempts)
+    return status, f"{status}: {gate_reason}"
+
+
 async def _scan_for_street(
     street_name: str,
     scan_prompt: str,
@@ -972,9 +1053,14 @@ async def process_hand_start(
             winning_positions,
         )
         if gate_reason is not None:
-            status = _transient_status(hs.consecutive_failures, max_attempts)
+            status, status_message = _gate_failure_outcome(
+                gate_reason,
+                hs.previous_status_message,
+                hs.consecutive_failures,
+                max_attempts,
+            )
             _write_attempt(
-                hs.hand_start_id, status, f"{status}: {gate_reason}",
+                hs.hand_start_id, status, status_message,
                 project_id=project_id, dataset=dataset,
             )
             return status

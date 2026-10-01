@@ -287,6 +287,14 @@ The point of gating early is not tidiness. It is that a **retry is the only
 mechanism that can recover a bad extraction**, and by the time dbt runs the
 extraction is over — dbt can exclude a hand but never re-read the frame.
 
+**That holds only for an error the gating phase made itself.** A gate that fires
+on a value an earlier phase produced is reporting a defect its own retries cannot
+reach, and it will report it identically every run. So a gate failure byte-identical
+to the entity's previous real attempt is terminal rather than retryable, and the
+gate belongs in the phase that produced the value wherever that phase has the
+information to check it — a check that only fires downstream of its own cause buys
+retries that cannot work.
+
 **Condition 2 applies only to rules with settled definitions.** A rule whose
 correct behaviour is itself uncertain fails condition 2 for a reason the
 condition does not name: not that dbt would keep the hand, but that *nobody yet

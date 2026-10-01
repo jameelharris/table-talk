@@ -24,6 +24,8 @@ from table_talk.hand_action_processing import (
     StreetTimestampUnusable,
     _board_duplicate,
     _find_pending_hand_starts,
+    _gate_failure_outcome,
+    _repeats_previous_gate_failure,
     _street_cards_unusable,
     _street_timestamp_guard,
     _transient_status,
@@ -33,6 +35,7 @@ from table_talk.hand_action_processing import (
     process_hand_start,
     process_pending_hand_starts,
 )
+from table_talk.mark_pending import MARK_MESSAGE_PREFIX
 from table_talk.videos_downloader import DownloadPermanentError
 
 _FVA = {"seat_position_label": "CO", "seat_number": 4, "action_type": "raise", "bet_amount": 2.5}
@@ -88,6 +91,7 @@ def _pending(**kwargs) -> PendingHandStart:
         hand_start_state=_hand_start_state(),
         raw_lead_gap_seconds=60,
         consecutive_failures=0,
+        previous_status_message=None,
     )
     return PendingHandStart(**{**defaults, **kwargs})
 
@@ -167,6 +171,7 @@ def _bq_row(**kwargs):
         hand_setup_time_seconds=100,
         raw_lead_gap_seconds=60,
         consecutive_failures=0,
+        previous_status_message=None,
     )
     return SimpleNamespace(**{**defaults, **kwargs})
 
@@ -327,7 +332,10 @@ def test_find_pending_hand_starts_no_filters():
     query = client.query.call_args[0][0]
     assert "only_video_ids" not in query
     assert "only_hand_start_ids" not in query
-    assert client.query.call_args[1]["job_config"].query_parameters == []
+    # Only the mark-message prefix, which is bound on every call: it is what
+    # tells the previous *real* attempt from a deliberate reprocess.
+    params = {p.name for p in client.query.call_args[1]["job_config"].query_parameters}
+    assert params == {"mark_message_prefix"}
 
 
 def test_find_pending_hand_starts_computes_lead_before_joining_hand_starts():
@@ -394,6 +402,7 @@ def test_find_pending_hand_starts_builds_pending_hand_start():
     assert hs.hand_setup_time_seconds == 100
     assert hs.raw_lead_gap_seconds == 60
     assert hs.consecutive_failures == 0
+    assert hs.previous_status_message is None
 
 
 # ---------------------------------------------------------------------------
@@ -1352,7 +1361,7 @@ def _upload_fixture_video(gcs_client, videos_bucket, video_id, duration_seconds=
     return blob
 
 
-def _write_hand_start_attempt(bq_client, hand_start_id, status):
+def _write_hand_start_attempt(bq_client, hand_start_id, status, status_message=None):
     from table_talk._generated.hand_start_processing_attempts_row import (
         HandStartProcessingAttemptsRow,
     )
@@ -1365,7 +1374,7 @@ def _write_hand_start_attempt(bq_client, hand_start_id, status):
             attempt_id=uuid.uuid4().hex,
             hand_start_id=hand_start_id,
             status=status,
-            status_message=status,
+            status_message=status if status_message is None else status_message,
         ),
         project=_INTEGRATION_PROJECT,
         dataset=_INTEGRATION_DATASET,
@@ -1663,6 +1672,83 @@ def test_find_pending_hand_starts_transient_then_complete_then_transient_counts_
         )
         assert len(results) == 1
         assert results[0].consecutive_failures == 1
+    finally:
+        _cleanup_hand_start(bq_client, ids)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_starts_carries_the_previous_real_attempt_message():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    ids = _seed_hand_start(bq_client, uid_tag="p5q")
+    gate = "failed_transient: P5-5: all_in_mismatch: preflop action 3 BB all_in 9.28"
+    try:
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "failed_transient", gate)
+
+        results = _find_pending_hand_starts(
+            _INTEGRATION_PROJECT,
+            _INTEGRATION_DATASET,
+            only_hand_start_ids=[ids.hand_start_id],
+            client=bq_client,
+        )
+        assert len(results) == 1
+        assert results[0].previous_status_message == gate
+    finally:
+        _cleanup_hand_start(bq_client, ids)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_starts_skips_a_mark_when_finding_the_previous_attempt():
+    """A mark is a deliberate reprocess, not an outcome. If it stood in for the
+    previous real attempt, a mark between two identical gate failures would hide
+    the repeat — which is exactly the sequence 004_001 and 014_003 both have.
+
+    The mark is written through mark_pending's own prefix, so this exercises the
+    binding between the message and the pattern, not a copy of either.
+    """
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    ids = _seed_hand_start(bq_client, uid_tag="p5q")
+    gate = "failed_transient: P5-5: all_in_mismatch: preflop action 3 BB all_in 9.28"
+    try:
+        _write_hand_start_attempt(bq_client, ids.hand_start_id, "failed_transient", gate)
+        _write_hand_start_attempt(
+            bq_client, ids.hand_start_id, "failed_transient",
+            f"{MARK_MESSAGE_PREFIX}hand_actions",
+        )
+
+        results = _find_pending_hand_starts(
+            _INTEGRATION_PROJECT,
+            _INTEGRATION_DATASET,
+            only_hand_start_ids=[ids.hand_start_id],
+            client=bq_client,
+        )
+        assert len(results) == 1
+        # The mark is the latest row, and the gate failure is still what counts.
+        assert results[0].previous_status_message == gate
+        # It does still cost a retry slot, which is unchanged behaviour.
+        assert results[0].consecutive_failures == 2
+    finally:
+        _cleanup_hand_start(bq_client, ids)
+
+
+@pytest.mark.integration
+def test_find_pending_hand_starts_has_no_previous_message_before_any_attempt():
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    ids = _seed_hand_start(bq_client, uid_tag="p5q")
+    try:
+        results = _find_pending_hand_starts(
+            _INTEGRATION_PROJECT,
+            _INTEGRATION_DATASET,
+            only_hand_start_ids=[ids.hand_start_id],
+            client=bq_client,
+        )
+        assert len(results) == 1
+        assert results[0].previous_status_message is None
     finally:
         _cleanup_hand_start(bq_client, ids)
 
@@ -2216,6 +2302,132 @@ def test_a_gate_failure_parks_at_the_cap():
 
     assert outcome == "failed_parked"
     assert "P5-1: action_label_unresolved: " in _attempt_row(mocks).status_message
+
+
+# ---------------------------------------------------------------------------
+# An identical gate repeat is permanent
+#
+# A step-D gate failure that reproduces the previous real attempt's message word
+# for word is a defect in the input, not a stochastic step-D slip. No retry of
+# this phase can reach it, and each one costs a step-D call on Pro.
+# ---------------------------------------------------------------------------
+
+
+_P5_5_REASON = (
+    "P5-5: all_in_mismatch: preflop action 3 BB all_in 9.28 leaves 10.00 BB behind"
+)
+_P5_8_REASON = (
+    "P5-8: fva_mismatch: preflop action 1 commits 17.6, but the fva block says 17.1"
+)
+_INFRA_MESSAGE = "rate limited by Vertex AI (429); retries exhausted"
+
+
+@pytest.mark.parametrize("previous,repeats", [
+    # YzKyFMQ1avU_004_001, which recorded this three times running.
+    (f"failed_transient: {_P5_5_REASON}", True),
+    # A predecessor stored as failed_parked: the hand was un-parked by a mark, and
+    # the gate text is still the same text.
+    (f"failed_parked: {_P5_5_REASON}", True),
+    # Same gate, different detail — a stochastic slip, which is what varies.
+    ("failed_transient: P5-5: all_in_mismatch: preflop action 2 SB all_in 4.0 "
+     "leaves 1.00 BB behind", False),
+    (f"failed_transient: {_P5_8_REASON}", False),
+    (_INFRA_MESSAGE, False),
+    ("complete: window=47s streets=preflop,flop,turn,river", False),
+    (None, False),
+])
+def test_only_an_identical_gate_message_counts_as_a_repeat(previous, repeats):
+    assert _repeats_previous_gate_failure(_P5_5_REASON, previous) is repeats
+
+
+def test_an_identical_repeat_is_permanent_and_says_why():
+    status, message = _gate_failure_outcome(
+        _P5_5_REASON, f"failed_transient: {_P5_5_REASON}", 0, 3
+    )
+    assert status == "failed_permanent"
+    # The gate prefix survives, or the per-gate report loses this hand's history.
+    assert _P5_5_REASON in message
+    assert "repeated identically" in message
+
+
+def test_an_identical_repeat_outranks_the_retry_cap():
+    """Both are terminal; this one carries the diagnosis."""
+    status, message = _gate_failure_outcome(
+        _P5_5_REASON, f"failed_transient: {_P5_5_REASON}", 2, 3
+    )
+    assert status == "failed_permanent"
+    assert "repeated identically" in message
+
+
+@pytest.mark.parametrize("previous", [None, _INFRA_MESSAGE, f"failed_transient: {_P5_8_REASON}"])
+def test_a_non_repeat_keeps_the_existing_transient_treatment(previous):
+    status, message = _gate_failure_outcome(_P5_5_REASON, previous, 0, 3)
+    assert status == "failed_transient"
+    assert message == f"failed_transient: {_P5_5_REASON}"
+
+
+@pytest.mark.parametrize("previous", [None, _INFRA_MESSAGE])
+def test_a_non_repeat_still_parks_at_the_cap(previous):
+    status, _ = _gate_failure_outcome(_P5_5_REASON, previous, 2, 3)
+    assert status == "failed_parked"
+
+
+def test_an_infrastructure_message_never_matches_however_often_it_repeats():
+    """429s, 5xx and connection resets legitimately repeat, and none of them is a
+    judgement about the hand. The gate-id prefix is what draws the line."""
+    assert _gate_failure_outcome(_P5_5_REASON, _INFRA_MESSAGE, 0, 3)[0] == "failed_transient"
+    assert _repeats_previous_gate_failure(_INFRA_MESSAGE, _INFRA_MESSAGE) is False
+
+
+def test_p5_14_is_out_of_scope_even_though_it_is_a_p5_gate():
+    """Its message names only a street, so a stochastic scan miss repeats
+    byte-identically — and Pro recovered 5 of 7 contested truncations on retry.
+    P5-14 writes its own status and never reaches _gate_failure_outcome; this
+    pins the decision rather than the plumbing."""
+    truncation = (
+        "P5-14: contested_street_unread: D reported turn but 2 scans found none, "
+        "and betting was still live there"
+    )
+    with _patched([_d_result()]) as mocks:   # a hand that does not reach P5-14
+        _call(_pending(previous_status_message=f"failed_transient: {truncation}"))
+    assert mocks.write_actions.call_count == 1
+
+
+def test_the_repeat_rule_fires_through_the_orchestrator():
+    """004_001's shape: the same gate message twice, so the second attempt ends
+    the hand instead of buying a third Pro call."""
+    bad = _d_result(actions=[
+        {"action_order": 1, "seat_position_label": "HJ",   # not a seat at this table
+         "action_type": "raise", "bet_amount": 2.5},
+    ])
+    reason = ("P5-1: action_label_unresolved: preflop action 1 names seat 'HJ', "
+              "which is not in this hand")
+    with _patched([bad]) as mocks:
+        outcome = _call(_pending(previous_status_message=f"failed_transient: {reason}"))
+
+    assert outcome == "failed_permanent"
+    assert mocks.clip.call_count == 1      # step D, and nothing after it
+    mocks.write_actions.assert_not_called()
+    row = _attempt_row(mocks)
+    assert row.status == "failed_permanent"
+    assert row.status_message.startswith(f"failed_permanent: {reason}")
+    assert "repeated identically" in row.status_message
+
+
+def test_a_mark_pending_row_is_not_the_previous_real_attempt():
+    """The pending query is what skips marks, so what this pins is the other
+    half: the prefix Phase 5 matches on is the message mark_pending writes. A
+    mark between two identical failures must not hide the repeat.
+
+    One definition, two readers — if they diverge, a mark counts as a real
+    attempt and a first genuine failure reads as a repeat.
+    """
+    for stage in ("tournament_results", "clip_manifest", "hand_setups",
+                  "hand_starts", "hand_actions"):
+        mark = f"{MARK_MESSAGE_PREFIX}{stage}"
+        assert mark.startswith(MARK_MESSAGE_PREFIX)
+        # And it is not mistakable for a gate failure or an outage.
+        assert _repeats_previous_gate_failure(_P5_5_REASON, mark) is False
 
 
 # ---------------------------------------------------------------------------
