@@ -496,7 +496,7 @@ Per hand setup: check preconditions, call Gemini on a bounded video window to fi
 ### Production files
 
 - `cli.py` — `tt process-hand-setups` subcommand
-- `hand_start_processing.py` — orchestration: `PendingHandSetup` (module-local frozen dataclass), `_find_pending_hand_setups`, `check_preconditions`, `_hallucination_guard`, `_transient_status`, `_write_attempt`, `process_hand_setup` (async, atomic per hand setup), `process_pending_hand_setups`
+- `hand_start_processing.py` — orchestration: `PendingHandSetup` (module-local frozen dataclass), `_find_pending_hand_setups`, `check_preconditions`, `check_fva`, `check_fva_amount`, `check_duplicate_hole_cards`, `check_missing_hole_cards`, `_hallucination_guard`, `_transient_status`, `_write_attempt`, `process_hand_setup` (async, atomic per hand setup), `process_pending_hand_setups`
 - `hand_starts_writer.py` — `hand_starts` table writes (replace semantics keyed on `hand_setup_id`; `verify_frame_gcs_paths` is REPEATED and goes through `ArrayQueryParameter`, never `None`)
 - `hand_setup_processing_attempts_writer.py` — `hand_setup_processing_attempts` state table writes
 - `card_normalization.py` — `normalize_card` / `normalize_cards`
@@ -504,7 +504,7 @@ Per hand setup: check preconditions, call Gemini on a bounded video window to fi
 - `seat_enrichment.py` — extended with `add_fva_seat_number`; `normalize_heads_up` gained an optional `fva` parameter
 - `prompts/identify_hand_start.md`, `prompts/extract_hole_cards.md`
 
-Shares `videos_downloader.py`, `frame_extractor.py`, `frame_uploader.py`, `gemini_caller.py`, `timestamp_utils.py`, and `bq_utils.py` with Phase 3.
+Shares `videos_downloader.py`, `frame_extractor.py`, `frame_uploader.py`, `gemini_caller.py`, `timestamp_utils.py`, and `bq_utils.py` with Phase 3, and `betting_state.py` with Phase 5 — P4-7 only, for the chip arithmetic.
 
 ### Test files
 
@@ -557,12 +557,17 @@ Three further preconditions were added with the gates, after those four and in t
 After step A returns, before the frame work:
 
 - **P4-4 `invalid_fva_action_type`** → `failed_transient`. The FVA's `action_type` must be `call`, `raise` or `all_in`, **and its `seat_position_label` must resolve to a seat in the hand.** The second half is not decoration: an unresolvable label leaves `seat_number` null, which the eligible-seat calculation reads as "every seat", so a bad label silently widens the hole-card read to the whole table. It also defeats `build_seats`, which marks the pre-FVA folds by seat number — so a bad label would make P5-16 demand cards for seats that folded long before the FVA.
+- **P4-7 `fva_amount_mismatch`** → `failed_transient`. An FVA recorded `all_in` must equal the seat's `stack_size` plus the blind it posted, within D6; and no FVA amount may exceed that. Forward only, like P5-5 — a whole-stack `call` or `raise` is a valid reading. Runs immediately after P4-4, which is what guarantees the label resolves.
 - **P4-5 `duplicate_hole_card`** → `failed_transient`, after the in-attempt retry, **case-folded** (see D4).
 - **P4-6 `missing_hole_cards_live_seat`** → `failed_permanent`, **scoped to the FVA seat's own hole cards**. Every other seat's null is carried into the row and judged by P5-16 once step D has said whether that seat stayed in. See H5 for the rule and "Null hole cards on a seat that stayed in" for how the scope got here.
 
 **Why P4-6 keeps only the FVA seat.** H5 asks whether a seat *stayed in* after the FVA, and Phase 4 cannot answer that: the actions do not exist until Phase 5 has run. The FVA seat is the one seat where the answer is structural — it is defined by a chip commitment, so it stayed in by construction — and that is the whole of what this gate can decide on its own. The retry is unchanged and still fires for a null on any eligible seat; only the judging narrowed.
 
-P4-4 fires before frame extraction and the hole-card call, so a bad FVA costs one clip call. When a hand carries both a duplicate and a missing card, P4-5 wins: giving the permanent gate precedence would discard a hand a retry could still fix.
+**Why P4-7 belongs in Phase 4 rather than Phase 5.** Phase 4 records exactly one action and nothing checked its amount, so the error was found a phase later and could never be fixed there. `YzKyFMQ1avU_014_003` recorded SB `all_in 17.1`; 17.1 is the stack *after* the 0.5 blind, so the total in front is 17.6, which is what step D read. The disagreement surfaced as P5-8, and **every Phase 5 retry failed identically on a Pro clip call**, because the fault was upstream of the retry. A Phase 4 redo produced 17.6. Both conditions of the gating principle hold — Phase 4 has the stack and the blind already, and a hand whose FVA amount is impossible would be excluded downstream regardless — and the error is random rather than deterministic, so `failed_transient` is the right class: Phase 4 read the same heads-up-blind situation correctly on `013_003`.
+
+**The blind arithmetic is `betting_state`'s, not restated.** `check_fva_amount` calls `build_seats`, so the blinds are identified by **role**: heads-up the BTN posts the small blind and `normalize_heads_up` has already left no seat labelled `SB`, so a label lookup would charge the BTN nothing and wave through a shove half a blind short. `Seat.chips_remaining` and `.all_in` are then the same properties P5-5 reads, which is what keeps the two gates from drifting. This is Phase 4's only import from `betting_state`, and it is a pure module rather than another phase's orchestrator.
+
+P4-4 fires before frame extraction and the hole-card call, so a bad FVA costs one clip call; P4-7 sits beside it for the same reason. When a hand carries both a duplicate and a missing card, P4-5 wins: giving the permanent gate precedence would discard a hand a retry could still fix.
 
 The null-stack check deliberately skips the **whole hand** when any single player has a null stack, rather than degrading to per-seat handling. Stacks are the per-seat anchor the hole-card prompt uses to identify seats, so a null stack means that seat's extraction context is unreliable. Whole-hand skip is preferred for simplicity, at an accepted small yield loss. Do not loosen this to per-seat handling without revisiting the hole-card prompt. A single-seat null stack also points at a per-seat gap in Phase 3's stack extraction for that frame.
 
@@ -1959,7 +1964,7 @@ the rule that a gate interprets but never rewrites what was extracted.
 
 ### D6 — amount tolerance
 
-`betting_state.GATE_AMOUNT_TOLERANCE_BB = 0.1`, shared by P5-5, P5-7 and P5-8.
+`betting_state.GATE_AMOUNT_TOLERANCE_BB = 0.1`, shared by P4-7, P5-5, P5-7 and P5-8.
 
 **Deliberately separate from, and looser than, the tolerance the DBT layer will
 calibrate.** The two serve opposite purposes: a dbt tolerance decides whether a

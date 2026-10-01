@@ -149,6 +149,14 @@ resolution problem."
 which did not exist before, so a higher skip count than the last run is expected
 rather than alarming. Run the per-gate report (below) to see which fired.
 
+**P4-7 is new and `failed_transient`** — an FVA whose amount cannot be the seat's
+whole stack plus its posted blind. A hit is a retry, not a skip, so it shows up in
+`failed_transient` rather than `complete_skipped`, and it parks at
+`--max-attempts` like any other. It is the gate that would have caught
+`YzKyFMQ1avU_014_003` here instead of as a P5-8 in step 5, where every retry cost
+a Pro call and failed identically. All 143 stored `hand_starts` FVA blocks pass
+it, so a hit on this run is news.
+
 **P4-6 now judges the FVA seat's hole cards only.** A null on any other seat
 completes here and is judged by P5-16 in step 5, so expect fewer P4-6 parks than
 the run that produced the current tables — and re-mark any hand parked by the

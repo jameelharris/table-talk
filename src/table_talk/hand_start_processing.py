@@ -21,6 +21,9 @@ from google.cloud import bigquery
 
 from ._generated.hand_setup_processing_attempts_row import HandSetupProcessingAttemptsRow
 from ._generated.hand_starts_row import HandStartsRow
+# Pure, no I/O, and deliberately shared: the chip arithmetic P4-7 needs is the
+# same arithmetic P5-5 reads, and restating it here would let the two drift.
+from .betting_state import GATE_AMOUNT_TOLERANCE_BB, build_seats
 from .card_normalization import normalize_cards
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
@@ -59,6 +62,7 @@ GATE_INVALID_LABEL_SET = "P4-3: invalid_label_set"
 GATE_INVALID_FVA_ACTION_TYPE = "P4-4: invalid_fva_action_type"
 GATE_DUPLICATE_HOLE_CARD = "P4-5: duplicate_hole_card"
 GATE_MISSING_HOLE_CARDS_LIVE_SEAT = "P4-6: missing_hole_cards_live_seat"
+GATE_FVA_AMOUNT_MISMATCH = "P4-7: fva_amount_mismatch"
 
 # identify_hand_start.md offers exactly these three. fold and check are
 # unreachable by definition — the FVA is the first *voluntary chip commitment*,
@@ -308,6 +312,62 @@ def check_fva(fva: dict, hand_setup_state: dict) -> str | None:
     return None
 
 
+def check_fva_amount(fva: dict, hand_setup_state: dict) -> str | None:
+    """P4-7. Return a reason the FVA's amount is impossible, or None.
+
+    The two conditions P5-5 keeps, applied to the one action this phase records:
+    an FVA recorded `all_in` must use up the seat's stack, and no FVA may commit
+    more than the stack plus the blind it posted. The reverse is deliberately not
+    checked here either — an FVA for the whole stack recorded `call` or `raise` is
+    a valid reading. See ARCHITECTURE, "P5-5 is one direction, plus
+    over-commitment."
+
+    Nothing checked this before, and the cost of that fell on Phase 5.
+    `YzKyFMQ1avU_014_003` recorded SB `all_in 17.1`, where 17.1 is the stack
+    *after* its 0.5 blind, so the total in front is 17.6 — which is what step D
+    then read. The disagreement surfaced as P5-8, and every Phase 5 retry failed
+    identically on a Pro call, because the error was a phase upstream of the
+    retry. A Phase 4 redo produced 17.6.
+
+    Transient: a random step-A slip, not a property of the window. Phase 4 read
+    the same heads-up-blind situation correctly on `013_003`.
+
+    **The arithmetic is `betting_state`'s, not restated.** `build_seats` applies
+    `posted_blind_for`, which identifies the blinds by ROLE — heads-up the BTN
+    posts the small blind and `normalize_heads_up` has already left no seat
+    labelled `SB` at all, so a label lookup would charge the BTN nothing and wave
+    through a shove half a blind short. `Seat.chips_remaining` and `.all_in` are
+    then the same properties P5-5 reads.
+
+    Runs after P4-4, which is what guarantees the label resolves to a seat.
+    """
+    bet_amount = fva.get("bet_amount")
+    if bet_amount is None:
+        return None  # nothing to compare; the FVA's shape is P4-4's business
+
+    seat = build_seats(hand_setup_state, fva)[fva["seat_position_label"]]
+    # build_seats seeded street_commitment with the posted blind, which stack_size
+    # is already net of; raising it to the FVA's amount is what replay_hand does
+    # for any preflop action, so chips_remaining and all_in now mean what they
+    # mean in Phase 5.
+    seat.street_commitment = max(seat.street_commitment, float(bet_amount))
+
+    if seat.chips_remaining < -GATE_AMOUNT_TOLERANCE_BB:
+        return (
+            f"{GATE_FVA_AMOUNT_MISMATCH}: {seat.label} {fva.get('action_type')} "
+            f"{bet_amount} is {abs(seat.chips_remaining):.2f} BB beyond its stack "
+            f"{seat.stack_size:g} plus the {seat.posted_blind:g} it posted"
+        )
+    if fva.get("action_type") == "all_in" and not seat.all_in:
+        return (
+            f"{GATE_FVA_AMOUNT_MISMATCH}: {seat.label} all_in {bet_amount} leaves "
+            f"{seat.chips_remaining:.2f} BB behind — stack {seat.stack_size:g} plus "
+            f"the {seat.posted_blind:g} it posted is "
+            f"{seat.stack_size + seat.posted_blind:g} in front"
+        )
+    return None
+
+
 def check_duplicate_hole_cards(eligible_players: list[dict]) -> str | None:
     """P4-5. Return a reason two seats hold the same card, or None.
 
@@ -521,6 +581,24 @@ async def process_hand_setup(
             status = _transient_status(hs.consecutive_failures, max_attempts)
             _write_attempt(
                 hs.hand_setup_id, status, f"{status}: {fva_reason}",
+                project_id=project_id, dataset=dataset,
+            )
+            return status
+
+        # P4-7, on the same step-A answer and also before any frame work: a bad
+        # FVA amount must not spend a HIGH-resolution hole-card read, and the
+        # error it catches is one Phase 5 can only rediscover at a Pro call.
+        #
+        # Sequential rather than folded into one loop with P4-4 on purpose:
+        # check_fva_amount resolves the FVA's label against the hand's seats, so
+        # it must not run on a label P4-4 has just rejected.
+        amount_reason = check_fva_amount(
+            hand_start_state["fva"], hand_start_state["hand_setup"]
+        )
+        if amount_reason is not None:
+            status = _transient_status(hs.consecutive_failures, max_attempts)
+            _write_attempt(
+                hs.hand_setup_id, status, f"{status}: {amount_reason}",
                 project_id=project_id, dataset=dataset,
             )
             return status

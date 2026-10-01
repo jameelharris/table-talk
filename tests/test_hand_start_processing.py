@@ -22,6 +22,7 @@ from table_talk.hand_start_processing import (
     _transient_status,
     check_duplicate_hole_cards,
     check_fva,
+    check_fva_amount,
     check_missing_hole_cards,
     check_preconditions,
     eligible_seats_at_fva,
@@ -1904,7 +1905,7 @@ def test_preconditions_first_failure_wins_and_null_stack_still_leads():
 
 
 # ---------------------------------------------------------------------------
-# P4-4 .. P4-6 — output checks
+# P4-4 .. P4-7 — output checks
 # ---------------------------------------------------------------------------
 
 
@@ -2016,6 +2017,99 @@ def test_p4_6_ignores_an_unreadable_card_off_the_fva_seat(cards):
         {"seat_position_label": "SB", "hole_cards": ["2c", "3c"]},
     ]
     assert check_missing_hole_cards(players, "SB") is None
+
+
+_SEAT_NUMBERS = {"BB": 1, "SB": 2, "BTN": 3, "CO": 4, "HJ": 5, "LJ": 6}
+
+
+def _stacked(total_seat_count: int, stacks: dict[str, float]) -> dict:
+    """A hand setup carrying stacks and seat numbers. Seat numbers are what
+    posted_blind_for reads, since the blinds go by role and not by label."""
+    return {
+        "total_seat_count": total_seat_count,
+        "pot_size_bb": 1.5,
+        "players": [
+            {"seat_position_label": label, "seat_number": _SEAT_NUMBERS[label],
+             "stack_size": stack}
+            for label, stack in stacks.items()
+        ],
+    }
+
+
+def _fva_amount(label: str, action_type: str, bet_amount) -> dict:
+    return {
+        "seat_position_label": label, "seat_number": _SEAT_NUMBERS[label],
+        "action_type": action_type, "bet_amount": bet_amount,
+    }
+
+
+@pytest.mark.parametrize("seats,stacks,label,amount,hits", [
+    # YzKyFMQ1avU_014_003 as recorded, and corrected. 17.1 is the stack *after*
+    # the 0.5 blind, so the total in front is 17.6 — what step D read.
+    (6, {"BB": 20.0, "SB": 17.1, "BTN": 9.0, "CO": 15.0, "HJ": 11.0, "LJ": 8.0},
+     "SB", 17.1, True),
+    (6, {"BB": 20.0, "SB": 17.1, "BTN": 9.0, "CO": 15.0, "HJ": 11.0, "LJ": 8.0},
+     "SB", 17.6, False),
+    # Heads-up, where the BTN posts the small blind and normalize_heads_up has
+    # left no seat labelled SB at all. A label-based blind lookup charges the BTN
+    # nothing and would wave through the 20.0 — half a blind short.
+    (2, {"BB": 30.0, "BTN": 20.0}, "BTN", 20.5, False),
+    (2, {"BB": 30.0, "BTN": 20.0}, "BTN", 20.0, True),
+    (2, {"BB": 20.0, "BTN": 30.0}, "BB", 21.0, False),
+    (2, {"BB": 20.0, "BTN": 30.0}, "BB", 20.0, True),
+    # A seat that posted nothing: the whole stack is the whole amount.
+    (6, {"BB": 20.0, "SB": 10.0, "BTN": 9.0, "CO": 15.0, "HJ": 11.0, "LJ": 8.0},
+     "CO", 15.0, False),
+])
+def test_p4_7_an_all_in_must_equal_the_stack_plus_the_blind_posted_by_role(
+    seats, stacks, label, amount, hits
+):
+    reason = check_fva_amount(_fva_amount(label, "all_in", amount),
+                              _stacked(seats, stacks))
+    if hits:
+        assert reason.startswith("P4-7: fva_amount_mismatch: ")
+        assert label in reason and "behind" in reason
+    else:
+        assert reason is None
+
+
+@pytest.mark.parametrize("action_type", ["call", "raise", "all_in"])
+def test_p4_7_no_fva_may_commit_more_than_the_stack_plus_its_blind(action_type):
+    """The over-commitment shape, which is a different defect from being wrongly
+    labelled all-in and gets its own message — the same split P5-5 makes."""
+    reason = check_fva_amount(
+        _fva_amount("SB", action_type, 20.0),
+        _stacked(3, {"BB": 20.0, "SB": 17.1, "BTN": 9.0}),
+    )
+    assert reason.startswith("P4-7: fva_amount_mismatch: ")
+    assert "beyond its stack" in reason
+
+
+@pytest.mark.parametrize("action_type", ["call", "raise"])
+def test_p4_7_a_whole_stack_call_or_raise_is_accepted(action_type):
+    """Forward only, consistent with P5-5: an FVA for the seat's whole stack need
+    not be recorded all_in. YzKyFMQ1avU_013_003's shape, one phase earlier."""
+    assert check_fva_amount(
+        _fva_amount("BB", action_type, 8.03),
+        _stacked(3, {"BB": 7.03, "SB": 20.0, "BTN": 15.0}),
+    ) is None
+
+
+def test_p4_7_tolerates_display_rounding():
+    """0.05 short of the stack, inside GATE_AMOUNT_TOLERANCE_BB. The corpus has a
+    shove recorded 4.55 against 4.6 behind; see D6."""
+    assert check_fva_amount(
+        _fva_amount("SB", "all_in", 17.55),
+        _stacked(3, {"BB": 20.0, "SB": 17.1, "BTN": 9.0}),
+    ) is None
+
+
+def test_p4_7_a_null_bet_amount_is_not_this_gates_business():
+    """There is nothing to compare. The FVA's shape is P4-4's."""
+    assert check_fva_amount(
+        _fva_amount("SB", "all_in", None),
+        _stacked(3, {"BB": 20.0, "SB": 17.1, "BTN": 9.0}),
+    ) is None
 
 
 def test_eligible_seats_at_fva_is_the_seats_from_the_fva_onwards():
@@ -2133,3 +2227,54 @@ def test_p4_5_duplicate_in_the_orchestrator_is_transient_and_writes_no_row():
     assert outcome == "failed_transient"
     mock_write_starts.assert_not_called()
     assert "P4-5: duplicate_hole_card: " in mock_attempt.call_args[0][0].status_message
+
+
+def test_p4_7_fires_before_any_frame_work():
+    """Same argument as P4-4's: the saved call is the point. An FVA amount that
+    cannot be right must not pay for the ULTRA_HIGH hole-card read — and Phase 5
+    can only rediscover this error at a Pro call, where every retry fails
+    identically because the fault is upstream of the retry."""
+    # BTN holds 50.0 and posts the 0.5 small blind heads-up, so an all-in is 50.5.
+    bad_amount = {**_CLIP_RESULT_FOUND, "action_type": "all_in", "bet_amount": 50.0}
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=bad_amount),
+        patch("table_talk.hand_start_processing.extract_frame") as mock_extract,
+        patch("table_talk.hand_start_processing.call_gemini_for_frame") as mock_frame,
+        patch("table_talk.hand_start_processing.upload_frame") as mock_upload,
+        patch("table_talk.hand_start_processing.write_hand_starts") as mock_write_starts,
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+        ))
+
+    assert outcome == "failed_transient"
+    mock_extract.assert_not_called()
+    mock_frame.assert_not_called()
+    mock_upload.assert_not_called()
+    mock_write_starts.assert_not_called()
+    assert mock_attempt.call_args[0][0].status_message.startswith(
+        "failed_transient: P4-7: fva_amount_mismatch: "
+    )
+
+
+def test_p4_7_parks_at_the_cap_like_any_other_transient():
+    bad_amount = {**_CLIP_RESULT_FOUND, "action_type": "all_in", "bet_amount": 50.0}
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=bad_amount),
+        patch("table_talk.hand_start_processing.write_hand_starts"),
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row") as mock_attempt,
+    ):
+        outcome = _run(process_hand_setup(
+            _HS_AT_CAP, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+            max_attempts=3,
+        ))
+
+    assert outcome == "failed_parked"
+    assert "P4-7: fva_amount_mismatch: " in mock_attempt.call_args[0][0].status_message
