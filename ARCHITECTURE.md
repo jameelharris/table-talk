@@ -1151,6 +1151,14 @@ Phase 5 over the rebuilt corpus: 57 of 58 `hand_starts` complete, one `failed_pe
 - `test_smoke.py` — version sanity check
 - `test_integrity.py` — the integrity checks
 - `test_mark_pending.py` — the reprocessing cascade
+- `test_integration_call_signatures.py` — a static guard that every
+  integration-marked call site still supplies every required argument. The
+  default run deselects integration tests, so a signature change that breaks one
+  of their call sites is otherwise invisible until the next real-GCP run: that is
+  how five of them came to be calling four orchestrators without the
+  `prompt_hashes` that provenance had made required. It checks presence only,
+  never types or values, and reads the test files as text rather than importing
+  them.
 
 ### Idempotent stage writes
 
