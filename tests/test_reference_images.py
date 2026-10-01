@@ -1,4 +1,4 @@
-# The reference images accompany extract_community_cards.md's video scan, and
+# The reference images accompany identify_community_cards.md's video scan, and
 # gemini_caller wraps each label as "Reference image — {label}:". These tests use
 # synthetic files under tmp_path rather than the real references/ directory, so
 # the suite does not depend on operator-supplied assets.

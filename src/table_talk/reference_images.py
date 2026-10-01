@@ -34,7 +34,7 @@ def _mime_type_for(path: Path) -> str:
 def load_reference_images(references_dir: Path) -> list[tuple[bytes, str, str]]:
     """Load the street reference images as (bytes, mime_type, label) tuples.
 
-    Ordered flop, turn, river — the order extract_community_cards.md describes
+    Ordered flop, turn, river — the order identify_community_cards.md describes
     them in. A missing file raises FileNotFoundError naming the path; this never
     returns a short list or a None entry, because a silently absent reference
     would degrade the scan without failing it.

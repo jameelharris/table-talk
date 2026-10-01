@@ -281,7 +281,7 @@ def main() -> None:
         prompt_paths = {}
         for name in (
             "extract_player_actions",
-            "extract_community_cards",
+            "identify_community_cards",
             "extract_community_cards_from_frame",
         ):
             path = prompts_dir / f"{name}.md"
@@ -319,8 +319,8 @@ def main() -> None:
                 videos_bucket=args.videos_bucket,
                 hand_actions_bucket=args.hand_actions_bucket,
                 extract_player_actions_prompt=prompt_paths["extract_player_actions"].read_text(),
-                extract_community_cards_prompt=prompt_paths[
-                    "extract_community_cards"
+                identify_community_cards_prompt=prompt_paths[
+                    "identify_community_cards"
                 ].read_text(),
                 extract_community_cards_from_frame_prompt=prompt_paths[
                     "extract_community_cards_from_frame"

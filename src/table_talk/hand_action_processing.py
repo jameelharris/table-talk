@@ -882,7 +882,7 @@ async def process_hand_start(
     videos_bucket: str,
     hand_actions_bucket: str,
     extract_player_actions_prompt: str,
-    extract_community_cards_prompt: str,
+    identify_community_cards_prompt: str,
     extract_community_cards_from_frame_prompt: str,
     reference_images: list[tuple[bytes, str, str]] | None = None,
     *,
@@ -1014,7 +1014,7 @@ async def process_hand_start(
                 project_id,
                 postflop_streets,
                 window_end,
-                extract_community_cards_prompt,
+                identify_community_cards_prompt,
                 extract_community_cards_from_frame_prompt,
                 reference_images,
                 frame_tmpdir,
@@ -1088,7 +1088,7 @@ async def process_hand_start(
             media_resolution = {"clip": CLIP_MEDIA_RESOLUTION}
             if step_e_ran:
                 prompt_files += [
-                    "prompts/extract_community_cards.md",
+                    "prompts/identify_community_cards.md",
                     "prompts/extract_community_cards_from_frame.md",
                     *(
                         f"references/{reference_image_filename(street)}"
@@ -1187,7 +1187,7 @@ async def process_pending_hand_starts(
     videos_bucket: str,
     hand_actions_bucket: str,
     extract_player_actions_prompt: str,
-    extract_community_cards_prompt: str,
+    identify_community_cards_prompt: str,
     extract_community_cards_from_frame_prompt: str,
     reference_images: list[tuple[bytes, str, str]] | None = None,
     *,
@@ -1277,7 +1277,7 @@ async def process_pending_hand_starts(
                         videos_bucket,
                         hand_actions_bucket,
                         extract_player_actions_prompt,
-                        extract_community_cards_prompt,
+                        identify_community_cards_prompt,
                         extract_community_cards_from_frame_prompt,
                         reference_images,
                         prompt_hashes=prompt_hashes,

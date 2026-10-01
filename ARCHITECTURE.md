@@ -761,7 +761,7 @@ Per hand start: check preconditions, run step D over the whole hand window for t
 - `reference_images.py` — `load_reference_images`, `STREET_REFERENCE_ORDER`, `reference_image_filename`
 - `prompt_context.py` — extended with `build_action_context` (position, stack and hole cards per seat) and `build_prior_cards_context`
 - `seat_enrichment.py` — extended with `heads_up_label`, the pure SB-is-BTN rule `normalize_heads_up` now rewrites through
-- `prompts/extract_player_actions.md`, `prompts/extract_community_cards.md`, `prompts/extract_community_cards_from_frame.md`
+- `prompts/extract_player_actions.md`, `prompts/identify_community_cards.md`, `prompts/extract_community_cards_from_frame.md`
 - `references/{flop,turn,river}_reference.jpeg`
 
 Shares `videos_downloader.py`, `frame_extractor.py`, `frame_uploader.py`, `gemini_caller.py`, `timestamp_utils.py`, `card_normalization.py`, and `bq_utils.py` with Phases 3 and 4.
@@ -837,7 +837,7 @@ A null community card is categorically more serious than a null hole card: the b
 
 ### Reference images
 
-Three universal JPEGs showing what flop, turn and river look like in a PokerStars broadcast, versioned with code in `references/`. `call_gemini_for_clip` emits a text part reading `Reference image — {label}:` before each blob, matching the wording `extract_community_cards.md` uses to describe them. That correspondence is what binds each description to its image; `test_reference_image_label_wording_matches_the_scan_prompt` asserts the rendered labels appear verbatim in the prompt file.
+Three universal JPEGs showing what flop, turn and river look like in a PokerStars broadcast, versioned with code in `references/`. `call_gemini_for_clip` emits a text part reading `Reference image — {label}:` before each blob, matching the wording `identify_community_cards.md` uses to describe them. That correspondence is what binds each description to its image; `test_reference_image_label_wording_matches_the_scan_prompt` asserts the rendered labels appear verbatim in the prompt file.
 
 That test is **not** an exception to "prompts have no automated tests." It asserts a code-to-prompt *interface* contract, not prompt content or quality. Rewording either side would otherwise unbind the descriptions from the images silently, degrading street detection corpus-wide with no error anywhere. Do not delete it for violating a rule it does not violate.
 
@@ -1007,7 +1007,7 @@ Phase 5 over the rebuilt corpus: 57 of 58 `hand_starts` complete, one `failed_pe
   - Payout extraction — `extract_results.md`
   - Phase 3 — `identify_hand.md`, `extract_player_info.md`, `extract_player_info_bounty_addendum.md` (concatenated onto the previous only when `bounty_type = 'progressive'`)
   - Phase 4 — `identify_hand_start.md`, `extract_hole_cards.md`
-  - Phase 5 — `extract_player_actions.md` (step D), `extract_community_cards.md` (step E's scan), `extract_community_cards_from_frame.md` (step E's read)
+  - Phase 5 — `extract_player_actions.md` (step D), `identify_community_cards.md` (step E's scan), `extract_community_cards_from_frame.md` (step E's read)
 
 ### Test files
 

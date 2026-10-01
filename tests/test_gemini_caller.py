@@ -310,13 +310,13 @@ def test_clip_with_reference_images_labels_each_blob_and_keeps_text_last():
 def test_reference_image_label_wording_matches_the_scan_prompt():
     """The label binds each image to its description in the scan prompt.
 
-    extract_community_cards.md's STREET VISUAL REFERENCE section names the
+    identify_community_cards.md's STREET VISUAL REFERENCE section names the
     images with this exact string. Rewording either side silently unbinds the
     descriptions from the images, and the resulting degradation would be hard
     to attribute — so the correspondence is asserted rather than commented.
     """
     prompt_text = (
-        Path(__file__).resolve().parents[1] / "prompts" / "extract_community_cards.md"
+        Path(__file__).resolve().parents[1] / "prompts" / "identify_community_cards.md"
     ).read_text(encoding="utf-8")
 
     for street in ("flop", "turn", "river"):
