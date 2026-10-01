@@ -11,6 +11,7 @@ from google.cloud import bigquery
 
 from table_talk.frame_extractor import FrameExtractionError
 from table_talk.gemini_caller import GeminiPermanentError, GeminiTransientError
+from table_talk.provenance import hash_files
 from table_talk.videos_downloader import DownloadPermanentError
 from table_talk.hand_setup_processing import (
     PendingClip,
@@ -894,12 +895,22 @@ async def _integration_body():
     # the materialization gate guarantees this row precedes any clip.
     _write_payout_row(bq_client, video_id, project, dataset)
 
-    prompts_dir = __import__("pathlib").Path(__file__).resolve().parents[1] / "prompts"
-    identify_hand_prompt = (prompts_dir / "identify_hand.md").read_text()
-    extract_player_info_prompt = (prompts_dir / "extract_player_info.md").read_text()
-    bounty_addendum = (
-        prompts_dir / "extract_player_info_bounty_addendum.md"
-    ).read_text()
+    repo_root = __import__("pathlib").Path(__file__).resolve().parents[1]
+    prompts_dir = repo_root / "prompts"
+    identify_hand_path = prompts_dir / "identify_hand.md"
+    extract_player_info_path = prompts_dir / "extract_player_info.md"
+    bounty_addendum_path = prompts_dir / "extract_player_info_bounty_addendum.md"
+    identify_hand_prompt = identify_hand_path.read_text()
+    extract_player_info_prompt = extract_player_info_path.read_text()
+    bounty_addendum = bounty_addendum_path.read_text()
+    # Real hashes from the files this run actually loads, as the CLI computes
+    # them: all three, because which of them a row names depends on the video's
+    # bounty_type, and a path the phase selects but the caller never hashed
+    # raises rather than silently under-reporting.
+    prompt_hashes = hash_files(
+        [identify_hand_path, extract_player_info_path, bounty_addendum_path],
+        repo_root,
+    )
 
     try:
         stats = await process_pending_clips(
@@ -910,6 +921,7 @@ async def _integration_body():
             identify_hand_prompt=identify_hand_prompt,
             extract_player_info_prompt=extract_player_info_prompt,
             extract_player_info_bounty_addendum=bounty_addendum,
+            prompt_hashes=prompt_hashes,
             only_clip_ids=[clip_id],
         )
 

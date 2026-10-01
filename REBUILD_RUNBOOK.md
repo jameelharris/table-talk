@@ -331,12 +331,17 @@ against a stored value:
 
 ```sql
 SELECT DISTINCT
-  JSON_VALUE(hand_action_state, '$.provenance.prompts["prompts/extract_player_actions.md"]')
+  JSON_VALUE(hand_action_state, '$.provenance.prompts."prompts/extract_player_actions.md"')
 FROM `table-talk-497020.table_talk_dev.hand_actions`
 ```
 
 One distinct value, equal to the `git hash-object` output at the commit the run
 used.
+
+**The key is a double-quoted member, not a bracket.** Provenance keys carry
+slashes and a dot, and BigQuery's JSONPath has no `["..."]` form — writing it that
+way fails with `400 Invalid JSON Path`. This query carried the bracket form until
+it was first run.
 
 ### 7 — every street carries `extraction_status`, none `unread`
 

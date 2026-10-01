@@ -36,6 +36,8 @@ from table_talk.hand_action_processing import (
     process_pending_hand_starts,
 )
 from table_talk.mark_pending import MARK_MESSAGE_PREFIX
+from table_talk.provenance import hash_files
+from table_talk.reference_images import STREET_REFERENCE_ORDER, reference_image_filename
 from table_talk.videos_downloader import DownloadPermanentError
 
 _FVA = {"seat_position_label": "CO", "seat_number": 4, "action_type": "raise", "bet_amount": 2.5}
@@ -68,6 +70,31 @@ def _hand_start_state(total_seat_count=6, fva=_FVA, players=None):
     if fva is not None:
         state["fva"] = dict(fva)
     return state
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _real_prompt_hashes() -> dict[str, str]:
+    """What the CLI would pass, computed from the files on disk.
+
+    Real rather than the stub `_P5_HASHES` the unit tests use, so the integration
+    tests exercise provenance end to end: step E's prompts and all three
+    reference images are listed, because that is the set a `complete` row names,
+    and `select` raises on a path the caller never hashed.
+    """
+    prompts_dir = _REPO_ROOT / "prompts"
+    references_dir = _REPO_ROOT / "references"
+    return hash_files(
+        [
+            prompts_dir / "extract_player_actions.md",
+            prompts_dir / "identify_community_cards.md",
+            prompts_dir / "extract_community_cards.md",
+            *(references_dir / reference_image_filename(street)
+              for street in STREET_REFERENCE_ORDER),
+        ],
+        _REPO_ROOT,
+    )
 
 
 _P5_HASHES = {
@@ -1467,6 +1494,7 @@ def test_process_pending_hand_starts_precondition_skip_integration():
                 identify_community_cards_prompt="UNUSED {street_name}",
                 extract_community_cards_prompt="UNUSED {prior_cards}",
                 reference_images=[],
+                prompt_hashes=_real_prompt_hashes(),
                 only_hand_start_ids=[ids.hand_start_id],
                 bq_client=bq_client,
                 gcs_client=gcs_client,
@@ -1552,6 +1580,7 @@ def test_process_pending_hand_starts_integration():
                     prompts_dir / "extract_community_cards.md"
                 ).read_text(),
                 reference_images=load_reference_images(references_dir),
+                prompt_hashes=_real_prompt_hashes(),
                 only_hand_start_ids=[ids.hand_start_id],
                 bq_client=bq_client,
                 gcs_client=gcs_client,

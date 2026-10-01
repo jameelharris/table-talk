@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -28,12 +29,28 @@ from table_talk.payout_processing import (
     process_pending_videos,
     process_video,
 )
+from table_talk.provenance import hash_files
 from table_talk.videos_downloader import DownloadPermanentError
 
 _PROMPT = "RESULTS PANEL PROMPT"
 _BUCKET = "tournament-results-bucket"
 _HASHES = {"prompts/extract_results.md": "0123456789ab"}
+
 _LONG_ENOUGH = 3000
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_EXTRACT_RESULTS_PATH = _REPO_ROOT / "prompts" / "extract_results.md"
+
+
+def _real_prompt_hashes() -> dict[str, str]:
+    """What the CLI would pass, computed from the file on disk.
+
+    Real rather than the stub `_HASHES` the unit tests use, because the
+    integration tests write the row: the hash passed here is the hash stored in
+    it, so provenance is exercised end to end and a path the phase names but the
+    caller never hashed fails here exactly as it would in production.
+    """
+    return hash_files([_EXTRACT_RESULTS_PATH], _REPO_ROOT)
 
 
 def _panel(**overrides):
@@ -976,6 +993,7 @@ def test_precondition_skip_end_to_end_makes_no_gemini_call():
                     _INTEGRATION_VIDEOS_BUCKET,
                     _INTEGRATION_RESULTS_BUCKET,
                     _PROMPT,
+                    prompt_hashes=_real_prompt_hashes(),
                     video_id=video_id,
                     bq_client=bq_client,
                     gcs_client=gcs_client,
@@ -1038,19 +1056,28 @@ def test_frame_is_retained_in_gcs_at_the_deterministic_path():
                     _INTEGRATION_PROJECT,
                     _INTEGRATION_DATASET,
                     _INTEGRATION_RESULTS_BUCKET,
-                    _PROMPT,
+                    _EXTRACT_RESULTS_PATH.read_text(),
+                    prompt_hashes=_real_prompt_hashes(),
                 )
             )
 
         assert outcome == "complete"
         assert blob.exists()
 
+        # The provenance key carries slashes and a dot, so it is a double-quoted
+        # member — `prompts."prompts/extract_results.md"`. BigQuery's JSONPath has
+        # no bracket-with-quotes form: `prompts["..."]` is a 400 Invalid JSON Path.
         rows = list(bq_client.query(
-            f"SELECT frame_gcs_path FROM `{_INTEGRATION_PROJECT}.{_INTEGRATION_DATASET}."
+            f"SELECT frame_gcs_path, JSON_VALUE(tournament_results_state, "
+            f"'$.provenance.prompts.\"prompts/extract_results.md\"') AS prompt_hash "
+            f"FROM `{_INTEGRATION_PROJECT}.{_INTEGRATION_DATASET}."
             f"tournament_results` WHERE video_id = '{video_id}'"
         ).result())
         assert len(rows) == 1
         assert rows[0].frame_gcs_path == expected_uri
+        # The hash the caller passed is the hash the row carries, and it is the
+        # one `git hash-object prompts/extract_results.md` prints.
+        assert rows[0].prompt_hash == _real_prompt_hashes()["prompts/extract_results.md"]
 
         # Reprocess: the stable path overwrites rather than adding a second
         # object, which is what keeps reprocessing non-orphaning.
@@ -1071,7 +1098,8 @@ def test_frame_is_retained_in_gcs_at_the_deterministic_path():
                     _INTEGRATION_PROJECT,
                     _INTEGRATION_DATASET,
                     _INTEGRATION_RESULTS_BUCKET,
-                    _PROMPT,
+                    _EXTRACT_RESULTS_PATH.read_text(),
+                    prompt_hashes=_real_prompt_hashes(),
                 )
             ) == "complete"
 
