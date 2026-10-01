@@ -457,7 +457,8 @@ def test_t584_sb_showing_11_1_raises_to_7_then_shoves_4_55_on_the_flop():
 def test_a_transposed_raise_and_shove_does_not_exhaust_the_stack():
     """The same hand with the pair swapped: 4.55 preflop and 6.55 on the flop.
     The flop action is recorded as an all_in but leaves chips behind, which is
-    what P5-5 catches in the reverse direction."""
+    what P5-5's forward branch catches — and, since P5-5 no longer checks the
+    reverse direction, the only branch that catches a transposed pair."""
     replay = replay_hand(
         _setup({"BB": 20.0, "SB": 11.1, "BTN": 15.0}),
         _fva("SB", "raise", 4.55),

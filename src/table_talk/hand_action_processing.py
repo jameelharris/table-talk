@@ -400,12 +400,25 @@ def _check_amount_types(replay) -> str | None:
 
 
 def _check_all_in(replay) -> str | None:
-    """P5-5. All-in if and only if the stack runs out, and never more than it.
+    """P5-5. An action recorded all_in must use up the stack, and no action may
+    commit more than it.
 
-    Both directions. Forward catches an all_in that leaves chips behind; reverse
-    catches a shove recorded as a raise, which is how a transposed raise/all-in
-    pair presents. Over-commitment is a third shape and gets its own message —
-    a seat cannot put in more than it holds.
+    One direction only. An all_in that leaves chips behind is wrong, and so is
+    over-commitment — a seat cannot put in more than it holds. The converse is
+    NOT checked: an action that exhausts the stack need not be recorded all_in.
+
+    That reverse check was removed. A call or raise for a player's whole stack is
+    validly described either way — on YzKyFMQ1avU_013_003 the BB called a shove
+    with exactly its stack (7.03 behind plus its 1 BB blind) and the broadcast's
+    own label changes from "Call" to "All-in" as it lands — so it failed a
+    correct reading, and a retry passed only because step D happened to write
+    all_in the second time. Phase 6 derives is_all_in from this same arithmetic
+    rather than from action_type, so nothing downstream needs the label to agree.
+
+    The transposed raise/all-in pair it was added for is still caught, by the
+    forward branch: a swap puts an all_in label on the action that does *not*
+    exhaust its stack. What is no longer caught is a one-sided mislabel of a
+    whole-stack commitment, which is the reading above.
     """
     for street in replay.streets:
         for a in street.actions:
@@ -421,14 +434,6 @@ def _check_all_in(replay) -> str | None:
                     f"{a.action_order} {a.seat_label} all_in {a.bet_amount} leaves "
                     f"{a.chips_remaining_after:.2f} BB behind"
                 )
-            if a.action_type in _COMMITTING_TYPES and a.action_type != "all_in":
-                if a.exhausts_stack:
-                    return (
-                        f"{GATE_ALL_IN_MISMATCH}: {street.street_name} action "
-                        f"{a.action_order} {a.seat_label} {a.action_type} "
-                        f"{a.bet_amount} exhausts the stack but is not recorded "
-                        f"all_in"
-                    )
     return None
 
 

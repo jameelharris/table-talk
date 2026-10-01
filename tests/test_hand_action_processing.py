@@ -1995,16 +1995,53 @@ def test_p5_5_an_all_in_that_leaves_chips_behind():
     assert "leaves" in reason
 
 
-def test_p5_5_a_commitment_that_exhausts_the_stack_but_is_not_called_all_in():
-    """The reverse direction."""
-    streets = [{"street_name": "preflop",
-                "actions": _acts(("BTN", "raise", 20.0), ("SB", "fold", 0.0),
-                                 ("BB", "fold", 0.0))}]
-    fva = {"seat_position_label": "BTN", "seat_number": 3,
-           "action_type": "raise", "bet_amount": 20.0}
-    reason = _gate(streets, fva=fva)
+def test_p5_5_a_transposed_raise_and_all_in_pair_is_still_caught():
+    """The case the removed reverse check was added for. ARCHITECTURE's t=584
+    hand with its two amounts swapped: the truth is a raise to 7 preflop and a
+    4.55 shove on the flop, so a transposition labels the *smaller* flop action
+    all_in, where it leaves 0.5 behind. The forward branch has it — a swap always
+    puts the all_in label on the action that does not exhaust the stack."""
+    setup = {
+        "total_seat_count": 3,
+        "pot_size_bb": 1.5,
+        "players": [
+            {"seat_number": 1, "seat_position_label": "BB", "stack_size": 20.0},
+            {"seat_number": 2, "seat_position_label": "SB", "stack_size": 11.1},
+            {"seat_number": 3, "seat_position_label": "BTN", "stack_size": 15.0},
+        ],
+    }
+    fva = {"seat_position_label": "SB", "seat_number": 2,
+           "action_type": "raise", "bet_amount": 4.55}
+    streets = [
+        {"street_name": "preflop",
+         "actions": _acts(("SB", "raise", 4.55), ("BB", "call", 4.55))},
+        {"street_name": "flop",
+         "actions": _acts(("SB", "all_in", 6.55), ("BB", "call", 6.55))},
+    ]
+    reason = _gate(streets, winners=("SB",), setup=setup, fva=fva)
     assert reason.startswith("P5-5: all_in_mismatch: ")
-    assert "not recorded" in reason
+    assert "leaves" in reason
+
+
+def test_p5_5_a_whole_stack_call_recorded_as_call_is_accepted():
+    """YzKyFMQ1avU_013_003, the hand the reverse check failed. The BB calls a
+    shove with exactly its stack — 7.03 behind plus its 1 BB blind — and the
+    broadcast's own label changes from "Call" to "All-in" as it lands. Either
+    label is a correct reading, so the sequence must pass."""
+    setup = {
+        "total_seat_count": 3,
+        "pot_size_bb": 1.5,
+        "players": [
+            {"seat_number": 1, "seat_position_label": "BB", "stack_size": 7.03},
+            {"seat_number": 2, "seat_position_label": "SB", "stack_size": 20.0},
+            {"seat_number": 3, "seat_position_label": "BTN", "stack_size": 15.0},
+        ],
+    }
+    fva = {"seat_position_label": "SB", "seat_number": 2,
+           "action_type": "all_in", "bet_amount": 20.5}
+    streets = [{"street_name": "preflop",
+                "actions": _acts(("SB", "all_in", 20.5), ("BB", "call", 8.03))}]
+    assert _gate(streets, winners=("SB",), setup=setup, fva=fva) is None
 
 
 def test_p5_5_committing_more_than_the_stack():

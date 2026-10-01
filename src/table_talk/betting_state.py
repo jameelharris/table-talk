@@ -124,7 +124,9 @@ class ActionReplay:
     largest_before: float
     owed_before: float
     # True when the amount committed exhausts the seat's stack, whatever the
-    # extracted action_type said. The two disagreeing is what P5-5 catches.
+    # extracted action_type said. An action recorded all_in while this is False
+    # is what P5-5 catches; the converse is deliberately not gated, since a
+    # whole-stack call or raise is validly described either way.
     exhausts_stack: bool
     # What the seat has left afterwards. Negative beyond the tolerance means it
     # committed more than it held, which is a different defect from being

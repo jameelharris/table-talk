@@ -928,6 +928,39 @@ recycled — reusing it would make the per-gate report ambiguous between two
 different checks. **P5-16 is therefore the next number allocated, not the
 second-to-last**, and P5-11 stays unused permanently.
 
+### P5-5 is one direction, plus over-commitment
+
+**The reverse check was removed (2026-10-01).** P5-5 shipped with three branches:
+an action recorded `all_in` must exhaust the stack (forward), no action may commit
+more than the stack (over-commitment), and an action that exhausts the stack must
+be recorded `all_in` (reverse). The first two remain; the third is gone.
+
+`YzKyFMQ1avU_013_003` is why. The BB called an SB shove with exactly its whole
+stack — 7.03 behind plus its 1 BB blind, so 8.03 in front — and step D recorded
+`call`. The reverse branch failed the hand; on the retry step D happened to write
+`all_in` and the same hand passed. The broadcast's own label changes from "Call"
+to "All-in" as the chips land, so **a call or raise for a player's whole stack is
+validly described either way**, and the gate was failing a correct reading on a
+coin flip. Phase 6 derives `is_all_in` from the chip arithmetic rather than from
+the extracted `action_type` — see D2 — so nothing downstream needs the label to
+agree.
+
+**The transposed raise/all-in pair it was added for is still caught, by the
+forward branch.** A swap between two actions necessarily puts the `all_in` label
+on the action that does *not* exhaust the stack, which is exactly branch one;
+`test_p5_5_a_transposed_raise_and_all_in_pair_is_still_caught` asserts it on
+ARCHITECTURE's own t=584 hand with its two amounts swapped. The removal was
+conditional on that holding.
+
+What is no longer detected is a **one-sided** mislabel of a whole-stack
+commitment — a true shove recorded as `raise` or `call` for the exact stack.
+That is not a loss, because it is the same reading `013_003` shows to be
+legitimate: the gate could not distinguish it from a correct answer, which is why
+it had to go rather than be narrowed.
+
+It fired on 0 of the 133 pre-rebuild hands, so the baseline table below is
+unchanged by this.
+
 ### P5-16 — the hole-card gate
 
 `check_missing_hole_cards` runs immediately after the step-D gates and before
@@ -1870,6 +1903,10 @@ Conventions it encodes, each of which has cost debugging time at least once:
   not its last — a seat that bets 3 and then folds to a raise committed 3, and
   its fold carries 0.0.
 - **All-in when the chips gone from the stack equal `stack_size`** within D6.
+  The converse does not hold: an action that exhausts the stack need not be
+  recorded `all_in`, and P5-5 no longer requires it — see "P5-5 is one direction,
+  plus over-commitment." **Phase 6 must derive `is_all_in` from this arithmetic**
+  and must not read the extracted `action_type` as authoritative.
 - **Preflop the amount owed starts at 1** (the BB). The blinds are mandatory
   posts, not voluntary actions; every preflop voluntary action is a fold, call or
   raise, and **a bet is never legal preflop**.
