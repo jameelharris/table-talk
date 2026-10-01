@@ -282,7 +282,7 @@ def main() -> None:
         for name in (
             "extract_player_actions",
             "identify_community_cards",
-            "extract_community_cards_from_frame",
+            "extract_community_cards",
         ):
             path = prompts_dir / f"{name}.md"
             if not path.exists():
@@ -322,8 +322,8 @@ def main() -> None:
                 identify_community_cards_prompt=prompt_paths[
                     "identify_community_cards"
                 ].read_text(),
-                extract_community_cards_from_frame_prompt=prompt_paths[
-                    "extract_community_cards_from_frame"
+                extract_community_cards_prompt=prompt_paths[
+                    "extract_community_cards"
                 ].read_text(),
                 reference_images=reference_images,
                 prompt_hashes=prompt_hashes,

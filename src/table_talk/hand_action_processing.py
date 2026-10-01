@@ -135,7 +135,7 @@ _COMMITTING_TYPES = frozenset({"call", "bet", "raise", "all_in"})
 # imported from Phase 4: the two phases meet at a table boundary, not in code.
 _FVA_TYPES = frozenset({"call", "raise", "all_in"})
 
-# extract_community_cards_from_frame.md's count rule, mirrored here so a
+# extract_community_cards.md's count rule, mirrored here so a
 # short read is caught rather than stored as a malformed board.
 EXPECTED_NEW_CARDS = {0: 3, 3: 1, 4: 1}
 
@@ -883,7 +883,7 @@ async def process_hand_start(
     hand_actions_bucket: str,
     extract_player_actions_prompt: str,
     identify_community_cards_prompt: str,
-    extract_community_cards_from_frame_prompt: str,
+    extract_community_cards_prompt: str,
     reference_images: list[tuple[bytes, str, str]] | None = None,
     *,
     prompt_hashes: dict[str, str],
@@ -1015,7 +1015,7 @@ async def process_hand_start(
                 postflop_streets,
                 window_end,
                 identify_community_cards_prompt,
-                extract_community_cards_from_frame_prompt,
+                extract_community_cards_prompt,
                 reference_images,
                 frame_tmpdir,
                 inert,
@@ -1089,7 +1089,7 @@ async def process_hand_start(
             if step_e_ran:
                 prompt_files += [
                     "prompts/identify_community_cards.md",
-                    "prompts/extract_community_cards_from_frame.md",
+                    "prompts/extract_community_cards.md",
                     *(
                         f"references/{reference_image_filename(street)}"
                         for street in STREET_REFERENCE_ORDER
@@ -1188,7 +1188,7 @@ async def process_pending_hand_starts(
     hand_actions_bucket: str,
     extract_player_actions_prompt: str,
     identify_community_cards_prompt: str,
-    extract_community_cards_from_frame_prompt: str,
+    extract_community_cards_prompt: str,
     reference_images: list[tuple[bytes, str, str]] | None = None,
     *,
     prompt_hashes: dict[str, str],
@@ -1278,7 +1278,7 @@ async def process_pending_hand_starts(
                         hand_actions_bucket,
                         extract_player_actions_prompt,
                         identify_community_cards_prompt,
-                        extract_community_cards_from_frame_prompt,
+                        extract_community_cards_prompt,
                         reference_images,
                         prompt_hashes=prompt_hashes,
                         max_attempts=max_attempts,

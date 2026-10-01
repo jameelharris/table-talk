@@ -761,7 +761,7 @@ Per hand start: check preconditions, run step D over the whole hand window for t
 - `reference_images.py` — `load_reference_images`, `STREET_REFERENCE_ORDER`, `reference_image_filename`
 - `prompt_context.py` — extended with `build_action_context` (position, stack and hole cards per seat) and `build_prior_cards_context`
 - `seat_enrichment.py` — extended with `heads_up_label`, the pure SB-is-BTN rule `normalize_heads_up` now rewrites through
-- `prompts/extract_player_actions.md`, `prompts/identify_community_cards.md`, `prompts/extract_community_cards_from_frame.md`
+- `prompts/extract_player_actions.md`, `prompts/identify_community_cards.md`, `prompts/extract_community_cards.md`
 - `references/{flop,turn,river}_reference.jpeg`
 
 Shares `videos_downloader.py`, `frame_extractor.py`, `frame_uploader.py`, `gemini_caller.py`, `timestamp_utils.py`, `card_normalization.py`, and `bq_utils.py` with Phases 3 and 4.
@@ -842,6 +842,41 @@ Three universal JPEGs showing what flop, turn and river look like in a PokerStar
 That test is **not** an exception to "prompts have no automated tests." It asserts a code-to-prompt *interface* contract, not prompt content or quality. Rewording either side would otherwise unbind the descriptions from the images silently, degrading street detection corpus-wide with no error anywhere. Do not delete it for violating a rule it does not violate.
 
 Ordering comes from `STREET_REFERENCE_ORDER`, never a directory listing — `sorted()` yields flop, river, turn.
+
+### Step E's prompts were renamed (2026-10-01)
+
+Step E's two prompts were renamed to follow the naming convention. The convention is
+by **output**: `identify_*` finds a moment in video, `extract_*` reads content —
+whether from a clip or a frame.
+
+| role | old | new |
+|---|---|---|
+| step E's scan — finds when a street is revealed | `prompts/extract_community_cards.md` | `prompts/identify_community_cards.md` |
+| step E's read — reads the new board cards from a frame | `prompts/extract_community_cards_from_frame.md` | `prompts/extract_community_cards.md` |
+
+The scan was the misnamed one: it locates a timestamp and reads nothing. Step D is
+correctly named under the convention and did not move — it reads the action sequence
+and the winning positions, which is extraction, out of a clip rather than a frame.
+**After this change every prompt follows the convention.**
+
+It is a swap-through: the read's new name is the scan's old name. So a bare search for
+`extract_community_cards` does not distinguish the two, and this section is the one
+place the old names legitimately survive. It landed as two commits, one per step, so
+git records both as renames rather than one rename and one rewrite.
+
+**File contents did not change**, so the recorded git blob hashes did not change
+either — `git log --find-object=b5054a4bc2fe` still finds the scan and
+`--find-object=52edb1fe84a7` still finds the read, across the rename and through the
+history that precedes it.
+
+**Provenance only ever contains the new names.** The rename landed before any
+provenance-bearing Phase 5 row was written: Phase 5 has not run since provenance was
+added, and the pre-rebuild snapshot carries no provenance at all. So no `hand_actions`
+row names either old path in `hand_action_state.provenance.prompts`, and a query
+grouping by provenance key does not need to accept both spellings. This is why the
+rename was done before Phase 5's rebuild run rather than after it — afterwards it
+would have split the corpus across two key vocabularies, which a rename cannot
+migrate, since the keys are stored data.
 
 ### Scan retries fire only on disagreement with D
 
@@ -1007,7 +1042,7 @@ Phase 5 over the rebuilt corpus: 57 of 58 `hand_starts` complete, one `failed_pe
   - Payout extraction — `extract_results.md`
   - Phase 3 — `identify_hand.md`, `extract_player_info.md`, `extract_player_info_bounty_addendum.md` (concatenated onto the previous only when `bounty_type = 'progressive'`)
   - Phase 4 — `identify_hand_start.md`, `extract_hole_cards.md`
-  - Phase 5 — `extract_player_actions.md` (step D), `identify_community_cards.md` (step E's scan), `extract_community_cards_from_frame.md` (step E's read)
+  - Phase 5 — `extract_player_actions.md` (step D), `identify_community_cards.md` (step E's scan), `extract_community_cards.md` (step E's read)
 
 ### Test files
 
@@ -1231,7 +1266,7 @@ What remains is the scan itself. This is the case that moves Flash's scan weakne
 
 **The corpus is now a Flash/Pro mixture, and the provenance is not recoverable.** Seven `YzKyFMQ1avU` hands were produced on Pro; the rest of both videos is Flash. Per "Cost instrumentation," the model that served a call is recorded only on the `gemini_usage` stderr line, which is not persisted — so no query can tell you which model produced a given row. Any comparison across the corpus that assumes a single model is wrong for those seven hands, and there is no way to exclude them from the tables alone.
 
-**The defaults change behaviour.** An unconfigured run puts frame reads on Flash, which moves `extract_player_info.md`, `extract_hole_cards.md`, `extract_community_cards_from_frame.md` and `extract_results.md` off Pro; the clip default then moved the clip-mode scans off Pro as well. Neither is a placeholder, but between them an unconfigured run no longer reproduces either half of the corpus built before them.
+**The defaults change behaviour.** An unconfigured run puts frame reads on Flash, which moves `extract_player_info.md`, `extract_hole_cards.md`, `extract_community_cards.md` and `extract_results.md` off Pro; the clip default then moved the clip-mode scans off Pro as well. Neither is a placeholder, but between them an unconfigured run no longer reproduces either half of the corpus built before them.
 
 **This comparison is not conclusive.** One video, one adjudicator, and the disagreement set contains only cases where the two models differed — an error both made identically is invisible to it. It justified the split back when the two defaults differed, and it is not enough to settle which model is better in general.
 

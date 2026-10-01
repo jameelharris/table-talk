@@ -70,7 +70,7 @@ def _hand_start_state(total_seat_count=6, fva=_FVA, players=None):
 _P5_HASHES = {
     "prompts/extract_player_actions.md": "111111111111",
     "prompts/identify_community_cards.md": "222222222222",
-    "prompts/extract_community_cards_from_frame.md": "333333333333",
+    "prompts/extract_community_cards.md": "333333333333",
     "references/flop_reference.jpeg": "444444444444",
     "references/turn_reference.jpeg": "555555555555",
     "references/river_reference.jpeg": "666666666666",
@@ -1456,7 +1456,7 @@ def test_process_pending_hand_starts_precondition_skip_integration():
                 hand_actions_bucket="table-talk-497020-hand-actions-dev",
                 extract_player_actions_prompt="UNUSED {player_context} {fva_context}",
                 identify_community_cards_prompt="UNUSED {street_name}",
-                extract_community_cards_from_frame_prompt="UNUSED {prior_cards}",
+                extract_community_cards_prompt="UNUSED {prior_cards}",
                 reference_images=[],
                 only_hand_start_ids=[ids.hand_start_id],
                 bq_client=bq_client,
@@ -1539,8 +1539,8 @@ def test_process_pending_hand_starts_integration():
                 identify_community_cards_prompt=(
                     prompts_dir / "identify_community_cards.md"
                 ).read_text(),
-                extract_community_cards_from_frame_prompt=(
-                    prompts_dir / "extract_community_cards_from_frame.md"
+                extract_community_cards_prompt=(
+                    prompts_dir / "extract_community_cards.md"
                 ).read_text(),
                 reference_images=load_reference_images(references_dir),
                 only_hand_start_ids=[ids.hand_start_id],
@@ -1745,7 +1745,7 @@ def test_hand_reaching_the_flop_lists_step_e_prompts_and_references():
     assert set(provenance["prompts"]) == {
         "prompts/extract_player_actions.md",
         "prompts/identify_community_cards.md",
-        "prompts/extract_community_cards_from_frame.md",
+        "prompts/extract_community_cards.md",
         "references/flop_reference.jpeg",
         "references/turn_reference.jpeg",
         "references/river_reference.jpeg",

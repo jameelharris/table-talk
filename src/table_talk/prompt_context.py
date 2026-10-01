@@ -55,7 +55,7 @@ def build_action_context(hand_start_state: dict) -> str:
 
 
 def build_prior_cards_context(prior_cards: list[str]) -> str:
-    # extract_community_cards_from_frame.md keys the number of cards to read off
+    # extract_community_cards.md keys the number of cards to read off
     # the number of prior cards (0 -> 3, 3 -> 1, 4 -> 1), so the count is stated
     # outright rather than left to be inferred from the list.
     if not prior_cards:

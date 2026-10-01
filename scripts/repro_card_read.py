@@ -7,8 +7,8 @@ fix against both the failing case and a control. Until now that harness was a
 gitignored notebook rebuilt from scratch each time. This is the tracked version,
 covering the two frame-mode card reads:
 
-  hole  -> prompts/extract_hole_cards.md               (Phase 4, step C)
-  board -> prompts/extract_community_cards_from_frame.md (Phase 5, step E)
+  hole  -> prompts/extract_hole_cards.md        (Phase 4, step C)
+  board -> prompts/extract_community_cards.md   (Phase 5, step E)
 
 It renders prompts with the production context builders and calls the production
 gemini_caller, so what it measures is what the pipeline does.
@@ -303,7 +303,7 @@ def _with_reference_section(prompt_text: str) -> str:
 
 
 def build_prompt(kind: str, version: dict) -> str:
-    name = "extract_hole_cards" if kind == "hole" else "extract_community_cards_from_frame"
+    name = "extract_hole_cards" if kind == "hole" else "extract_community_cards"
     text = (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
     text = _with_instruction(text) if version["instruction"] else _without_instruction(text)
     if version["references"]:

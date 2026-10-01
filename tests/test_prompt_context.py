@@ -6,7 +6,7 @@
 #   build_hole_card_context   -> {hole_card_context} in extract_hole_cards.md
 #   build_action_context      -> {player_context}    in extract_player_actions.md
 #   build_fva_context         -> {fva_context}       in extract_player_actions.md
-#   build_prior_cards_context -> {prior_cards}       in extract_community_cards_from_frame.md
+#   build_prior_cards_context -> {prior_cards}       in extract_community_cards.md
 #
 # build_fva_context had no caller between the step-C stack-anchor fix and Phase 5;
 # extract_player_actions.md uses it again to establish that the FVA is action_order 1.
@@ -244,7 +244,7 @@ def test_build_action_context_null_stack_renders_none():
 
 def test_build_prior_cards_context_empty_states_zero_outright():
     # The flop case, and the one most likely to be broken by a future edit.
-    # extract_community_cards_from_frame.md derives how many cards to read from
+    # extract_community_cards.md derives how many cards to read from
     # this slot (0 -> 3, 3 -> 1, 4 -> 1), so "nothing" has to be a positive
     # statement rather than an empty slot. If the model reads this as non-zero,
     # the flop read is told it is reading a turn and returns one card instead of
