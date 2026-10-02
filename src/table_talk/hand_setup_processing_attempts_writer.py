@@ -18,6 +18,9 @@ VALID_STATUSES: frozenset[str] = frozenset({
     "complete",
     "complete_skipped",
     "complete_uncontested",
+    # Written by `tt mark-pending`, not by an attempt: retryable, and
+    # outside the failed% family so it resets the consecutive-failure count.
+    "marked_pending",
     "failed_transient",
     "failed_permanent",
     "failed_parked",

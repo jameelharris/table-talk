@@ -39,6 +39,7 @@ from .gemini_caller import (
 from .hand_setup_processing_attempts_writer import write_hand_setup_processing_attempt_row
 from .hand_starts_writer import write_hand_starts
 from .prompt_context import build_hole_card_context, build_player_context
+from .mark_pending import MARK_MESSAGE_PREFIX
 from .provenance import build_provenance, select
 from .seat_enrichment import add_fva_seat_number, canonical_labels, normalize_heads_up
 from .timestamp_utils import parse_timestamp
@@ -97,7 +98,8 @@ def _find_pending_hand_setups(
     """Return hand_setups rows pending hand-start processing.
 
     A hand_setup is pending if it has never been attempted or its latest
-    attempt status is 'failed_transient'. hand_setups with 'complete',
+    attempt status is 'failed_transient' or 'marked_pending'. hand_setups with
+    'complete',
     'complete_skipped', 'complete_uncontested', 'failed_permanent', or
     'failed_parked' are excluded.
 
@@ -110,7 +112,10 @@ def _find_pending_hand_setups(
     video_filter = ""
     hand_setup_filter = ""
     params: list = [
-        bigquery.ScalarQueryParameter("max_available_seconds", "INT64", MAX_AVAILABLE_SECONDS)
+        bigquery.ScalarQueryParameter("max_available_seconds", "INT64", MAX_AVAILABLE_SECONDS),
+        # Bound rather than interpolated, so the mark message has exactly one
+        # definition and it lives with the code that writes it.
+        bigquery.ScalarQueryParameter("mark_message_prefix", "STRING", MARK_MESSAGE_PREFIX),
     ]
     if only_video_ids is not None:
         video_filter = "AND w.video_id IN UNNEST(@only_video_ids)"
@@ -143,7 +148,15 @@ def _find_pending_hand_setups(
         attempt_marks AS (
           SELECT
             hand_setup_id, status, attempted_at,
-            MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL)) OVER (
+            -- A mark is not a failure, so it resets the count rather than
+            -- advancing it. New marks say so in `status`; the OR recognises the
+            -- pre-'marked_pending' marks already in the table, which are
+            -- 'failed_transient' rows carrying the mark message.
+            MAX(IF(
+              status NOT LIKE 'failed%'
+              OR status_message LIKE CONCAT(@mark_message_prefix, '%'),
+              attempted_at, NULL
+            )) OVER (
               PARTITION BY hand_setup_id
             ) AS last_non_failure_at
           FROM `{project_id}.{dataset}.hand_setup_processing_attempts`
@@ -167,7 +180,8 @@ def _find_pending_hand_setups(
         FROM windowed w
         LEFT JOIN attempt_state a USING (hand_setup_id)
         LEFT JOIN `{project_id}.{dataset}.tournament_results` tr ON tr.video_id = w.video_id
-        WHERE (a.latest_status IS NULL OR a.latest_status = 'failed_transient')
+        WHERE (a.latest_status IS NULL
+               OR a.latest_status IN ('failed_transient', 'marked_pending'))
           {video_filter}
           {hand_setup_filter}
     """

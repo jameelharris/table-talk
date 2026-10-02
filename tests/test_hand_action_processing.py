@@ -385,7 +385,21 @@ def test_find_pending_hand_starts_selects_only_pending_statuses():
     _find_pending_hand_starts("proj", "ds", client=client)
 
     query = client.query.call_args[0][0]
-    assert "a.latest_status IS NULL OR a.latest_status = 'failed_transient'" in query
+    assert (
+        "a.latest_status IS NULL\n"
+        "               OR a.latest_status IN ('failed_transient', 'marked_pending')"
+    ) in query
+
+
+def test_find_pending_hand_starts_treats_a_mark_as_a_non_failure():
+    """The mark prefix now has a second use in this query: it keeps a mark from
+    standing in for the previous real attempt, and it keeps a mark from
+    advancing the retry cap."""
+    client = _mock_bq_client()
+    _find_pending_hand_starts("proj", "ds", client=client)
+
+    query = client.query.call_args[0][0]
+    assert query.count("status_message LIKE CONCAT(@mark_message_prefix, '%')") == 2
 
 
 def test_find_pending_hand_starts_video_filter():

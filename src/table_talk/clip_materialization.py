@@ -30,14 +30,16 @@ from ._generated.clip_manifest_row import ClipManifestRow
 from ._generated.clip_materialization_attempts_row import ClipMaterializationAttemptsRow
 from .clip_manifest_writer import write_clip_manifest_rows
 from .clip_materialization_attempts_writer import write_clip_materialization_attempt_row
+from .mark_pending import MARK_MESSAGE_PREFIX
 
 _CLIP_WINDOW_SECONDS = 240
 
-# Retryable statuses. 'blocked_upstream' is retryable but is deliberately not
-# a 'failed%' status: the consecutive-failure counter below keys on that
-# prefix, so a video waiting on payout extraction resets the counter rather
-# than advancing it toward the cap for a condition that is not its fault.
-_RETRYABLE_STATUSES = ("failed_transient", "blocked_upstream")
+# Retryable statuses. 'blocked_upstream' and 'marked_pending' are retryable but
+# are deliberately not 'failed%' statuses: the consecutive-failure counter below
+# keys on that prefix, so a video waiting on payout extraction — or one an
+# operator has marked for reprocessing — resets the counter rather than
+# advancing it toward the cap for a condition that is not its fault.
+_RETRYABLE_STATUSES = ("failed_transient", "blocked_upstream", "marked_pending")
 
 
 class MaterializeError(Exception):
@@ -72,6 +74,13 @@ def _payout_gate_reason(video_id: str, latest_status: str | None) -> str:
             "no tournament_results row; the last extraction failed transiently — "
             f"re-run `tt extract-payouts --video-id {video_id}`"
         )
+    if latest_status == "marked_pending":
+        # A mark is not an outcome, so this must not fall through to the
+        # "terminated" branch below: the extraction has not run yet.
+        return (
+            "no tournament_results row; extraction is marked for reprocessing and has "
+            f"not re-run — run `tt extract-payouts --video-id {video_id}`"
+        )
     if latest_status == "complete":
         # Should not occur: 'complete' is written only after the row lands. One
         # branch, because without it this case would print a misleading message.
@@ -99,13 +108,23 @@ def _video_state_sql(project: str, dataset: str, where_clause: str) -> str:
     reprocessing is the point. `consecutive_failures` counts only failures since
     the last non-failure — a failure can follow a success, so a lifetime count
     would park healthy videos early — and the 'failed%' prefix match is what
-    keeps 'blocked_upstream' from advancing it.
+    keeps 'blocked_upstream' and 'marked_pending' from advancing it.
+
+    Both entry points must bind @mark_message_prefix.
     """
     return f"""
         WITH attempt_marks AS (
           SELECT
             video_id, status, attempted_at,
-            MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL)) OVER (
+            -- A mark is not a failure, so it resets the count rather than
+            -- advancing it. New marks say so in `status`; the OR recognises the
+            -- pre-'marked_pending' marks already in the table, which are
+            -- 'failed_transient' rows carrying the mark message.
+            MAX(IF(
+              status NOT LIKE 'failed%'
+              OR status_message LIKE CONCAT(@mark_message_prefix, '%'),
+              attempted_at, NULL
+            )) OVER (
               PARTITION BY video_id
             ) AS last_non_failure_at
           FROM `{project}.{dataset}.clip_materialization_attempts`
@@ -163,8 +182,8 @@ def _find_pending_videos(
     """Return videos pending clip materialization.
 
     A video is pending if it has never been attempted or its latest attempt
-    status is 'failed_transient' or 'blocked_upstream'. Videos with 'complete',
-    'failed_permanent', or 'failed_parked' are excluded.
+    status is 'failed_transient', 'blocked_upstream' or 'marked_pending'. Videos
+    with 'complete', 'failed_permanent', or 'failed_parked' are excluded.
 
     Driven off `videos` and LEFT JOINed to `tournament_results`, not the
     reverse: a payout-less video must be visible-and-blocked, not invisible.
@@ -182,7 +201,11 @@ def _find_pending_videos(
     to test-owned data, per the integration test scoping convention in CLAUDE.md.
     """
     scope_filter = ""
-    params: list = []
+    # Bound rather than interpolated, so the mark message has exactly one
+    # definition and it lives with the code that writes it.
+    params: list = [
+        bigquery.ScalarQueryParameter("mark_message_prefix", "STRING", MARK_MESSAGE_PREFIX)
+    ]
     if only_video_ids is not None:
         scope_filter = "AND v.video_id IN UNNEST(@only_video_ids)"
         params.append(bigquery.ArrayQueryParameter("only_video_ids", "STRING", only_video_ids))
@@ -192,7 +215,7 @@ def _find_pending_videos(
         f"({', '.join(repr(s) for s in _RETRYABLE_STATUSES)}))\n          {scope_filter}"
     )
     query = _video_state_sql(project, dataset, where_clause)
-    job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
     rows = list(client.query(query, job_config=job_config).result())
     return [_to_pending_video(row) for row in rows]
 
@@ -216,7 +239,12 @@ def _find_video(
         bq_client.query(
             query,
             job_config=bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ScalarQueryParameter("video_id", "STRING", video_id)]
+                query_parameters=[
+                    bigquery.ScalarQueryParameter("video_id", "STRING", video_id),
+                    bigquery.ScalarQueryParameter(
+                        "mark_message_prefix", "STRING", MARK_MESSAGE_PREFIX
+                    ),
+                ]
             ),
         ).result()
     )

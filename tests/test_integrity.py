@@ -146,6 +146,19 @@ def test_failure_statuses_are_never_constrained():
         assert "failed_permanent" not in sql
 
 
+def test_marked_pending_is_never_constrained():
+    """A mark is not an attempt outcome, so no row count follows from it in any
+    phase: a marked entity keeps whatever output its last real attempt left."""
+    from table_talk.integrity import UNCONSTRAINED
+
+    for spec in PHASES:
+        assert "marked_pending" not in spec.arity, spec.label
+        assert "marked_pending" in UNCONSTRAINED[spec.label], spec.label
+        if not spec.arity:
+            continue
+        assert "marked_pending" not in status_row_sql(spec, PROJECT, DATASET, scoped=False)
+
+
 def test_phase_3_has_no_status_row_invariant():
     assert _SPECS["Phase 3"].arity == {}
     with pytest.raises(ValueError):

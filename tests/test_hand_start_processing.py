@@ -15,6 +15,7 @@ from table_talk.gemini_caller import (
     GeminiPermanentError,
     GeminiTransientError,
 )
+from table_talk.mark_pending import MARK_MESSAGE_PREFIX
 from table_talk.hand_start_processing import (
     PendingHandSetup,
     _find_pending_hand_setups,
@@ -219,13 +220,30 @@ def test_find_pending_hand_setups_no_filters():
     query = mock_client.query.call_args[0][0]
     assert "hand_setup_processing_attempts" in query
     assert "hand_setups" in query
-    assert "failed_transient" in query
+    assert (
+        "a.latest_status IS NULL\n"
+        "               OR a.latest_status IN ('failed_transient', 'marked_pending')"
+    ) in query
     assert "only_video_ids" not in query
     assert "only_hand_setup_ids" not in query
 
     job_config = mock_client.query.call_args[1]["job_config"]
     param_names = {p.name for p in job_config.query_parameters}
-    assert param_names == {"max_available_seconds"}
+    assert param_names == {"max_available_seconds", "mark_message_prefix"}
+
+
+def test_find_pending_hand_setups_treats_a_mark_as_a_non_failure():
+    """A mark resets the count rather than spending a retry slot, including the
+    pre-'marked_pending' marks already in the table."""
+    mock_client = _mock_bq_client()
+    _find_pending_hand_setups("proj", "ds", client=mock_client)
+
+    query = mock_client.query.call_args[0][0]
+    assert "OR status_message LIKE CONCAT(@mark_message_prefix, '%')" in query
+    params = {
+        p.name: p.value for p in mock_client.query.call_args[1]["job_config"].query_parameters
+    }
+    assert params["mark_message_prefix"] == MARK_MESSAGE_PREFIX
 
 
 def test_find_pending_hand_setups_video_filter():

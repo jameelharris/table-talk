@@ -31,6 +31,7 @@ from .gemini_caller import (
     call_gemini_for_frame,
 )
 from .hand_setups_writer import write_hand_setups
+from .mark_pending import MARK_MESSAGE_PREFIX
 from .provenance import build_provenance, select
 from .seat_enrichment import add_seat_numbers, normalize_heads_up
 from .timestamp_utils import parse_timestamp
@@ -108,8 +109,8 @@ def _find_pending_clips(
     """Return pending clips (as PendingClip) awaiting processing.
 
     A clip is pending if it has never been attempted or its latest attempt
-    status is 'failed_transient'. Clips with 'complete', 'failed_permanent',
-    or 'failed_parked' are excluded.
+    status is 'failed_transient' or 'marked_pending'. Clips with 'complete',
+    'failed_permanent', or 'failed_parked' are excluded.
 
     `bounty_type` is joined from tournament_results to select the extraction
     prompt. The join is LEFT rather than INNER, and a null raises: the
@@ -126,7 +127,11 @@ def _find_pending_clips(
 
     clip_filter = ""
     video_filter = ""
-    params: list = []
+    # Bound rather than interpolated, so the mark message has exactly one
+    # definition and it lives with the code that writes it.
+    params: list = [
+        bigquery.ScalarQueryParameter("mark_message_prefix", "STRING", MARK_MESSAGE_PREFIX)
+    ]
     if only_clip_ids is not None:
         clip_filter = "AND m.clip_id IN UNNEST(@only_clip_ids)"
         params.append(bigquery.ArrayQueryParameter("only_clip_ids", "STRING", only_clip_ids))
@@ -138,7 +143,15 @@ def _find_pending_clips(
         WITH attempt_marks AS (
           SELECT
             clip_id, status, attempted_at,
-            MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL)) OVER (
+            -- A mark is not a failure, so it resets the count rather than
+            -- advancing it. New marks say so in `status`; the OR recognises the
+            -- pre-'marked_pending' marks already in the table, which are
+            -- 'failed_transient' rows carrying the mark message.
+            MAX(IF(
+              status NOT LIKE 'failed%'
+              OR status_message LIKE CONCAT(@mark_message_prefix, '%'),
+              attempted_at, NULL
+            )) OVER (
               PARTITION BY clip_id
             ) AS last_non_failure_at
           FROM `{project_id}.{dataset}.clip_processing_attempts`
@@ -161,12 +174,13 @@ def _find_pending_clips(
         FROM `{project_id}.{dataset}.clip_manifest` m
         LEFT JOIN attempt_state a USING (clip_id)
         LEFT JOIN `{project_id}.{dataset}.tournament_results` tr ON tr.video_id = m.video_id
-        WHERE (a.latest_status IS NULL OR a.latest_status = 'failed_transient')
+        WHERE (a.latest_status IS NULL
+               OR a.latest_status IN ('failed_transient', 'marked_pending'))
           {clip_filter}
           {video_filter}
         ORDER BY m.video_id, m.clip_start_time
     """
-    job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
     rows = list(client.query(query, job_config=job_config).result())
     clips = []
     for row in rows:

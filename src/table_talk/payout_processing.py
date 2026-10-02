@@ -41,6 +41,7 @@ from .gemini_caller import (
     GeminiPermanentError,
     call_gemini_for_frame,
 )
+from .mark_pending import MARK_MESSAGE_PREFIX
 from .provenance import build_provenance, select
 from .tournament_results_processing_attempts_writer import (
     write_tournament_results_processing_attempt_row,
@@ -95,8 +96,8 @@ def _find_pending_videos(
     """Return videos pending payout extraction.
 
     A video is pending if it has never been attempted or its latest attempt
-    status is 'failed_transient'. Videos with 'complete', 'complete_skipped',
-    'failed_permanent', or 'failed_parked' are excluded.
+    status is 'failed_transient' or 'marked_pending'. Videos with 'complete',
+    'complete_skipped', 'failed_permanent', or 'failed_parked' are excluded.
 
     There is deliberately no NOT EXISTS guard against tournament_results.
     'complete_skipped' is legitimately terminal with zero stage rows, and such a
@@ -111,7 +112,11 @@ def _find_pending_videos(
         client = bigquery.Client(project=project_id)
 
     video_filter = ""
-    params: list = []
+    # Bound rather than interpolated, so the mark message has exactly one
+    # definition and it lives with the code that writes it.
+    params: list = [
+        bigquery.ScalarQueryParameter("mark_message_prefix", "STRING", MARK_MESSAGE_PREFIX)
+    ]
     if only_video_ids is not None:
         video_filter = "AND v.video_id IN UNNEST(@only_video_ids)"
         params.append(bigquery.ArrayQueryParameter("only_video_ids", "STRING", only_video_ids))
@@ -120,7 +125,15 @@ def _find_pending_videos(
         WITH attempt_marks AS (
           SELECT
             video_id, status, attempted_at,
-            MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL)) OVER (
+            -- A mark is not a failure, so it resets the count rather than
+            -- advancing it. New marks say so in `status`; the OR recognises the
+            -- pre-'marked_pending' marks already in the table, which are
+            -- 'failed_transient' rows carrying the mark message.
+            MAX(IF(
+              status NOT LIKE 'failed%'
+              OR status_message LIKE CONCAT(@mark_message_prefix, '%'),
+              attempted_at, NULL
+            )) OVER (
               PARTITION BY video_id
             ) AS last_non_failure_at
           FROM `{project_id}.{dataset}.tournament_results_processing_attempts`
@@ -142,11 +155,12 @@ def _find_pending_videos(
           COALESCE(a.consecutive_failures, 0) AS consecutive_failures
         FROM `{project_id}.{dataset}.videos` v
         LEFT JOIN attempt_state a USING (video_id)
-        WHERE (a.latest_status IS NULL OR a.latest_status = 'failed_transient')
+        WHERE (a.latest_status IS NULL
+               OR a.latest_status IN ('failed_transient', 'marked_pending'))
           {video_filter}
         ORDER BY v.video_id
     """
-    job_config = bigquery.QueryJobConfig(query_parameters=params) if params else None
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
     rows = list(client.query(query, job_config=job_config).result())
     return [
         PendingVideo(

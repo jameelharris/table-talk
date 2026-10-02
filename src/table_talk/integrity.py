@@ -137,14 +137,25 @@ DUPLICATE_KEYS: dict[str, str] = {
     "hand_actions": "hand_start_id",
 }
 
-# Statuses deliberately left unconstrained despite not being failures. Phase 3's
-# `complete` spans zero rows — a clip may legitimately detect no hand setups —
-# so no row count can be predicted from it. A contract test asserts that every
-# status a writer can produce is either constrained by `arity`, in the `failed*`
-# family, or listed here, so adding a status and forgetting the map fails loudly
-# rather than silently disabling a check.
+# Statuses deliberately left unconstrained despite not being failures. A contract
+# test asserts that every status a writer can produce is either constrained by
+# `arity`, in the `failed*` family, or listed here, so adding a status and
+# forgetting the map fails loudly rather than silently disabling a check.
+#
+# `marked_pending` is exempt in every phase because a mark is not an attempt
+# outcome — `tt mark-pending` writes it to make an entity eligible again — so no
+# row count follows from it anywhere. It is listed per phase rather than
+# special-cased because the per-phase dict is what the contract test reads.
+_MARK: frozenset[str] = frozenset({"marked_pending"})
+
 UNCONSTRAINED: dict[str, frozenset[str]] = {
-    "Phase 3": frozenset({"complete"}),
+    "Payouts": _MARK,
+    "Phase 2": _MARK,
+    # Phase 3's `complete` spans zero rows — a clip may legitimately detect no
+    # hand setups — so no row count can be predicted from it either.
+    "Phase 3": _MARK | frozenset({"complete"}),
+    "Phase 4": _MARK,
+    "Phase 5": _MARK,
 }
 
 # Rows counted for the report header.

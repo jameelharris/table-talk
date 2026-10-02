@@ -11,6 +11,7 @@ from google.cloud import bigquery
 
 from table_talk.frame_extractor import FrameExtractionError
 from table_talk.gemini_caller import GeminiPermanentError, GeminiTransientError
+from table_talk.mark_pending import MARK_MESSAGE_PREFIX
 from table_talk.provenance import hash_files
 from table_talk.videos_downloader import DownloadPermanentError
 from table_talk.hand_setup_processing import (
@@ -97,12 +98,31 @@ def test_find_pending_clips_no_filters():
     query = mock_client.query.call_args[0][0]
     assert "clip_processing_attempts" in query
     assert "clip_manifest" in query
-    assert "failed_transient" in query
+    assert (
+        "a.latest_status IS NULL\n"
+        "               OR a.latest_status IN ('failed_transient', 'marked_pending')"
+    ) in query
     # No scope filters when both are None
     assert "only_clip_ids" not in query
     assert "only_video_ids" not in query
-    # No query_parameters passed when no filters
-    assert mock_client.query.call_args[1].get("job_config") is None
+    # The mark prefix is always bound, scoped or not: the reset clause
+    # references it.
+    param_names = {p.name for p in mock_client.query.call_args[1]["job_config"].query_parameters}
+    assert param_names == {"mark_message_prefix"}
+
+
+def test_find_pending_clips_treats_a_mark_as_a_non_failure():
+    """A mark resets the count rather than spending a retry slot, including the
+    pre-'marked_pending' marks already in the table."""
+    mock_client = _mock_bq_client()
+    _find_pending_clips("proj", "ds", client=mock_client)
+
+    query = mock_client.query.call_args[0][0]
+    assert "OR status_message LIKE CONCAT(@mark_message_prefix, '%')" in query
+    params = {
+        p.name: p.value for p in mock_client.query.call_args[1]["job_config"].query_parameters
+    }
+    assert params["mark_message_prefix"] == MARK_MESSAGE_PREFIX
 
 
 def test_find_pending_clips_clip_id_filter():
@@ -136,7 +156,7 @@ def test_find_pending_clips_both_filters():
     )
     job_config = mock_client.query.call_args[1]["job_config"]
     param_names = {p.name for p in job_config.query_parameters}
-    assert param_names == {"only_clip_ids", "only_video_ids"}
+    assert param_names == {"only_clip_ids", "only_video_ids", "mark_message_prefix"}
 
 
 # ---------------------------------------------------------------------------

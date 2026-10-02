@@ -29,6 +29,7 @@ from table_talk.payout_processing import (
     process_pending_videos,
     process_video,
 )
+from table_talk.mark_pending import MARK_MESSAGE_PREFIX
 from table_talk.provenance import hash_files
 from table_talk.videos_downloader import DownloadPermanentError
 
@@ -288,7 +289,10 @@ def test_find_pending_videos_selects_only_pending_statuses():
     _find_pending_videos("proj", "ds", client=client)
 
     query = client.query.call_args[0][0]
-    assert "a.latest_status IS NULL OR a.latest_status = 'failed_transient'" in query
+    assert (
+        "a.latest_status IS NULL\n"
+        "               OR a.latest_status IN ('failed_transient', 'marked_pending')"
+    ) in query
 
 
 def test_find_pending_videos_has_no_output_existence_guard():
@@ -313,6 +317,19 @@ def test_find_pending_videos_counts_consecutive_failures_since_last_non_failure(
     assert "status NOT LIKE 'failed%'" in query
 
 
+def test_find_pending_videos_treats_a_mark_as_a_non_failure():
+    """A mark resets the count rather than spending a retry slot. New marks are
+    outside the 'failed%' family by status; the message clause is what catches
+    the pre-'marked_pending' marks already in the table."""
+    client = _mock_bq_client()
+    _find_pending_videos("proj", "ds", client=client)
+
+    query = client.query.call_args[0][0]
+    assert "OR status_message LIKE CONCAT(@mark_message_prefix, '%')" in query
+    params = {p.name: p.value for p in client.query.call_args[1]["job_config"].query_parameters}
+    assert params["mark_message_prefix"] == MARK_MESSAGE_PREFIX
+
+
 def test_find_pending_videos_drives_off_videos_and_carries_duration():
     client = _mock_bq_client()
     _find_pending_videos("proj", "ds", client=client)
@@ -328,8 +345,8 @@ def test_find_pending_videos_scopes_to_supplied_ids():
 
     query = client.query.call_args[0][0]
     assert "AND v.video_id IN UNNEST(@only_video_ids)" in query
-    params = client.query.call_args[1]["job_config"].query_parameters
-    assert params[0].values == ["a", "b"]
+    params = {p.name: p for p in client.query.call_args[1]["job_config"].query_parameters}
+    assert params["only_video_ids"].values == ["a", "b"]
 
 
 def test_find_pending_videos_empty_scope_list_scopes_to_nothing():

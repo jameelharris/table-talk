@@ -12,6 +12,7 @@ from table_talk.clip_materialization import (
     MaterializeError,
     PendingVideo,
     _find_pending_videos,
+    _payout_gate_reason,
     _transient_status,
     materialize_clips,
     materialize_clips_for_pending_videos,
@@ -19,6 +20,7 @@ from table_talk.clip_materialization import (
 from table_talk.clip_materialization_attempts_writer import (
     write_clip_materialization_attempt_row,
 )
+from table_talk.mark_pending import MARK_MESSAGE_PREFIX
 from table_talk.videos_writer import VideosRow, write_video_row
 
 PROJECT = "test-project"
@@ -336,7 +338,9 @@ def test_no_only_video_ids_scans_all_pending():
 
     call_args = bq.query.call_args
     assert "IN UNNEST" not in call_args[0][0]
-    assert call_args[1].get("job_config") is None
+    # The mark prefix is bound either way; only the scope params are absent.
+    params = {p.name for p in call_args[1]["job_config"].query_parameters}
+    assert params == {"mark_message_prefix"}
 
 
 # --- pending query shape ---
@@ -351,7 +355,7 @@ def test_pending_query_selects_on_attempt_status_not_output_rows():
     assert f"`{PROJECT}.{DATASET}.clip_materialization_attempts`" in query_str
     assert (
         "(a.latest_status IS NULL OR a.latest_status IN "
-        "('failed_transient', 'blocked_upstream'))" in query_str
+        "('failed_transient', 'blocked_upstream', 'marked_pending'))" in query_str
     )
     # Pending is a property of the attempts table alone. A guard against
     # existing output rows would block the deliberate reprocessing that
@@ -374,17 +378,51 @@ def test_pending_query_joins_tournament_results():
 
 
 def test_consecutive_failure_counter_excludes_blocked_upstream():
-    """The counter keys on the 'failed%' prefix, so 'blocked_upstream' resets it
-    rather than advancing it toward the cap for a condition upstream of the
-    video. The property falls out of the naming."""
+    """The counter keys on the 'failed%' prefix, so 'blocked_upstream' and
+    'marked_pending' reset it rather than advancing it toward the cap for a
+    condition upstream of the video. The property falls out of the naming."""
     bq = _pending_bq()
 
     _find_pending_videos(PROJECT, DATASET, client=bq)
 
     query_str = bq.query.call_args[0][0]
-    assert "MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL))" in query_str
+    assert "status NOT LIKE 'failed%'" in query_str
     assert "COUNTIF(" in query_str
     assert "status = 'failed_transient'" in query_str
+
+
+def test_consecutive_failure_counter_excludes_historical_marks():
+    """Marks written before 'marked_pending' existed are 'failed_transient' rows
+    carrying the mark message, and must reset the count too."""
+    bq = _pending_bq()
+
+    _find_pending_videos(PROJECT, DATASET, client=bq)
+
+    query_str = bq.query.call_args[0][0]
+    assert "OR status_message LIKE CONCAT(@mark_message_prefix, '%')" in query_str
+    params = {p.name: p.value for p in bq.query.call_args[1]["job_config"].query_parameters}
+    assert params["mark_message_prefix"] == MARK_MESSAGE_PREFIX
+
+
+def test_single_video_path_binds_the_mark_prefix():
+    """--video-id shares the SELECT, so it must bind the parameter the shared
+    SQL references or BigQuery rejects the query."""
+    bq = _mock_bq([_state_row()])
+
+    with patch(WRITE_ATTEMPT), patch(WRITE_MANIFEST):
+        materialize_clips(VIDEO_ID, project=PROJECT, dataset=DATASET, bq_client=bq)
+
+    params = {p.name for p in bq.query.call_args[1]["job_config"].query_parameters}
+    assert params == {"video_id", "mark_message_prefix"}
+
+
+def test_payout_gate_reason_for_a_marked_extraction_is_not_terminated():
+    """A marked payout extraction has not run yet, so it must not read as a
+    terminal outcome the operator cannot act on."""
+    reason = _payout_gate_reason("vid_marked", "marked_pending")
+
+    assert "terminated" not in reason
+    assert "tt extract-payouts --video-id vid_marked" in reason
 
 
 def test_pending_query_returns_dataclasses():

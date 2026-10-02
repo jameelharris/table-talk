@@ -179,7 +179,7 @@ def _find_pending_hand_starts(
     """Return hand_starts rows pending hand-action processing.
 
     A hand start is pending if it has never been attempted or its latest attempt
-    status is 'failed_transient'.
+    status is 'failed_transient' or 'marked_pending'.
 
     The window bound is the LEAD over hand_setups, computed across *all* of a
     video's hand setups before joining to hand_starts: the next hand setup
@@ -231,7 +231,15 @@ def _find_pending_hand_starts(
         attempt_marks AS (
           SELECT
             hand_start_id, status, status_message, attempted_at,
-            MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL)) OVER (
+            -- A mark is not a failure, so it resets the count rather than
+            -- advancing it. New marks say so in `status`; the OR recognises the
+            -- pre-'marked_pending' marks already in the table, which are
+            -- 'failed_transient' rows carrying the mark message.
+            MAX(IF(
+              status NOT LIKE 'failed%'
+              OR status_message LIKE CONCAT(@mark_message_prefix, '%'),
+              attempted_at, NULL
+            )) OVER (
               PARTITION BY hand_start_id
             ) AS last_non_failure_at
           FROM `{project_id}.{dataset}.hand_start_processing_attempts`
@@ -270,7 +278,8 @@ def _find_pending_hand_starts(
         FROM `{project_id}.{dataset}.hand_starts` h
         INNER JOIN windowed w USING (hand_setup_id)
         LEFT JOIN attempt_state a USING (hand_start_id)
-        WHERE (a.latest_status IS NULL OR a.latest_status = 'failed_transient')
+        WHERE (a.latest_status IS NULL
+               OR a.latest_status IN ('failed_transient', 'marked_pending'))
           {video_filter}
           {hand_start_filter}
     """

@@ -78,12 +78,15 @@ def test_every_valid_status_is_accepted(status):
     assert _params(mock_client)["status"].value == status
 
 
-def test_valid_statuses_matches_documented_five():
+def test_valid_statuses_matches_the_schema_description():
     # The schema's status description enumerates exactly these; if one is added
     # here, add it there too and decide its terminal/retryable category.
     assert VALID_STATUSES == frozenset({
         "complete",
         "complete_skipped",
+        # Written by `tt mark-pending`, not by an attempt: retryable, and
+        # outside the failed% family so it resets the consecutive-failure count.
+        "marked_pending",
         "failed_transient",
         "failed_permanent",
         "failed_parked",
