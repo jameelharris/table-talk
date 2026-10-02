@@ -27,6 +27,11 @@ state column on `tournament_results`, `hand_setups`, `hand_starts` and
 before: descriptions only, no column, type or mode changes, and codegen output
 byte-identical. Apply before Step 1.
 
+**The five `*_attempts` tables' `status` descriptions changed too**, for
+`marked_pending` — and `clip_processing_attempts` gained the `failed_parked` its
+description had always omitted. Descriptions only; codegen output is unchanged.
+Apply before Step 1.
+
 Six schema **descriptions** changed across this work: four for `provenance`
 (Commit 1) and two on `hand_actions` for `extraction_status` and
 `street_frame_gcs_paths` (Commit 5). No columns, types or modes changed, and
@@ -82,7 +87,7 @@ forces a full re-detection for no benefit: clip windows are arithmetic on
 ```
 tt extract-payouts --project $PROJECT --dataset $DATASET \
   --videos-bucket $VIDEOS --tournament-results-bucket $RESULTS \
-  --video-id <VIDEO> --max-attempts 4
+  --video-id <VIDEO>
 ```
 
 **Check before continuing:** the video has exactly one `tournament_results` row,
@@ -103,7 +108,7 @@ FROM `table-talk-497020.table_talk_dev.tournament_results`
 ```
 tt process-clips --project $PROJECT --dataset $DATASET \
   --videos-bucket $VIDEOS --hand-setups-bucket $SETUPS \
-  --video-id <VIDEO> --max-attempts 4
+  --video-id <VIDEO>
 ```
 
 Default models. **Do not set `TT_CLIP_MODEL` here** — the Pro requirement is
@@ -121,7 +126,7 @@ is expected — detection is not deterministic.
 ```
 tt process-hand-setups --project $PROJECT --dataset $DATASET \
   --videos-bucket $VIDEOS --hand-starts-bucket $STARTS \
-  --video-id <VIDEO> --max-attempts 4
+  --video-id <VIDEO>
 ```
 
 Default models again, for the same reason.
@@ -171,7 +176,7 @@ longer exists. See H5 in ARCHITECTURE.
 TT_CLIP_MODEL=gemini-2.5-pro tt process-hand-starts \
   --project $PROJECT --dataset $DATASET \
   --videos-bucket $VIDEOS --hand-actions-bucket $ACTIONS \
-  --video-id <VIDEO> --max-attempts 4
+  --video-id <VIDEO>
 ```
 
 Step E's community-card read also runs at `MEDIA_RESOLUTION_ULTRA_HIGH` now. No
@@ -182,13 +187,14 @@ read once at import, so its scope is whichever command carries it. Exported for
 the session it would silently move Phase 3's detection and Phase 4's step A onto
 Pro as well.
 
-`--max-attempts 4`, here and everywhere above: a mark is written as
-`failed_transient`, so it costs one retry slot and the default 3 would leave only
-two real attempts.
+The default `--max-attempts 3` is right everywhere above: a mark is written as
+`marked_pending`, which resets the consecutive-failure count, so every marked
+entity starts the run with all three attempts. Raising it is no longer needed.
 
 **A step-D gate failure identical to the previous real attempt's now ends the hand
-`failed_permanent`**, so `--max-attempts 4` no longer implies four step-D calls on
-Pro for an error that lives upstream — the second identical hit is the last one.
+`failed_permanent`**, so the attempt budget no longer implies that many step-D
+calls on Pro for an error that lives upstream — the second identical hit is the
+last one.
 Marks are not counted as real attempts for this, so re-marking between runs does
 not reset it. Read such a park as "review Phase 3 or Phase 4 for this hand," not
 as a Phase 5 defect: `tt mark-pending --stage hand_starts` after fixing the
@@ -264,14 +270,20 @@ re-marking anything.
 
 ### Parked hands, listed
 
+The join to `hand_starts` is not decoration. The attempts table still holds the
+history of hands re-detection has removed, so without it this lists ids that no
+longer exist.
+
 ```sql
-SELECT hand_start_id, status_message, attempted_at
+SELECT a.hand_start_id, a.status_message, a.attempted_at
 FROM `table-talk-497020.table_talk_dev.hand_start_processing_attempts` a
-WHERE status = 'failed_parked'
-  AND attempted_at = (
+JOIN `table-talk-497020.table_talk_dev.hand_starts` st
+  ON st.hand_start_id = a.hand_start_id
+WHERE a.status = 'failed_parked'
+  AND a.attempted_at = (
     SELECT MAX(attempted_at) FROM `table-talk-497020.table_talk_dev.hand_start_processing_attempts`
     WHERE hand_start_id = a.hand_start_id)
-ORDER BY status_message
+ORDER BY a.status_message
 ```
 
 ### Boundary fragments among failures

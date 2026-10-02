@@ -292,7 +292,7 @@ tt materialize-clips --project P --dataset D --video-id VIDEO_ID [--max-attempts
 
 `--max-attempts` defaults to 3, matching the other processing subcommands.
 
-Without `--video-id`: materializes for all videos in `videos` whose latest `clip_materialization_attempts` status is absent, `failed_transient`, or `blocked_upstream`. Videos missing the payout row are named on stdout with the reason and recorded `blocked_upstream`; the run continues and exits zero. Prints the standard stats block: `videos_processed`, `videos_complete`, `videos_blocked_upstream`, `videos_failed_transient`, `videos_failed_permanent`, `videos_failed_parked`.
+Without `--video-id`: materializes for all videos in `videos` whose latest `clip_materialization_attempts` status is absent, `failed_transient`, `blocked_upstream`, or `marked_pending`. Videos missing the payout row are named on stdout with the reason and recorded `blocked_upstream`; the run continues and exits zero. Prints the standard stats block: `videos_processed`, `videos_complete`, `videos_blocked_upstream`, `videos_failed_transient`, `videos_failed_permanent`, `videos_failed_parked`.
 With `--video-id`: materializes the specified video **whatever its latest status** — deliberate reprocessing is the point of this entry point — and raises on any non-`complete` outcome, after recording it.
 
 ### Admissibility: payout data gates the corpus
@@ -330,7 +330,7 @@ WHERE tr.video_id IS NULL
 
 ### Failure handling
 
-Phase 2 pairs `clip_manifest` with `clip_materialization_attempts`, like every other phase. Pending videos are those whose latest attempt status is absent, `failed_transient`, or `blocked_upstream`.
+Phase 2 pairs `clip_manifest` with `clip_materialization_attempts`, like every other phase. Pending videos are those whose latest attempt status is absent, `failed_transient`, `blocked_upstream`, or `marked_pending`.
 
 Five statuses:
 
@@ -341,6 +341,8 @@ Five statuses:
 | `failed_transient` | retryable, counted | BQ or write error |
 | `failed_permanent` | terminal failure | invalid `duration_seconds`, or no `videos` row |
 | `failed_parked` | terminal failure | retry cap reached (`--max-attempts`, default 3) |
+
+A sixth value can be the latest status without appearing above: `marked_pending`, which this phase never writes — `tt mark-pending` does. It is retryable and resets the cap, the same shape as `blocked_upstream` for a different reason; see "Reprocessing and the mark-pending cascade."
 
 **A missing `tournament_results` row is neither an upstream bug nor a transient error** — it is a legitimate not-yet-ready state, resolved by running an upstream command. `blocked_upstream` records it: retryable, so the video is re-selected once payouts land, but deliberately outside the `failed%` prefix the consecutive-failure counter matches on, so a video behind a slow payout extraction cannot park for a condition that is not its fault. It is worded and tallied as a block rather than a failure, because a video awaiting payout extraction is a normal outcome of a correctly ordered pipeline and reporting it as an error would train operators to ignore it.
 
@@ -1192,7 +1194,7 @@ Three checks: orphaned stage rows (anti-join against the parent table), duplicat
 
 **Phase 3's absence from the status/row check is a property of the phase, not a gap in the tool.** A clip that legitimately detects zero hand setups is `complete` with zero rows, so row count cannot be predicted from status. The report states this rather than silently omitting the phase.
 
-**Failure statuses are unconstrained everywhere,** and this falls out of omission rather than an exclusion clause: a status absent from a phase's arity map is simply not checked, and the failure statuses are never listed. This is the false positive most likely to be introduced, since it would fire on exactly the incident the tool exists to catch — see the outage path above. A contract test binds each arity map to its writer's `VALID_STATUSES`, so a new status that is neither constrained nor deliberately exempt fails loudly rather than silently going unchecked.
+**Failure statuses are unconstrained everywhere,** and this falls out of omission rather than an exclusion clause: a status absent from a phase's arity map is simply not checked, and the failure statuses are never listed. This is the false positive most likely to be introduced, since it would fire on exactly the incident the tool exists to catch — see the outage path above. A contract test binds each arity map to its writer's `VALID_STATUSES`, so a new status that is neither constrained nor deliberately exempt fails loudly rather than silently going unchecked. `marked_pending` is exempt in every phase, and that is not a tolerance: a mark is not an outcome, so no row count follows from it — a marked entity keeps whatever output its last real attempt left.
 
 Each phase is anchored on its **input** table rather than its attempts table, which makes the stage-to-attempts off-by-one tractable: an attempts table sits between the entity a phase consumes and the rows it produces, and is named for the former. Two things follow. Every input table carries `video_id` while `clip_processing_attempts`, `hand_setup_processing_attempts` and `hand_start_processing_attempts` do not, so this is what makes `--video-id` scoping possible at all. And an attempt row whose entity no longer exists — Phase 3 re-detection shrinkage — drops out rather than being flagged, which is correct: state tables are append-only audit logs and a superseded entity's history is not an anomaly.
 
@@ -1208,7 +1210,7 @@ The rebuild appended that row, and the audit reported clean across both videos: 
 
 ### Reprocessing and the mark-pending cascade
 
-`tt mark-pending` is the sanctioned way to make a finished entity eligible for reprocessing. It appends a retryable attempt row to the named stage's state table and to every stage downstream of it, and deletes the downstream stage rows that reprocessing would otherwise leave stale. `mark_pending.py` holds the cascade; `--dry-run` prints the same plan the real run executes, from the same code path.
+`tt mark-pending` is the sanctioned way to make a finished entity eligible for reprocessing. It appends a retryable row to the named stage's state table and to every stage downstream of it, and deletes the downstream stage rows that reprocessing would otherwise leave stale. `mark_pending.py` holds the cascade; `--dry-run` prints the same plan the real run executes, from the same code path.
 
 It replaces a hand-written INSERT. Deleting a stage table's rows does not cause a phase to re-run — pending queries key on latest attempt status, and an output-existence guard is rejected because several outcomes are legitimately terminal with zero rows — so reprocessing has always required appending an attempt row by hand, per phase, against ids the operator worked out themselves.
 
@@ -1228,11 +1230,19 @@ Two stages feed `hand_setups` and neither feeds the other: materialization is ar
 
 **Marks below the named stage are partly speculative, and this is expected.** `--stage hand_setups` appends `hand_setup_processing_attempts` rows for ids that re-detection may not reproduce. Harmless: every pending query joins to its input table, so an attempt row for a vanished entity selects nothing — the same property that makes `check-integrity` anchor on input tables.
 
-**A mark costs one retry slot.** Marks are written as `failed_transient`, the only retryable status every phase shares. It is inside the `failed%` family, so a mark appended after a `complete` leaves the entity at `consecutive_failures = 1` and it gets `max_attempts - 1` real attempts before parking. Pass `--max-attempts 4` on a rebuild run if the full three matter. `blocked_upstream` was not reused: it exists only in Phase 2 and means something specific.
+**The flip side: a query over an attempts table must join the input table.** Those tables still hold the history of entities re-detection has since removed — 17 in `hand_setup_processing_attempts` and 18 in `hand_start_processing_attempts` as of 2026-10-02 — and their latest status reads as retryable. A pending query joins and they select nothing; an ad-hoc query that does not will list them as though they were pending, which is how one Phase 4 check during the rebuild reported seven entities that no longer existed. This is not specific to marks: `MPBLfM4mwfE_006_004` has twelve real attempts and no `hand_setups` row. The rows are left in place — a superseded entity's history is not an anomaly, and the tables are append-only.
+
+**A mark resets the retry budget rather than spending one.** Marks are written as `marked_pending`, a status no phase writes and every phase's pending query treats as retryable. It sits outside the `failed%` family deliberately, and that is the whole mechanism: the consecutive-failure counter keys on that prefix, so a mark becomes the latest non-failure and the count resets to zero. An entity is eligible with its full retry budget whatever state it was in — parked included — and marking one that is already pending costs nothing. `blocked_upstream` was not reused: it exists only in Phase 2 and means something specific, so a mark took the same *shape* rather than the same value.
+
+It was `failed_transient` until 2026-10-02, on the reasoning that it was the one retryable status every phase shared. That made a mark read as a failure: every mark spent a retry slot, marking a parked entity bought one attempt rather than a budget, marking an already-pending entity spent a slot for nothing, and each rebuild run after a mark needed `--max-attempts` raised — 4, then 5, then 6. The instruction to do that is gone from the runbook.
+
+**The marks already written stay exactly as they are.** Over a thousand `failed_transient` rows carrying the mark message are in the attempts tables, and nothing was rewritten — state tables are append-only, and a backfill would destroy the record of what actually happened. Each pending query's reset clause therefore also recognises a mark by its `status_message`, which is what stops those from spending a slot. Measured over the corpus the day the change landed, it moved `consecutive_failures` only, only downward, and only on entities that were already terminal or whose ids no longer exist — with one exception, `YzKyFMQ1avU_004_001_001` at 5 → 3, where the three identical P5-5 failures after its last mark are real and still counted. No entity started or stopped being selected.
 
 Marks carry `status_message = "mark-pending: rebuilding {stage}"`. That string is the only trace distinguishing a synthetic mark from a real failure, and it matters — an audit reader must not read a deliberate reprocess as a rate-limit incident.
 
-It now has a second reader. Phase 5's pending query skips marks when it looks for the previous *real* attempt, so the text is defined once as `mark_pending.MARK_MESSAGE_PREFIX` and bound into that query as a parameter rather than copied into it. If the two ever diverged, a mark would count as a real attempt: a mark between two identical failures would hide the repeat, and a mark after a success would make the first genuine failure read as one.
+It now has three readers: that audit reader; Phase 5's pending query, which skips marks when it looks for the previous *real* attempt; and every phase's consecutive-failure counter, which recognises the pre-`marked_pending` marks by it. So the text is defined once as `mark_pending.MARK_MESSAGE_PREFIX` and bound into each query as a parameter rather than copied into them. If the text and those patterns ever diverged, a mark would count as a real attempt: a mark between two identical failures would hide the repeat, a mark after a success would make the first genuine failure read as one, and an old mark would resume spending a retry slot.
+
+**The repeat rule matches the message, not the status, and that is deliberate.** A new mark carries both, so one predicate covers both eras. Keying on `marked_pending` alone would reclassify every mark already in the tables as a real attempt — and a mark standing in for "the previous real attempt" is precisely what hides a genuine identical repeat, at the cost of a Pro step-D call.
 
 **`--video-id` is mandatory, single, and there is no all-videos mode.** This makes terminal entities eligible again, which costs real money when the phases run; an accidental corpus-wide invocation at 150 videos would be a large unintended expense. `--id` and `--status` narrow within the video. No status is excluded by default: whether a `failed_permanent` is recoverable is context-dependent — a malformed-JSON response may well be fixed by a prompt change, while the two clip-boundary fragments can never complete — so the dry-run reports the status composition and the operator decides. An unnarrowed run scopes its deletes by `video_id` alone, which additionally sweeps orphaned downstream rows that an id list could never reach, since an orphan's parent is by definition not in the entity set.
 
@@ -1241,6 +1251,8 @@ It now has a second reader. Phase 5's pending query skips marks when it looks fo
 ### Retry caps
 
 Orchestrators park an entity after N consecutive failures rather than retrying forever. See CLAUDE.md's "Retry caps and terminal parking" for the rules.
+
+**A mark resets the counter.** `tt mark-pending` writes `marked_pending`, which is not a `failed%` status, so it becomes the entity's latest non-failure and the count starts again at zero. That is what makes a mark grant a full budget rather than a single attempt; see "Reprocessing and the mark-pending cascade."
 
 **Phase 5 can also terminate before the cap.** A step-D gate failure identical to the previous real attempt's is recorded `failed_permanent` rather than counted toward the cap, because the error is in the input and no retry of that phase can reach it. See "An identical gate repeat is permanent." Nothing else in the pipeline does this, and it is specific to a phase whose retries cost Pro clip calls.
 

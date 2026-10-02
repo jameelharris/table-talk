@@ -127,7 +127,7 @@ Status values vary by phase, but every status falls into one of three categories
 
 - **Terminal success** — the entity is done; never re-selected. (`complete`, `complete_skipped`, `complete_uncontested`)
 - **Terminal failure** — the entity cannot complete; never re-selected. (`failed_permanent`, `failed_parked`, Phase 1's `failed_terminal`)
-- **Retryable** — re-selected on the next run. (`failed_transient`, `blocked_upstream`, Phase 1's `failed_transient_predownload` / `failed_transient_postdownload`)
+- **Retryable** — re-selected on the next run. (`failed_transient`, `blocked_upstream`, `marked_pending`, Phase 1's `failed_transient_predownload` / `failed_transient_postdownload`)
 
 `complete_skipped` is for precondition failures caught before any LLM call — the entity was examined and deliberately not processed. It is a success, not a failure: retrying would produce the same skip.
 
@@ -138,6 +138,10 @@ Status values vary by phase, but every status falls into one of three categories
 It is a fourth shape, distinct from the three terminal successes: **retryable but excluded from the retry cap.** The blocking condition is not the entity's fault, and a video sitting behind a slow payout extraction would otherwise park after three runs for a condition it cannot influence. The exclusion is not a special case in the counter — it falls out of the naming. The consecutive-failure count is computed with `MAX(IF(status NOT LIKE 'failed%', attempted_at, NULL))`, a prefix match on the failure family, so a status named outside that family resets the counter rather than advancing it. A new status that must not count toward the cap should be named the same way rather than adding an exclusion clause.
 
 Do not overload `failed_transient` for this. The two are both retryable, but conflating them makes the cap fire on a healthy entity.
+
+`marked_pending` is the fourth shape's second member, and it is that naming rule applied rather than a new mechanism. `tt mark-pending` writes it to make a finished entity eligible for reprocessing; because it is named outside the `failed%` family, the counter reads it as the entity's latest non-failure and the count resets to zero. So a mark grants a full retry budget whatever state the entity was in — parked included — and marking an already-pending entity costs nothing. It is not an attempt: no work was done and no outcome is being reported, which is also why no row count follows from it and why `check-integrity` leaves it unconstrained in every phase. Overloading `failed_transient` for marks was the original design, and it made every mark spend a retry slot — the same defect the paragraph above warns about, arriving from the reprocessing side.
+
+One wrinkle the quoted expression above does not show: the live counter carries a second disjunct matching `mark_pending.MARK_MESSAGE_PREFIX`, so that marks written before `marked_pending` existed — `failed_transient` rows carrying the mark message, and the tables are append-only, so they are permanent — also reset the count. The prefix match on the status is still the mechanism for every new mark.
 
 The three terminal successes differ in whether output exists. `complete` is success *with* output; `complete_skipped` and `complete_uncontested` are successes with zero stage rows, each for a stated structural reason. That the two zero-row statuses share a `complete_*` shape is an observation about the vocabulary as it stands, not a rule — a future status should be named for what it means, and the shared shape only records that this category has more than one member.
 
