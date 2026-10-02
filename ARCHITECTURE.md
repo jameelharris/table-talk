@@ -205,11 +205,13 @@ Freezeout (`static`) bounty is not modelled. No such event has been observed on 
 
 Some broadcasts prefix a payout with an asterisk. `payout_marked` records it; nothing in the pipeline reads it.
 
-**What it means is not known.** On `YzKyFMQ1avU` ranks 1–3 are asterisked, and those are exactly the ranks whose payout ratios depart from the flat 1.425 that holds across ranks 4–9 — so the marker correlates with a departure from the published curve. That is a correlation on one video, not a meaning.
+**What it means is now confirmed: a deal was made, and the number of marked ranks is the number of players in the deal.** On `YzKyFMQ1avU` ranks 1–3 are asterisked — a three-way deal — and those are exactly the ranks whose payout ratios depart from the flat 1.425 that holds across the unmarked ranks 4–9. The marker is the deal, and the departure from the curve is its consequence.
 
-No geometric fitting, no schedule reconstruction, no `deal_detected` field. Those belong to downstream analysis, where a larger sample makes the meaning inferable rather than guessable from two videos.
+**There is no evidence of an unmarked deal.** `MPBLfM4mwfE`'s top two payouts are near-equal — 9,423.33 and 9,423.26 — which reads like a chop, and it is not one: no rank on that panel is marked, and the flat top is the published PKO structure, where half the prize pool is paid out as bounties and the ladder flattens at the top. A near-equal pair is therefore not a signal on its own; the asterisk is.
 
-Consequence to be aware of: if marked payouts are not the scheduled ladder, ICM computed on them measures the wrong environment. Downstream ICM work must either exclude marked videos or reconstruct a schedule, and that reconstruction's validity rests on a question that is currently open.
+The capture stays raw all the same. No geometric fitting, no schedule reconstruction, no `deal_detected` field — deriving a pre-deal schedule from a post-deal ladder is downstream analysis, and it needs a larger sample than two videos whatever the marker means.
+
+Consequence to be aware of, and it is now a known rather than an open one: a marked ladder is **not** the scheduled ladder, so ICM computed on it measures the wrong environment. Downstream ICM work must either exclude marked videos or reconstruct the schedule the deal replaced.
 
 `_normalize_panel` also sets `payout_marked` when a raw payout string carries a leading asterisk. That fallback only fires on the string path — the prompt asks for bare numbers, so on the common path the asterisk never reaches Python. It is belt-and-braces against observed prompt variance (the spike saw the same prompt return `'$406.25'` on one frame and `406.25` on another), **not** a second source and not a cross-check on the model's own answer.
 
@@ -613,8 +615,16 @@ The retry was built before the step-C stack-anchor prompt fix, which largely cur
 
 Both card reads — Phase 4's step C and Phase 5's step E frame read — send the
 frame at **`MEDIA_RESOLUTION_ULTRA_HIGH`**, set per call site rather than on the
-caller. This is the measured fix for the suit misreads recorded under "Observed
-extraction errors."
+caller. This is the measured mitigation for the suit misreads recorded under
+"Observed extraction errors."
+
+**Mitigation, not fix — the corpus has an ULTRA_HIGH suit misread in it.** The
+harness below reads 0 misreads in 640 cards and the adjudicated corpus reads one,
+and both numbers are correct about what they measured. Keep that distinction when
+quoting either: the harness's zero is 20 repetitions of four specific frames, 10
+of its 13 baseline errors being a single card, where the corpus is 128 hands of
+frames nobody chose. ULTRA_HIGH moves the rate a long way down and does not take
+it to zero.
 
 **The finding.** Comparing the rebuilt Phase 4 against `hand_starts_pre_rebuild`,
 all 128 matched hands agreed on every FVA and every card *rank*. Four hole-card
@@ -623,6 +633,42 @@ as a heart — and the disagreement ran in **both directions**, the rebuilt run
 wrong on three and the pre-rebuild run wrong on the fourth. The same frame read
 correctly in one run and wrong in the other, so the cause is a marginal signal,
 not a prompt defect.
+
+**That comparison predates the fix it motivated, and the post-fix one has now
+been adjudicated.** The four cases above were measured against the 2026-09-30
+Phase 4 output, before ULTRA_HIGH shipped; Phase 4 was then re-run end to end
+with it. Against the same `hand_starts_pre_rebuild` snapshot, the current corpus
+shows **five** suit disagreements across the same 128 matched hands — still 0 FVA
+and 0 rank disagreements — and every one has been checked against the broadcast:
+
+| hand (`YzKyFMQ1avU`) | seat | pre-rebuild (HIGH) | current (ULTRA_HIGH) | correct |
+|---|---|---|---|---|
+| t=642 | UTG+1 | Q♥ | Q♣ | ULTRA_HIGH |
+| t=823 | SB | K♥ | K♠ | ULTRA_HIGH |
+| t=1617 | BB | J♠ | J♦ | ULTRA_HIGH |
+| **t=2356** | **CO** | **Q♠** | **Q♥** | **HIGH** |
+| t=2763 | SB | Q♥ | Q♠ | ULTRA_HIGH |
+
+Two notes on reading the table. `t` is the **pre-rebuild** `hand_setup_time_seconds`,
+which is the matching key; two of the five sit one second earlier in the current
+corpus (t=823 → 822, t=2356 → 2355), so query by a ±2 s window and not by equality.
+And unlike the four cases in "The finding" above, these five are not all
+spade-to-heart — one is heart/club and one spade/diamond, which is the four-colour
+deck's other confusion pair showing up in the same population.
+
+**ULTRA_HIGH is right in four of five and wrong in one.** The miss is the CO at
+t=2356 (`_010_007` in the current corpus, `_010_006` pre-rebuild): the seat holds
+A♠ Q♠ and the ULTRA_HIGH run read A♠ Q♥ — **the same spade-face-card error the
+whole section is about**, at the resolution meant to remove it. One wrong card in
+1,016 read slots is a large improvement over the arm-A baseline and it is not
+zero, which is why the heading above now says mitigation.
+
+Two things follow for reading the rest of this section. The harness's `0 / 640`
+is evidence about four frames and mostly about one card on one of them — see the
+first of the three limits below, which said so before this case existed and is
+now the load-bearing caveat rather than a footnote. And the five disagreements
+are **not** five errors: four are the pre-rebuild run's, which the fix corrects,
+so the count moving 4 → 5 is not a regression. See "Corpus state."
 
 Looking at the frames explains it. The deck is four-colour, and **face-card
 artwork is heavily red in every suit** — a K♠'s centre panel is red and black,
@@ -652,8 +698,10 @@ cards**, and controls were clean everywhere.
 **Resolution is the whole effect.** A prompt instruction to read the suit from
 the pip directly under the rank — the hypothesis the investigation began with —
 moved 4 misreads to 3, which is noise. Adding suit reference images made it
-*worse*, at 6. Every arm carrying ULTRA_HIGH went to zero and stayed there. F
-ships because it is the cheapest arm that works and the only one that changes no
+*worse*, at 6. Every arm carrying ULTRA_HIGH went to zero and stayed there *on
+these frames* — the corpus has since produced one ULTRA_HIGH misread, so read the
+arm table as a ranking of the three levers, not as an absolute rate. F ships
+because it is the cheapest arm that works and the only one that changes no
 prompt: no new code-to-prompt contract, nothing to keep in sync between a prompt
 and a loader, and no null-hedging clause to regress on.
 
@@ -663,7 +711,11 @@ and a loader, and no null-hedging clause to regress on.
   all arms — is on the frame at `YzKyFMQ1avU` t=1716, and 10 of 13 are one card,
   the BTN's Q♠. The other three known-misread frames read correctly in all 25
   reps of all five arms. "0 of 640" means that card was read right 20 times in a
-  row, not that a broad population was swept clean.
+  row, not that a broad population was swept clean. **This is the limit the
+  corpus went on to exercise:** the adjudicated ULTRA_HIGH miss at t=2356 is a
+  frame the study never looked at, and it is the same Q♠-as-Q♥ confusion. The
+  study picked its frames from the known disagreements, so it could not have
+  found it.
 - **That frame also fails the other documented way.** The HJ's Q♦ was read as Q♠
   four times (twice in A, twice in E) — diamond-to-spade, blue-to-black. The
   frame is marginal in both four-colour confusion pairs, not just one.
@@ -671,6 +723,18 @@ and a loader, and no null-hedging clause to regress on.
   that plainly: no board misread was ever reproduced. All three ULTRA_HIGH arms
   read the board controls 0 wrong in 50 cards, and so did the baseline. Step E's
   ULTRA_HIGH repairs nothing demonstrated.
+
+  **The corpus now says the same thing, and it had one candidate to say it
+  about.** Across the 57 card-bearing postflop streets present in both runs, 56
+  agree card for card. The one disagreement — `YzKyFMQ1avU` t=3835's river, A♦
+  pre-rebuild against 6♣ now — is **not a suit misread**: adjudicated against the
+  broadcast, the river is dealt at 3,906 s, the current run read it at 3,907 s and
+  is correct, and the pre-rebuild run's 3,968 s read was **a minute late** — its
+  scan landed on a later moment and read whatever card was there. That is a step-E
+  scan timing error, which is a different failure with a different fix, and it is
+  the pre-rebuild run's. **Board suit reads remain clean at both resolutions**, so
+  this half is still precautionary after a second look rather than vindicated by
+  one.
 
   It is set anyway, on three grounds. It is the **same frame read of the same
   four-colour deck** as step C, which did demonstrably fail — the board controls
@@ -724,7 +788,9 @@ means moving that count back to 12 in the same change.
 
 **What this does not fix.** Silent suit errors remain possible. The mechanism —
 a small pip against loud artwork — is reduced, not removed, and nothing in the
-pipeline detects a wrong-but-non-null card. See "What `hand_starts` guarantees,
+pipeline detects a wrong-but-non-null card. **That is no longer a hypothetical:**
+the corpus carries one, the CO's Q♠ read as Q♥ at `YzKyFMQ1avU` t=2356, found by
+comparing two runs rather than by any check. See "What `hand_starts` guarantees,
 and what it does not."
 
 ### The reproduction harness
@@ -1127,7 +1193,7 @@ A 60-hand run over `MPBLfM4mwfE`, in the same spirit as Phase 4's "What `hand_st
 
 ### What the rebuild added
 
-Phase 5 over the rebuilt corpus: 57 of 58 `hand_starts` complete, one `failed_permanent`. Two observations worth keeping.
+Phase 5 over the rebuilt corpus: 57 of 58 `hand_starts` complete, one `failed_permanent`. Those are the figures from the first `MPBLfM4mwfE` pass; the corpus-wide totals are in "Corpus state" and the two observations below are not superseded by them. Two observations worth keeping.
 
 - **`_008_001_001`'s malformed JSON was a refusal, not a parse failure.** The response was Gemini declining in prose — the six cards visible were all in player positions and no community cards were on the table. The classification is right (malformed JSON does not fix itself on a retry), but the cause is upstream of the classifier: a street was read that should not have been, either because D over-reported it or because E's scan landed before the deal. The same hand completed in the original run with `streets=preflop,flop`. D over-reporting streets on preflop-ending hands is a known and prompt-fixed failure recorded above, so this may be a residual instance — but nobody has looked at the frame, so record it as an observation and not a diagnosis.
 - **`CARD_READ_ATTEMPTS` exhausting is not always frame-limited.** `_002_001_001` failed `failed_transient` with `river: null card in read after 3 reads`, then completed on a single retry against the same frames. That read was stochastic. The known hole-card null in Phase 4 is the opposite case — six reproductions against the stored frame returned null every time, so the card is genuinely illegible. The two are **indistinguishable in `status_message`**, which means a null-after-N-reads message is not by itself grounds for giving up on a card, and the retry that resolves one costs nothing on the other.
@@ -1372,7 +1438,7 @@ Detectability is worth less than that argument assumed, for two reasons now reco
 
 Note that the marker cannot distinguish those two outcomes in advance — it names only the first unfound street — which is why the split needed adjudication against frames rather than a query. See "The truncation rate, and why hand shape decides what it costs."
 
-**One case was investigated exhaustively**, and it is recorded in full because it rules out every alternative rather than merely favouring one. `YzKyFMQ1avU_003_001_001`: the river is visible in the broadcast from 10:04 (604s), the scan window runs to roughly 623s, and the board is on screen for the better part of a minute. Flash returned `found: false` twice. Eliminated in turn:
+**One case was investigated exhaustively**, and it is recorded in full because it rules out every alternative rather than merely favouring one. `YzKyFMQ1avU_003_001_001`: the river is visible in the broadcast from 9:40 (580s), the scan window runs to roughly 623s, and the board is on screen for the better part of a minute. Flash returned `found: false` twice. (**The reveal time was recorded here as 604s and is wrong.** Both the pre-rebuild and the rebuilt run read this river at 580s — `["4d"]`, with flop 504s and turn 554s — and nothing has since read it at 604s. The correction only strengthens the window argument below: the river falls further inside the window, not nearer its edge. The runbook's verification 9 carried the same 604s expectation and is corrected too.) Eliminated in turn:
 
 - **the window** — the river falls inside it, so the scan was shown the moment;
 - **transient visibility** — the board is up for ~50s, not a frame or two;
@@ -1574,26 +1640,73 @@ Re-detection being stochastic, the row counts are expected to move. Record the n
 
 ### Corpus state
 
-The corpus is two videos. Counts move whenever a phase is re-run, and they have moved four times in a single day, so **this section is the one place they live**; everywhere else points here. A figure copied into another section is a figure that will go stale on its own schedule.
+The corpus is two videos. Counts move whenever a phase is re-run, and they have moved five times now, so **this section is the one place they live**; everywhere else points here. A figure copied into another section is a figure that will go stale on its own schedule.
+
+These are the **post-rebuild** figures: Phase 3 re-detected both videos on 2026-09-29, Phase 4 and Phase 5 ran on 2026-09-30 and were re-run on 2026-10-01 after `ultra_high` shipped, so every row carries provenance and was produced with every gate in place. The pre-rebuild figures they replace are preserved as BigQuery snapshots — `hand_setups_pre_rebuild`, `hand_starts_pre_rebuild`, `hand_actions_pre_rebuild`, `tournament_results_pre_rebuild` — which is what makes the old-versus-new comparisons below re-derivable.
 
 | | `MPBLfM4mwfE` | `YzKyFMQ1avU` |
 |---|---:|---:|
 | `clip_manifest` | 13 | 22 |
-| `hand_setups` | 57 | 96 |
-| `hand_starts` | 54 | 81 |
-| `hand_actions` | 52 | ~80 |
+| `hand_setups` | 62 | 100 |
+| `hand_starts` | 57 | 86 |
+| `hand_actions` | 57 | 84 |
 
-`YzKyFMQ1avU`'s `hand_actions` count is approximate and is the one cell not confirmed against the table. It moved when seven hands were reprocessed on Pro (see "Model selection is per call mode") and was not re-counted afterwards. Read it as "about 80," not as 80.
+**Detection moved up, and that reverses the direction the previous runs showed.** `hand_setups` went 57 → 62 and 96 → 100. Matching on `hand_setup_time_seconds` within ±2 s against the pre-rebuild snapshot: `MPBLfM4mwfE` 54 matched, 3 present only before, 8 only after; `YzKyFMQ1avU` 90 matched, 6 only before, 10 only after. "Detection is not deterministic" recorded three successive re-detections of `MPBLfM4mwfE` each finding *fewer* setups than the last (65 → 63 → 57) and said the open question should be framed to test that direction. This run breaks it. The direction is not monotone, and the churn is two-sided on both videos at roughly the same rate as before.
 
-`MPBLfM4mwfE` has been re-detected twice since the 63-row rebuild, and `YzKyFMQ1avU` was processed end to end for the first time in the same session. Wherever this document describes `YzKyFMQ1avU` as a video with stage rows and no downstream data, that description is superseded and labelled as such.
+**Phase 4 outcomes**, by each `hand_setups` row's latest `hand_setup_processing_attempts` status:
+
+| | `MPBLfM4mwfE` | `YzKyFMQ1avU` |
+|---|---:|---:|
+| `complete` | 57 | 86 |
+| `complete_uncontested` | 4 | 9 |
+| `complete_skipped` | 0 | 2 |
+| `failed_parked` | 1 | 2 |
+| `failed_permanent` | 0 | 1 |
+
+Each with its cause:
+
+- **13 `complete_uncontested`** — all carry `complete_uncontested: no voluntary chip commitment`, step A's `reason: uncontested`: every player folded to the BB, so there is no FVA to find. A success with zero stage rows, per CLAUDE.md's "Attempt status semantics."
+- **2 `complete_skipped`** — the null-stack precondition, both on `YzKyFMQ1avU`: `_001_001` (`CO`, `LJ`) and `_010_005` (`HJ`). Three seats across two hands; `MPBLfM4mwfE` has none. These are the only null `stack_size` reads in the corpus.
+- **3 `failed_parked`** — all three carry `failed_parked: no_first_voluntary_commitment_found`, step A reporting it could not find the FVA in the window. Two are duplicate detections whose window was collapsed by the duplicate: `MPBLfM4mwfE_008_004` (t=1915, re-detected as `_009_001` at t=1921 across the clip 008/009 boundary at 1920 — a 6 s window) and `YzKyFMQ1avU_017_002` (t=3985, re-detected as `_017_003` at t=3986 *inside* clip 017 — a 1 s window). The third, `YzKyFMQ1avU_016_008` (t=3785), has 16 s of clear air on either side and a full window; step A simply did not find the shove. Nothing about it is explained by window derivation.
+- **1 `failed_permanent`** — `YzKyFMQ1avU_020_002`, `P4-6: missing_hole_cards_live_seat: the FVA seat SB has no readable hole cards after retry`. It reported the same gate failure on all three runs.
+
+**Phase 5 outcomes**: 141 `complete` (57 + 84), 1 `failed_permanent`, 1 `failed_transient`. No parked hands and no skips. Both non-successes are on `YzKyFMQ1avU` and are described under "Known losses" below.
+
+**The per-gate report.** Hits, entities and final outcome grouped by `<gate_id>: <code>`, across the whole rebuild. Every gate hit in the attempts tables belongs to the rebuild and to an entity that still exists, so the rebuild-scoped and unscoped reports agree.
+
+| phase | gate | code | hits | entities | recovered | permanent | still transient |
+|---|---|---|---:|---:|---:|---:|---:|
+| 4 | P4-6 | `missing_hole_cards_live_seat` | 9 | 7 | 6 | 1 | 0 |
+| 5 | P5-4 | `action_after_fold_or_all_in` | 1 | 1 | 1 | 0 | 0 |
+| 5 | P5-5 | `all_in_mismatch` | 4 | 2 | 1 | 0 | 1 |
+| 5 | P5-7 | `illegal_betting` | 2 | 2 | 2 | 0 | 0 |
+| 5 | P5-8 | `fva_mismatch` | 2 | 1 | 1 | 0 | 0 |
+
+Five gates fired, on 13 entities, 18 hits. **11 of 13 recovered on a retry**, which is the first real test of the standing assumption that the gated errors are stochastic, and it holds for P4-6, P5-4, P5-7 and P5-8. No `PAYOUT-*` gate fired, and no gate parked anything. The two that did not recover are a P4-6 that repeats identically (above) and the P5-5 under "Known losses."
+
+**Two things the report missed as originally written, both now fixed in the runbook.** The three parked hands carry **no gate id** — `no_first_voluntary_commitment_found` is step A's own `found: false` reason, not a gate — so a bucket key built on the `<gate_id>: <code>` regex dropped every one of them and the report read as a run with no parks. Keyed on the failure code as well, they appear as `(no gate id)` / `no_first_voluntary_commitment_found`: 4 entities, 7 hits, **3 parked and 1 recovered**, so even that failure is stochastic once. And the boundary-fragment query returned **0 of 15** because it tested `hand_setup_time_seconds = clip_start_time` on the *failing* row, which in a boundary pair is the earlier row — it sits just before the boundary, never on it, and the row at `clip_start_time` is the one that completes. Keyed on the nearest neighbouring detection instead, it returns **2 of 4** terminally failed hands with a neighbour within 8 s: one boundary fragment (gap 6 s) and one within-clip duplicate (gap 1 s). Half the terminal failures are duplicate-pair members, where the original query said none were.
+
+**Old versus new — hole cards.** Matching `hand_starts` against `hand_starts_pre_rebuild` on `hand_setup_time_seconds` within ±2 s gives **128 matched hands, one to one**. Across them: **0 FVA disagreements** (seat label, seat number and action type all agree), and across 1,018 hole-card slots, 1,016 read in both runs, **0 rank disagreements**, **5 suit-only disagreements**, and 2 cards read before and null now (`YzKyFMQ1avU_016_005`'s CO). All five suit disagreements are face cards and all are on `YzKyFMQ1avU`, listed as pre-rebuild/current at the pre-rebuild `hand_setup_time_seconds`: Q♥/Q♣ at t=642, K♥/K♠ at t=823, J♠/J♦ at t=1617, Q♠/Q♥ at t=2356, Q♥/Q♠ at t=2763.
+
+**All five are adjudicated against the broadcast, and the current corpus is right in four.** The miss is the CO at t=2356 (`_010_006` pre-rebuild, `_010_007` here at t=2355): the seat holds A♠ Q♠ and the `ultra_high` run read A♠ Q♥ — the same spade-face-card confusion `ultra_high` exists to reduce. One wrong card in 1,016 slots. The other four are the pre-rebuild run's errors, which is why the count reads five against the four recorded in "Suit misreads are a resolution problem": that comparison was run against the 2026-09-30 Phase 4 output, *before* `ultra_high` shipped, and Phase 4 was then re-run end to end with it. **The 4 → 5 move is not a regression** — the fix corrects four and misses one, where before it missed three. See "Suit misreads are a resolution problem" for the per-hand table and what it does to the harness result.
+
+**Old versus new — boards.** Matching the same way at ±1 s gives **57 card-bearing postflop streets present in both runs**, of which **56 agree exactly**. The one disagreement is `YzKyFMQ1avU` t=3835 (`_016_010`): the pre-rebuild run read the river as A♦ at 3,968 s, the rebuilt run reads 6♣ at 3,907 s, with the flop and turn identical in both. Adjudicated against the broadcast: the river is dealt at **3,906 s**, so the current run's 3,907 s read is correct and the pre-rebuild run's was **a minute late** — a step-E scan timing error that landed on a later moment and read whatever was on the table, not a suit misread. **Board suit reads are clean at both resolutions**, which is the second look the precautionary half of `ultra_high` has now had.
+
+**The inert skip.** 68 of 143 postflop streets were skipped as inert — `MPBLfM4mwfE` 38 of 70 (54%), `YzKyFMQ1avU` 30 of 73 (41%), 48% overall. The pre-rebuild baseline under "Pre-rebuild gate baseline" was 42 of 104 (40%). Every `skipped_inert` street carries no timestamp and no cards, and no street in the corpus is `unread`.
+
+**Known losses.** Four hands the corpus does not carry through to `hand_actions`, and two rows that duplicate hands it already has. Two of the four have a `hand_starts` row and stop at Phase 5; two were never detected or never got past Phase 4:
+
+- **`YzKyFMQ1avU_017_003` — Phase 5 input token limit.** `400 INVALID_ARGUMENT ... input token count is 65577 but model only supports up to 65536`. Classified `failed_permanent`, correctly: the same window produces the same count. Its `raw_lead_gap_seconds` is 201 s, under `MAX_WINDOW_SECONDS` (240), and a 226 s window on the same video (`_004_004`) succeeded — so the window cap does not bound the token count, and window length alone does not predict which calls fit.
+- **`YzKyFMQ1avU_004_001` — a Phase 3 stack misread, reported by Phase 5.** `P5-5: all_in_mismatch: preflop action 3 BB all_in 9.28 leaves 10.00 BB behind`, identical on all three attempts. `hand_setups` has the BB at 18.28 BB where the seat has 8.28 behind. The value the gate contradicts was produced by Phase 3, so no number of Phase 5 retries can change it — see "Where a validation check belongs" in CLAUDE.md on why a gate that fires on an upstream value buys retries that cannot work. It sits `failed_transient` because all three attempts predate the identical-repeat rule; under that rule the next attempt records `failed_permanent` instead. See "An identical gate repeat is permanent," which this hand is the motivating case for.
+- **The two duplicate detections** (`MPBLfM4mwfE_008_004`, `YzKyFMQ1avU_017_002`) are parked, and they are not lost hands: each is a second detection of a hand the corpus already holds under the other id. The cost is a parked row, not missing data.
+- **`YzKyFMQ1avU_016_008`** is parked and *is* a lost hand — a genuine setup with a full window that step A did not resolve.
+- **`MPBLfM4mwfE` t≈2787 was found by neither run.** Neither the pre-rebuild snapshot nor the rebuilt corpus has a setup between t=2773 and t=2874. "Detection is not deterministic" records t=2787 as a hand the second of two earlier runs found and confirmed; it has now been missed twice more.
 
 **An id is not a stable reference to a hand across runs.** `hand_setup_id` is positional — `{clip_id}_{NNN}` — so it renumbers whenever a clip's detection count changes, and `hand_start_id` and the `hand_actions` key inherit that. An id observed in one run may point at a different moment in the next, or not exist. Anything citing one as a test fixture or a reproduction target must **re-derive it by timestamp first**. This is the same property behind the content-staleness gap and the frame path-reuse case; see "Detection is not deterministic" and "Frames and orphaned GCS objects."
 
-The consequence for this document is that id-level findings are labelled with the run they were observed in rather than silently re-derived. A finding tied to a superseded run is still evidence about the pipeline — it is just not a pointer to a row that exists today.
+The consequence for this document is that id-level findings are labelled with the run they were observed in rather than silently re-derived. A finding tied to a superseded run is still evidence about the pipeline — it is just not a pointer to a row that exists today. The ids in this section are the 2026-10-01 run's.
 
-**These counts predate the gates and the rebuild.** Every figure in this section was produced before the Phase 4 and Phase 5 gates existed and before any row carried provenance. They are the baseline the rebuild replaces, not the current state — re-count after it and record the new figures here. A change is expected, because detection is not deterministic; a large change is itself a finding.
-
-**The latest `MPBLfM4mwfE` run is the quality reference.** Across its 57 `hand_setups`: 0 phantom seats, 0 pot mismatches, 0 duplicate hole cards, 0 FVA disagreements, 1 null-hole-cards-on-an-acting-seat, and 6 truncations all inert. Note what that does to the findings below — the three phantom seats and the misread pot that several sections analyse are **not in this corpus**. They were real when observed and the analysis of them stands; the ids do not.
+**What the rebuilt corpus is clean on.** 0 duplicate hole cards across both videos. 0 null `stack_size` seats on `MPBLfM4mwfE` and 3 on `YzKyFMQ1avU`, all in the two skipped hands — so the all-null-stack phantom seat that several sections analyse is **not in this corpus**, and the `_005_005` / `_009_005` / `_012_003` ids those sections cite do not describe current rows. They were real when observed and the analysis of them stands. Seat-count monotonicity remains unbuilt, so the non-null phantom seat that `_012_003` was an instance of is unmeasured here rather than absent.
 
 ### Detection is not deterministic
 
@@ -1787,7 +1900,7 @@ The counterexample is `MPBLfM4mwfE_008_004`, whose pre-rebuild record put the BT
 
 Both ids are historical to the original run and have been through two re-detections since; re-derive by timestamp before treating either as a reproduction target. See "Corpus state." Four-colour confusion remains a live cause — it is one of the three behind a null on a seat that stayed in; see "Null hole cards on a seat that stayed in."
 
-**Measured and substantially fixed, by resolution rather than by wording.** The rebuild-versus-`hand_starts_pre_rebuild` comparison put the residual population at four suit disagreements across 128 matched hands, with every rank correct — and the disagreement ran in both directions, which is what identified the cause as a marginal signal rather than a prompt defect. Face-card artwork is red in every suit in this broadcast, so the corner pip is the only unambiguous evidence and it is small. Sending the frame at `MEDIA_RESOLUTION_ULTRA_HIGH` took the reproduction from 4 misreads in 160 cards to 0 in 640; a prompt instruction naming the pip moved nothing, and suit reference images made it worse. See "Suit misreads are a resolution problem" for the full arm table and the three limits on what it establishes. **Rank remains the reliable half and suit the fragile one** — that asymmetry is unchanged, only its rate has moved.
+**Measured and substantially fixed, by resolution rather than by wording.** The rebuild-versus-`hand_starts_pre_rebuild` comparison put the residual population at four suit disagreements across 128 matched hands, with every rank correct (the same comparison against the post-fix corpus reads five, four of them the pre-rebuild run's and one the fix's own miss; see "Corpus state") — and the disagreement ran in both directions, which is what identified the cause as a marginal signal rather than a prompt defect. Face-card artwork is red in every suit in this broadcast, so the corner pip is the only unambiguous evidence and it is small. Sending the frame at `MEDIA_RESOLUTION_ULTRA_HIGH` took the reproduction from 4 misreads in 160 cards to 0 in 640; a prompt instruction naming the pip moved nothing, and suit reference images made it worse. See "Suit misreads are a resolution problem" for the full arm table and the three limits on what it establishes. **Rank remains the reliable half and suit the fragile one** — that asymmetry is unchanged, only its rate has moved.
 
 Consequence depends entirely on the hand. `_002_002_001` ended preflop, so the wrong suit never collides with anything and the record stays useful. `_009_004_001`'s `Ah` also appears on the flop, correctly recorded — an impossible duplicate, and the hand is unusable.
 
@@ -2113,6 +2226,8 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 - **Cross-phase content staleness is undetected** — the residual half of the reprocessing cascade gap, now that `tt mark-pending` has closed the orphan and stale-row halves. A `hand_setup_id` that survives re-detection at a shifted moment leaves downstream rows describing a different hand, with no orphan and reconciling counts. The eventual answer is a content hash of the upstream row stored downstream, making a mismatch a one-column comparison — a schema change to two tables. **Spike the cheaper option first:** `hand_start_state.hand_setup` is already a verbatim copy of the parent blob, so a `TO_JSON_STRING` comparison may detect this today with no schema change, if BigQuery's JSON normalisation is consistent enough to make equal blobs compare equal. Two queries answer it: one same-row comparison that should return no differences, and one cross-row that should return differences. A spike, not a spec.
 - **Detection variance is quantified but not addressed** — roughly 5% of legitimate hands differ between two Phase 3 runs on identical input, in both directions, with nothing in the pipeline able to see it. See "Detection is not deterministic." Two pieces of work, in order. First the **open question**: are the misses random or systematic? A detector that loses a *kind* of hand biases every aggregate, where random misses only cost precision, and this bears directly on Phase 6's analytical premise — it decides whether the corpus can be read as a census at all. Answering it needs a third and fourth detection pass on one video and a look at what the differing hands have in common, not new machinery. Then the **cheap mitigation**: union across two detection passes, at the cost of the clip-mode calls only. It needs a cross-run dedup rule, and that rule is proximity in time — the same signal the clip-boundary duplicate below needs, which is an argument for doing them together.
+- **Possible under-detection of fast hands — an observation, not a finding** — the direction the detection-variance question above needs testing in. Two pieces of evidence, both from the rebuilt corpus. `YzKyFMQ1avU_016_008` sits 16 s after the previous setup and 16 s before the next, had a full Phase 4 window, and step A still could not find its FVA on any attempt; adjudicated at the broadcast, the hand is a fast shove. And `MPBLfM4mwfE` t≈2787 — confirmed legitimate when an earlier run found it, see "Detection is not deterministic" — has now been missed by two further runs, and the rebuilt corpus's nearest setup is 14 s earlier at t=2773, so the missed hand is a short one. Against that: the corpus-wide inter-hand gap distribution shows **no floor** — 33 of 160 gaps are under 20 s and 5 are under 10 s — so short hands are plainly detectable, and nothing here separates "short hands are missed more often" from "two short hands were missed." What would separate them is the third and fourth detection pass the item above already calls for, with the differing hands bucketed by gap length rather than merely compared. This matters more than a precision loss would: push/fold hands are where ICM pressure is highest, so a detector biased against them biases the corpus against exactly the spots the project exists to analyse.
+- **Phase 5's step D call can exceed the model's input token limit inside the window cap** — `YzKyFMQ1avU_017_003` failed `failed_permanent` on `400 INVALID_ARGUMENT ... input token count is 65577 but model only supports up to 65536`. Its `raw_lead_gap_seconds` is 201 s, well under `MAX_WINDOW_SECONDS` (240), and a 226 s window on the same video (`_004_004`) succeeded — so the cap does not bound the token count and window length does not predict which calls fit. The classification is right (the same window produces the same count) but the hand is lost with no recovery path short of a narrower window. Nothing counts tokens before the call. Options, in increasing cost: lower `MAX_WINDOW_SECONDS` to a value no observed window exceeds, which also discards the hands between it and 240; count tokens pre-flight and skip with a distinct status rather than failing; or split the window. Not decided here — the population is one hand in 143, which is the argument for leaving it until a second instance says what the real distribution is.
 - **429 retry patience, and no cooldown between runs** — supersedes "429 backoff is untested at default concurrency," which is answered: three incidents in one session exercised the backoff, it absorbed 429s, and one case exhausted all five attempts and parked a clip. Its suggested target no longer applies either — `YzKyFMQ1avU` is fully processed. Two things remain. **Whether to raise `_RETRY_MAX_ATTEMPTS`:** five attempts is an expected total wait of ~65s against a dynamic shared quota that can stay saturated far longer, and Google's own example has no stop condition; the trade is a longer-blocked worker against a parked entity. **A cooldown between runs:** the consecutive-failure counter has none, so re-running immediately against saturated capacity parks healthy entities. The second is the one that blocks unattended operation. See "Vertex uses dynamic shared quota, and the console does not show it."
 - **Seat-count monotonicity is an unbuilt check** — the player count in `hand_setups` must not increase over `hand_setup_time_seconds` within a video. One window function on one stage table. It found five phantom seats when last run, but all five ids predate a re-detection and the latest `MPBLfM4mwfE` run carries none, so the check must be re-run to have current hits — its value is that it is cheap and repeatable, not that it has a standing hit list. See "Phantom seats and the checks that find them" for why the null-stack precondition does not cover it, and "Corpus state" on why the ids expired.
 - **Step D's action sequence is now validated against the `fva` block** — closed by P5-8. The item previously read that nothing compared preflop `action_order 1` against the block Phase 5 interpolated into the prompt, and argued the check belonged in **DBT, not the orchestrator**, on the grounds that failing a hand for starting one action early would discard an otherwise-correct sequence where a flagged row keeps the data.
@@ -2123,7 +2238,9 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 - **Phase 3 builds its prompt text and its provenance file list from two functions that must agree** — `_player_info_prompt` concatenates the bounty addendum on a progressive video, and `_clip_prompt_files` lists it in the provenance block on the same condition. Nothing enforces that the two branches match. They sit adjacent and are commented, which is the weakest form of enforcement there is. One function returning both the composed prompt and the files that went into it would make the class of bug impossible; today a divergence would record a provenance that is quietly wrong, which is worse than one that is obviously missing.
 
-- **Review the per-gate report after the rebuild** — hits, recoveries and parks grouped by `<gate_id>: <code>`, with parked hands listed before any re-mark. This is where the stated assumption that the gated errors are stochastic gets its first real test: it is demonstrated only for step D's pre-FVA folds and one card read that cleared on retry, and is untested for P4-4, P4-5, the other step-D gates and P5-14 on Pro. Include the count of parked or failed hands whose `hand_setup_time_seconds` equals their clip's `clip_start_time` — if boundary fragments account for a meaningful share of gate failures, that is the argument for a Phase 3 precondition suppressing detections in the first seconds of a clip. One join against `clip_manifest`, no LLM.
+- **Per-gate report review — run, and recorded under "Corpus state."** The item read that the stochastic-error assumption had never been tested beyond step D's pre-FVA folds and one card read. It has now been: five gates fired on 13 entities, 18 hits, **11 of 13 recovered on a retry**, no gate parked anything, and no `PAYOUT-*` gate fired at all. What the run did *not* exercise is still worth naming — P4-4, P4-5 and P5-14 recorded zero hits, so they remain untested rather than vindicated.
+
+  **Two things the report's own shape got wrong, now fixed in the runbook** and recorded under "Corpus state". The `<gate_id>: <code>` regex dropped the three parked hands entirely, because `no_first_voluntary_commitment_found` is step A's `found: false` reason and carries no gate id — so "no gate parked anything" and "nothing parked" are different statements and the gate-keyed report only ever supported the first. And the boundary-fragment count the item asked for returned 0 of 15 for a reason that had nothing to do with fragments. Both queries now bucket on the failure code and on the nearest neighbouring detection respectively; see the duplicate-detection item below.
 
 - **P5-7(b) promotion review** — implement turn order as a dbt check, run it over the rebuilt corpus, and adjudicate every hand it flags against the broadcast. Promote it to a Phase 5 gate when it produces zero unadjudicated false positives across a full corpus, with the all-in, incomplete-raise and reopened-betting cases actually represented in the sample rather than merely absent from it. Until then it stays in dbt, where the four documented Pro seat-attribution swaps get flagged without costing the hand. See CLAUDE.md's "Where a validation check belongs."
 
@@ -2140,9 +2257,14 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 - **`_bq_param_type` narrowness** — `bq_param_type` handles `str`, `int`, and `dict`; REPEATED columns are handled separately via `ArrayQueryParameter` in `hand_starts_writer`. A `FLOAT64`, `BOOL`, or `BYTES` column would make this live. Note `bool` is a subclass of `int` and must be checked first if added.
 - **Built: the null-hole-card check is now P4-6 plus P5-16**, not the unbuilt dbt check this item used to describe. Its reasoning was that the rule needed Phase 5's actions and so could not run at extraction time; it needed them for every seat but the FVA's, which is the split the two gates make. H5 is the rule. What remains for dbt is the backstop every promoted gate keeps, plus the three observed causes — one of which, a chat-bubble overlay, no retry or prompt change can reach. See "Null hole cards on a seat that stayed in."
+- **Phase 3 stack misreads have no check in Phase 3** — the cause behind the standing `YzKyFMQ1avU_004_001` failure, generalised. `hand_setups` has the BB at 18.28 BB where the seat has 8.28 behind, and the only thing that notices is Phase 5's P5-5 a phase later. A leading digit that is not the seat's is the shape a partly covered stack produces — a chip tray or a bet in front of the number — which makes it a read error Phase 3 could plausibly catch at its own frame rather than a quantity only step D can contradict. Nothing is proposed here: the obvious candidates (chip conservation against the previous hand, a per-seat delta ceiling) both need a stack history Phase 3 does not currently assemble, and the population is one hand, so the measurement comes first. **Two things are already closed and should not be re-derived.** The identical-repeat rule now makes the second occurrence `failed_permanent` — the three `failed_transient` rows on this hand all predate the commit — so the hand stops billing for unreachable retries. And the mark-and-redo route out is documented. What is open is only the upstream check, and whether a second instance ever appears. See "An identical gate repeat is permanent" and CLAUDE.md's "Where a validation check belongs" on why a gate that fires on an upstream value buys retries that cannot work.
 - **`status_message` truncation** — the 500-char limit can cut off ffmpeg or Gemini error detail before the useful tail. Either raise the limit or extract the tail.
 - **`status_message` description typo** in `schemas/clip_processing_attempts.json` ("reason.NULL" missing a space).
 - **Phase 3 re-detects an in-progress hand at the start of the next clip** — a hand a few seconds old still matches the hand-setup criteria, so Phase 3 writes a second `hand_setups` row for the same poker hand just after a clip boundary. The duplicate collapses the earlier row's Phase 4 LEAD window (down to one and five seconds in the two corpus instances, see "Retry caps") and adds a duplicate hand to the corpus — two of `MPBLfM4mwfE`'s original 65 `hand_setups` rows were such fragments, and one of the two survived re-detection into the rebuilt 63. The fix belongs in Phase 3 or Phase 2: suppress detections in the first few seconds of a clip, or deduplicate across clip boundaries. Deduplication cannot key on matching state, since the duplicate rows carry different stack snapshots a second apart; proximity in time across a clip boundary is the only usable signal. The failure mode is worse downstream than upstream — Phase 4 degrades visibly, as a failure, while a phase that needs the whole hand would see the fragment as a hand that ended early, a silent wrong answer rather than a loud one.
+
+  **Amended again, by the rebuild: the clip boundary is not the only place it happens.** The rebuilt corpus has two duplicate detections in 162 `hand_setups` rows (1.2%), and only one is a boundary case. `MPBLfM4mwfE_008_004` at t=1915 is re-detected as `_009_001` at t=1921 across the clip 008/009 boundary at 1920, as described. `YzKyFMQ1avU_017_002` at t=3985 is re-detected as `_017_003` at t=3986 **inside clip 017**, 145 s after its start — so a clip-boundary suppression rule would not have caught it, and "proximity in time across a clip boundary" is too narrow a dedup signal. Proximity in time alone is the signal. Both earlier rows parked on a collapsed Phase 4 window (6 s and 1 s), which is the documented failure mode arriving from a second direction.
+
+  **The runbook's boundary-fragment query could not see either of them, and now can.** It tested `hand_setup_time_seconds = clip_start_time` on the *failing* row, and in both corpus instances the failing row is the earlier one — the hand whose window the re-detection collapsed — not the one at the boundary. It returned 0 of 15 failed-or-parked attempts, which read as "fragments are not a problem" when the opposite is what happened. It now keys on the **nearest neighbouring detection** in either direction and on whether a clip boundary sits between the pair, and returns 2 of 4 terminally failed hands. Half the terminal failures in the corpus are duplicate-pair members.
 
   **Amended: the silent wrong answer already happens, in Phase 4.** `_008_004` completed on a five-second fragment window and wrote a confident, internally consistent, wrong `hand_starts` row (see "Retry caps"). A truncated window fabricates as readily as it fails, so this is not a risk deferred to a future assembly phase; it is present behaviour, and it raises the item's priority. It is also the same problem as the detection variance above — over-detection and under-detection are one reliability question and probably one piece of work — with the note that in this sample under-detection is roughly twice as frequent as over-detection.
 

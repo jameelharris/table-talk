@@ -16,7 +16,7 @@
     "name": "status",
     "type": "STRING",
     "mode": "REQUIRED",
-    "description": "Outcome of this attempt: 'complete' | 'failed'. No in-flight states; every row represents a terminated attempt. NOT enforced as an enum by BigQuery — validation lives in application code."
+    "description": "Outcome of this attempt: 'complete' | 'failed_terminal' | 'failed_transient_predownload' | 'failed_transient_postdownload'. 'complete' is a terminal success and 'failed_terminal' a terminal failure; both are skipped on the next run. The two 'failed_transient_*' values are retryable and name which side of the download failed. This phase predates the 'failed_transient' / 'failed_permanent' / 'failed_parked' vocabulary of later phases and has no retry cap; the naming divergence is historical. 'marked_pending' does not appear here — tt mark-pending deliberately excludes the videos stage, since re-running Phase 1 is re-acquisition rather than reprocessing. No in-flight states; every row represents a terminated attempt. NOT enforced as an enum by BigQuery — validation lives in application code."
   },
   {
     "name": "video_id",

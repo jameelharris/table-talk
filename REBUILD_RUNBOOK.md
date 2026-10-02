@@ -221,9 +221,21 @@ natural ids and status/row-count mismatches — not gate outcomes.
 
 ## The per-gate report
 
-Hits, recoveries and parks grouped by gate, across all three phases. The rebuild
+Hits, recoveries, parks and permanent failures across all three phases, grouped
+by gate where there is one and **by failure code where there is not**. The rebuild
 re-runs payout extraction first, so the `PAYOUT-*` codes belong here alongside
 P4 and P5.
+
+**Not every terminal failure carries a gate id, and the gate-only version of this
+query hid the ones that matter most.** Phase 4's step A reports
+`failed_parked: no_first_voluntary_commitment_found` — the orchestrator's own
+`found: false` reason, with no `P4-<n>:` prefix — and all three of the rebuild's
+parked hands landed there. A report keyed on the gate regex alone showed zero
+parks and read as a clean run. So the bucket key falls back: a gate id when the
+message has one, the bare code the orchestrator wrote after the status prefix
+when it does not, and the first 40 characters otherwise so that infrastructure
+errors (429s, 5xx, the token-limit 400) collapse into a few rows rather than one
+per attempt.
 
 ```sql
 WITH attempts AS (
@@ -236,13 +248,25 @@ WITH attempts AS (
   SELECT 'phase5',           hand_start_id,  status, status_message, attempted_at
   FROM `table-talk-497020.table_talk_dev.hand_start_processing_attempts`
 ),
-gated AS (
+-- Every failure, gated or not. Marks are excluded by both tests: `marked_pending`
+-- is outside the `failed%` family, and the message filter catches the historical
+-- marks written as `failed_transient` before that status existed.
+classified AS (
   SELECT
-    phase, entity_id, status, attempted_at,
-    REGEXP_EXTRACT(status_message, r'(P4-\d+|P5-\d+|PAYOUT-\d+): ([a-z_]+)') AS gate_id,
-    REGEXP_EXTRACT(status_message, r'(?:P4-\d+|P5-\d+|PAYOUT-\d+): ([a-z_]+)') AS code
+    phase, entity_id, attempted_at,
+    COALESCE(
+      REGEXP_EXTRACT(status_message, r'(P4-\d+|P5-\d+|PAYOUT-\d+)'),
+      '(no gate id)'
+    ) AS gate_id,
+    COALESCE(
+      REGEXP_EXTRACT(status_message, r'(?:P4-\d+|P5-\d+|PAYOUT-\d+): ([a-z0-9_]+)'),
+      REGEXP_EXTRACT(status_message, r'^failed_[a-z_]+: ([a-z0-9_]+)$'),
+      SUBSTR(REGEXP_REPLACE(status_message, r'^failed_[a-z_]+: ', ''), 1, 40)
+    ) AS code
   FROM attempts
-  WHERE status_message IS NOT NULL
+  WHERE status LIKE 'failed%'
+    AND status_message IS NOT NULL
+    AND status_message NOT LIKE 'mark-pending: rebuilding %'
 ),
 latest AS (
   SELECT entity_id,
@@ -250,23 +274,30 @@ latest AS (
   FROM attempts GROUP BY entity_id
 )
 SELECT
-  g.phase,
-  g.gate_id,
-  g.code,
-  COUNT(*)                                             AS hits,
-  COUNT(DISTINCT g.entity_id)                          AS entities,
-  COUNTIF(l.final_status LIKE 'complete%')             AS recovered,
-  COUNTIF(l.final_status = 'failed_parked')            AS parked
-FROM gated g
+  c.phase,
+  c.gate_id,
+  c.code,
+  COUNT(*)                                                                   AS hits,
+  COUNT(DISTINCT c.entity_id)                                                AS entities,
+  COUNT(DISTINCT IF(l.final_status LIKE 'complete%',       c.entity_id, NULL)) AS recovered,
+  COUNT(DISTINCT IF(l.final_status = 'failed_parked',      c.entity_id, NULL)) AS parked,
+  COUNT(DISTINCT IF(l.final_status = 'failed_permanent',   c.entity_id, NULL)) AS permanent
+FROM classified c
 JOIN latest l USING (entity_id)
-WHERE g.gate_id IS NOT NULL
-GROUP BY g.phase, g.gate_id, g.code
-ORDER BY parked DESC, hits DESC
+GROUP BY c.phase, c.gate_id, c.code
+ORDER BY parked DESC, permanent DESC, hits DESC
 ```
 
-`recovered` counts entities that hit a gate and finished `complete*` anyway —
-the stochastic ones a retry fixed. `parked` is the population to review before
-re-marking anything.
+`recovered` counts entities that failed and finished `complete*` anyway — the
+stochastic ones a retry fixed. `parked` and `permanent` are the population to
+review before re-marking anything. All three counts are distinct entities, not
+rows, so an entity that hit the same code twice is counted once.
+
+Add `AND attempted_at >= '<run start>'` to `classified` to scope the report to one
+rebuild; on the current corpus every gate hit belongs to the rebuild, so the
+scoped and unscoped reports agree. Unscoped it also lists manual un-park rows
+(`unparked: retry after ...`), which are retryable statuses written by hand rather
+than failures — another reason to scope it to the run under review.
 
 ### Parked hands, listed
 
@@ -286,27 +317,74 @@ WHERE a.status = 'failed_parked'
 ORDER BY a.status_message
 ```
 
-### Boundary fragments among failures
+Run the same query against `hand_setup_processing_attempts` joined to
+`hand_setups` for Phase 4's parks — which is where the rebuild's three were.
 
-Whether clip-boundary fragments deserve a Phase 3 precondition. One of the two
-pre-rebuild P5-7(c) hits was a fragment rather than a prompt defect.
+### Duplicate detections among failures
+
+Whether near-duplicate detections deserve a Phase 3 precondition. The test is the
+**nearest neighbouring detection**, not the failing row's own position.
+
+**The earlier version of this query tested `hand_setup_time_seconds =
+clip_start_time` on the failing row and returned 0, which was wrong in a way that
+inverted its conclusion.** In a boundary pair the row that fails is the *earlier*
+one — the hand whose Phase 4 LEAD window the re-detection collapsed to a few
+seconds — and that row sits just *before* the boundary, never on it. The row at
+`clip_start_time` is the one that completes. The query has to look at the pair.
 
 ```sql
+WITH setups AS (
+  SELECT
+    hs.hand_setup_id, hs.clip_id,
+    hs.hand_setup_time_seconds               AS t,
+    LAG(hs.hand_setup_time_seconds)  OVER w  AS prev_t,
+    LAG(hs.clip_id)                  OVER w  AS prev_clip,
+    LEAD(hs.hand_setup_time_seconds) OVER w  AS next_t,
+    LEAD(hs.clip_id)                 OVER w  AS next_clip
+  FROM `table-talk-497020.table_talk_dev.hand_setups` hs
+  WINDOW w AS (PARTITION BY hs.video_id ORDER BY hs.hand_setup_time_seconds)
+),
+neighboured AS (
+  SELECT
+    hand_setup_id, t,
+    LEAST(IFNULL(t - prev_t, 1000000), IFNULL(next_t - t, 1000000)) AS nearest_gap,
+    IF(IFNULL(t - prev_t, 1000000) <= IFNULL(next_t - t, 1000000),
+       prev_clip != clip_id,
+       next_clip != clip_id)                                       AS neighbour_in_another_clip
+  FROM setups
+),
+terminal AS (
+  SELECT hand_setup_id FROM (
+    SELECT hand_setup_id,
+           ARRAY_AGG(status ORDER BY attempted_at DESC LIMIT 1)[OFFSET(0)] AS final_status
+    FROM `table-talk-497020.table_talk_dev.hand_setup_processing_attempts`
+    WHERE hand_setup_id IN (
+      SELECT hand_setup_id FROM `table-talk-497020.table_talk_dev.hand_setups`)
+    GROUP BY hand_setup_id)
+  WHERE final_status IN ('failed_parked', 'failed_permanent')
+)
 SELECT
-  COUNTIF(hs.hand_setup_time_seconds = cm.clip_start_time) AS at_clip_boundary,
-  COUNT(*)                                                 AS failed_or_parked
-FROM `table-talk-497020.table_talk_dev.hand_start_processing_attempts` a
-JOIN `table-talk-497020.table_talk_dev.hand_starts` st
-  ON st.hand_start_id = a.hand_start_id
-JOIN `table-talk-497020.table_talk_dev.hand_setups` hs
-  ON hs.hand_setup_id = st.hand_setup_id
-JOIN `table-talk-497020.table_talk_dev.clip_manifest` cm
-  ON cm.clip_id = hs.clip_id
-WHERE a.status IN ('failed_parked', 'failed_permanent')
+  COUNT(*)                                                                  AS terminally_failed_hands,
+  COUNTIF(n.nearest_gap <= 8)                                               AS has_neighbour_within_8s,
+  COUNTIF(n.nearest_gap <= 8 AND n.neighbour_in_another_clip)                AS boundary_fragments,
+  COUNTIF(n.nearest_gap <= 8 AND NOT n.neighbour_in_another_clip)            AS within_clip_duplicates,
+  STRING_AGG(IF(n.nearest_gap <= 8,
+                FORMAT('%s@%d gap=%d', n.hand_setup_id, n.t, n.nearest_gap),
+                NULL), '; ')                                                AS pairs
+FROM terminal t
+JOIN neighboured n USING (hand_setup_id)
 ```
 
-A meaningful share is the argument for suppressing detections in the first
-seconds of a clip.
+The denominator is hands whose *latest* status is terminal failure, not attempts,
+so a hand that failed once and later completed does not inflate it.
+
+On the rebuilt corpus this returns **2 of 4** terminally failed hands with a
+neighbour within 8 s — one boundary fragment (`MPBLfM4mwfE_008_004`, gap 6 s) and
+one within-clip duplicate (`YzKyFMQ1avU_017_002`, gap 1 s). Half the terminal
+failures are duplicate-pair members, which is the argument for a precondition —
+and because one of the two is 145 s inside its clip, a rule that only suppresses
+detections in the first seconds of a clip would catch just one of them. Proximity
+in time, not proximity to a boundary, is the usable signal.
 
 ---
 
@@ -409,17 +487,25 @@ the sequence starts and the structural gate catches it first.
 
 ```sql
 SELECT hs.hand_setup_time_seconds,
-       JSON_VALUE(st, '$.extraction_status') AS status,
-       JSON_VALUE(st, '$.street_timestamp')  AS ts
+       JSON_VALUE(st, '$.extraction_status')          AS status,
+       JSON_VALUE(st, '$.street_timestamp')           AS ts,
+       TO_JSON_STRING(JSON_QUERY(st, '$.community_cards')) AS cards
 FROM `table-talk-497020.table_talk_dev.hand_actions` ha
 JOIN `table-talk-497020.table_talk_dev.hand_setups` hs USING (hand_setup_id),
 UNNEST(JSON_QUERY_ARRAY(ha.hand_action_state, '$.streets')) AS st
 WHERE hs.video_id = 'YzKyFMQ1avU'
+  AND hs.hand_setup_time_seconds BETWEEN 486 AND 490
   AND JSON_VALUE(st, '$.street_name') = 'river'
-  AND SAFE_CAST(JSON_VALUE(st, '$.street_timestamp') AS INT64) BETWEEN 595 AND 615
 ```
 
-Expect the river `extracted` with a timestamp near 604 s.
+Expect the river `extracted` as **`["4d"]` at 580 s**. Anchor on the hand's start
+(t≈488 s), not on the river's timestamp — a run that finds no river returns no
+row either way, and a filter on the river timestamp cannot tell the two apart.
+
+**The earlier expectation of "near 604 s" was wrong.** 604 s is where the
+investigation under "Model selection is per call mode" said the river becomes
+visible; both the pre-rebuild and the rebuilt run read it at 580 s, with
+identical flop (504 s) and turn (554 s). The 580 s reading is the one to expect.
 
 ### 10 — re-running selects nothing
 
