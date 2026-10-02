@@ -97,7 +97,7 @@ _RETRY_MULTIPLIER = 2.0
 
 
 class GeminiTransientError(Exception):
-    """Retryable: HTTP 429/5xx, timeouts, connection errors."""
+    """Retryable: HTTP 429/5xx, timeouts, connection errors, input-token-limit 400."""
 
 
 class GeminiPermanentError(Exception):
@@ -144,6 +144,85 @@ def _is_rate_limited(exc: Exception) -> bool:
     return _genai_status_code(exc) == 429
 
 
+# Vertex rejects an over-large request before inference with a plain 400 naming
+# both counts. The status alone cannot identify it — a genuinely malformed
+# request is also a 400 — so the message is matched as well, and only in
+# addition to the status, never instead of it (see _genai_status_code on why a
+# bare substring match is not acceptable here).
+_INPUT_TOKEN_LIMIT_RE = re.compile(
+    r"input token count is (\d+) but model only supports up to (\d+)"
+)
+
+# Fixed prefix, so the attempts tables can be grouped by it across releases.
+#
+# Deliberately NOT a "P5-<n>: " gate id. hand_action_processing's
+# _gate_failure_outcome records a step-D gate message that repeats identically
+# as failed_permanent, on the reasoning that an identical repeat is an upstream
+# defect no retry can reach. This message repeats identically by construction —
+# the same window produces the same count — so wearing a gate id would promote
+# it to permanent and undo the classification below.
+#
+# Not clip-specific either: the classification lives in this shared module, so
+# a frame read or the payout panel read reaches it by the same path.
+INPUT_TOKEN_LIMIT_CODE = "input_token_limit"
+
+
+def _is_input_token_limit(exc: Exception) -> bool:
+    """True only for the 400 Vertex returns when the input is too large.
+
+    False for a 400 that merely mentions tokens: "token budget 429 exceeded" is
+    a permanent failure and must stay one.
+    """
+    return (
+        _genai_status_code(exc) == 400
+        and _INPUT_TOKEN_LIMIT_RE.search(str(exc)) is not None
+    )
+
+
+def _input_token_limit_message(exc: Exception) -> str:
+    """The fixed, countable message for an input-token-limit 400.
+
+    Carries both reported counts, because the limit named is not stable: it is
+    65,536, which is not gemini-2.5-pro's documented input limit (1,048,576) but
+    exactly its *output* limit, and a measured 71,823-token request was served
+    in the same run that rejected a 65,577-token one.
+    """
+    match = _INPUT_TOKEN_LIMIT_RE.search(str(exc))
+    if match is None:  # pragma: no cover - guarded by _is_input_token_limit
+        return INPUT_TOKEN_LIMIT_CODE
+    return (
+        f"{INPUT_TOKEN_LIMIT_CODE}: input {match.group(1)} "
+        f"exceeds model limit {match.group(2)}"
+    )
+
+
+def _retry_exhausted_message(exc: Exception) -> str | None:
+    """The message to raise if in-call retries run out, or None to re-raise now.
+
+    Two causes are retried inside the call.
+
+    A 429 is rate relief. An input-token-limit 400 is retried because that
+    limit is enforced inconsistently — see _input_token_limit_message — and
+    because Vertex does not bill a rejected request, so a second ask is the
+    cheapest recovery in the system: it recovers the hand inside the attempt
+    rather than leaving it for the next operator run.
+
+    The backoff is shared rather than given a second schedule. A token-limit
+    rejection needs no rate relief, but the suspected mechanism is per-backend
+    variation on the `global` endpoint, where a delay plausibly helps, and a
+    second delay policy is machinery this buys nothing.
+
+    The message must name the cause. Recording an exhausted token-limit failure
+    under the 429 wording would file it as a rate-limit incident, which is the
+    mis-bucketing the fixed code above exists to prevent.
+    """
+    if _is_rate_limited(exc):
+        return "rate limited by Vertex AI (429); retries exhausted"
+    if _is_input_token_limit(exc):
+        return f"{_input_token_limit_message(exc)}; retries exhausted"
+    return None
+
+
 def _classify_genai_error(exc: genai_errors.APIError) -> Exception:
     """Map a google.genai APIError onto this module's transient/permanent split.
 
@@ -155,7 +234,13 @@ def _classify_genai_error(exc: genai_errors.APIError) -> Exception:
     An unreadable status classifies transient, matching the orchestrators'
     "anything not recognised is transient" convention: an unclassifiable
     failure should stay retryable rather than be discarded.
+
+    The input-token-limit 400 is the one 4xx that is transient, and it is tested
+    before the status rule rather than carved out of it — the limit it reports
+    is enforced inconsistently, so the request may well be served on a retry.
     """
+    if _is_input_token_limit(exc):
+        return GeminiTransientError(_input_token_limit_message(exc))
     status = _genai_status_code(exc)
     if status is not None and 400 <= status < 500 and status != 429:
         return GeminiPermanentError(str(exc))
@@ -163,21 +248,22 @@ def _classify_genai_error(exc: genai_errors.APIError) -> Exception:
 
 
 def _call_with_retry(fn):
-    """Call fn() with truncated exponential backoff + full jitter on HTTP 429.
+    """Call fn() with truncated exponential backoff + full jitter.
 
-    Catches both exception families and retries only a genuine 429. Anything
-    else is re-raised untouched for the caller to classify.
+    Catches both exception families and retries a genuine 429 or an
+    input-token-limit 400 — see _retry_exhausted_message for why those two and
+    why they share one backoff. Anything else is re-raised untouched for the
+    caller to classify.
     """
     for attempt in range(_RETRY_MAX_ATTEMPTS):
         try:
             return fn()
         except (api_exc.ResourceExhausted, genai_errors.APIError) as exc:
-            if not _is_rate_limited(exc):
+            exhausted_message = _retry_exhausted_message(exc)
+            if exhausted_message is None:
                 raise
             if attempt == _RETRY_MAX_ATTEMPTS - 1:
-                raise GeminiTransientError(
-                    "rate limited by Vertex AI (429); retries exhausted"
-                )
+                raise GeminiTransientError(exhausted_message)
             cap_delay = min(
                 _RETRY_BASE_DELAY_SECONDS * (_RETRY_MULTIPLIER ** (attempt + 1)),
                 _RETRY_MAX_DELAY_SECONDS,

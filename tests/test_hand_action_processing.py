@@ -2418,6 +2418,9 @@ _P5_8_REASON = (
     "P5-8: fva_mismatch: preflop action 1 commits 17.6, but the fva block says 17.1"
 )
 _INFRA_MESSAGE = "rate limited by Vertex AI (429); retries exhausted"
+# gemini_caller's fixed message for the input-token-limit 400, as the attempts
+# table stores it.
+_TOKEN_LIMIT_MESSAGE = "input_token_limit: input 65577 exceeds model limit 65536"
 
 
 @pytest.mark.parametrize("previous,repeats", [
@@ -2475,6 +2478,24 @@ def test_an_infrastructure_message_never_matches_however_often_it_repeats():
     judgement about the hand. The gate-id prefix is what draws the line."""
     assert _gate_failure_outcome(_P5_5_REASON, _INFRA_MESSAGE, 0, 3)[0] == "failed_transient"
     assert _repeats_previous_gate_failure(_INFRA_MESSAGE, _INFRA_MESSAGE) is False
+
+
+def test_a_repeated_token_limit_failure_stays_transient():
+    """The input-token-limit 400 repeats byte-identically by construction — the
+    same window produces the same count — so the identical-repeat rule must not
+    reach it, or the hand would be written off on the second attempt. What makes
+    it safe is that the message wears no gate id; this asserts that holds.
+
+    YzKyFMQ1avU_017_003_001 is the case: rejected at a reported 65,577 while a
+    counted 71,823-token request on the same video was served 36 minutes earlier.
+    """
+    assert _repeats_previous_gate_failure(_TOKEN_LIMIT_MESSAGE, _TOKEN_LIMIT_MESSAGE) is False
+    assert (
+        _repeats_previous_gate_failure(
+            _TOKEN_LIMIT_MESSAGE, f"failed_transient: {_TOKEN_LIMIT_MESSAGE}"
+        )
+        is False
+    )
 
 
 def test_p5_14_is_out_of_scope_even_though_it_is_a_p5_gate():

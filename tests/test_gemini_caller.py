@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -13,10 +14,12 @@ from google.genai import types
 from table_talk.gemini_caller import (
     _RETRY_MAX_ATTEMPTS,
     FRAME_RESOLUTION_ULTRA_HIGH,
+    INPUT_TOKEN_LIMIT_CODE,
     GeminiPermanentError,
     GeminiTransientError,
     _classify_genai_error,
     _genai_status_code,
+    _is_input_token_limit,
     _is_rate_limited,
     call_gemini_for_clip,
     call_gemini_for_frame,
@@ -965,6 +968,102 @@ def test_rate_limit_detection_does_not_read_the_message():
     misleading = _genai_error(400, "INVALID_ARGUMENT")
     misleading.args = ("400 INVALID_ARGUMENT. token budget 429 exceeded",)
     assert _is_rate_limited(misleading) is False
+
+
+# --- the input-token-limit 400 ---
+
+
+def _token_limit_error(reported=65577, limit=65536):
+    """The 400 that killed YzKyFMQ1avU_017_003_001, shaped as Vertex sends it."""
+    err = _genai_error(400, "INVALID_ARGUMENT")
+    err.args = (
+        f"400 INVALID_ARGUMENT. {{'error': {{'code': 400, 'message': 'Unable to "
+        f"submit request because the input token count is {reported} but model only "
+        f"supports up to {limit}. Reduce the input token count and try again.', "
+        f"'status': 'INVALID_ARGUMENT'}}}}",
+    )
+    return err
+
+
+def test_input_token_limit_400_is_transient_not_permanent():
+    """The limit reported is not the model's documented input limit and is not
+    enforced consistently — a measured 71,823-token step D was served in the same
+    run that rejected a 65,577-token one — so the hand must stay retryable."""
+    classified = _classify_genai_error(_token_limit_error())
+    assert isinstance(classified, GeminiTransientError)
+
+
+def test_input_token_limit_message_is_fixed_and_carries_both_counts():
+    message = str(_classify_genai_error(_token_limit_error()))
+    assert message == "input_token_limit: input 65577 exceeds model limit 65536"
+    # The countable prefix is what the attempts tables group by, and it must not
+    # wear a gate id: hand_action_processing promotes an identical gate-message
+    # repeat to failed_permanent, and this message repeats by construction.
+    assert message.startswith(f"{INPUT_TOKEN_LIMIT_CODE}: ")
+    assert not re.match(r"^P5-\d+: ", message)
+
+
+@pytest.mark.parametrize("exc,expected", [
+    (_token_limit_error(), True),
+    # A 400 that merely mentions tokens stays permanent.
+    (_genai_error(400, "INVALID_ARGUMENT"), False),
+    (_genai_error(429), False),
+])
+def test_is_input_token_limit(exc, expected):
+    assert _is_input_token_limit(exc) is expected
+
+
+def test_token_budget_400_is_still_permanent():
+    """The sibling of test_rate_limit_detection_does_not_read_the_message: the
+    match must be the input-token-limit wording, not the word "token"."""
+    misleading = _genai_error(400, "INVALID_ARGUMENT")
+    misleading.args = ("400 INVALID_ARGUMENT. token budget 429 exceeded",)
+    assert _is_input_token_limit(misleading) is False
+    assert isinstance(_classify_genai_error(misleading), GeminiPermanentError)
+
+
+def test_input_token_limit_400_is_retried_inside_the_call():
+    """Retried in-call because Vertex does not bill a rejected request and the
+    limit is enforced inconsistently, so a second ask is the cheapest recovery
+    there is — it saves the hand inside the attempt."""
+    mock_client_inst = _failing_client(_token_limit_error(), _make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
+            result = call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
+
+    assert result == {"ok": True}
+    mock_sleep.assert_called_once()
+    assert mock_client_inst.models.generate_content.call_count == 2
+
+
+def test_input_token_limit_exhaustion_names_its_own_cause():
+    """Not the 429 wording. An exhausted token-limit failure filed as a
+    rate-limit incident is exactly the mis-bucketing the fixed code prevents."""
+    mock_client_inst = _failing_client(*([_token_limit_error()] * _RETRY_MAX_ATTEMPTS))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        with patch("table_talk.gemini_caller.time.sleep"):
+            with pytest.raises(GeminiTransientError) as excinfo:
+                call_gemini_for_frame(PROMPT, FRAME_BYTES, PROJECT, user_text=USER_TEXT)
+
+    message = str(excinfo.value)
+    assert message == (
+        "input_token_limit: input 65577 exceeds model limit 65536; retries exhausted"
+    )
+    assert "429" not in message
+    assert mock_client_inst.models.generate_content.call_count == _RETRY_MAX_ATTEMPTS
+
+
+def test_input_token_limit_400_is_retried_on_the_clip_caller_too():
+    """The call that actually hits this is step D, which is clip mode."""
+    mock_client_inst = _failing_client(_token_limit_error(), _make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.time.sleep") as mock_sleep:
+        result = _call_clip(mock_client_inst)
+
+    assert result == {"ok": True}
+    mock_sleep.assert_called_once()
 
 
 # --- integration test ---
