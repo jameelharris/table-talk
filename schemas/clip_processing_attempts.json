@@ -9,7 +9,7 @@
     "name": "status",
     "type": "STRING",
     "mode": "REQUIRED",
-    "description": "Outcome of this attempt: 'complete' | 'failed_transient' | 'failed_permanent'. No in-flight states. NOT enforced as an enum by BigQuery — validation lives in application code."
+    "description": "Outcome of this attempt: 'complete' | 'marked_pending' | 'failed_transient' | 'failed_permanent' | 'failed_parked'. 'failed_parked' means the retry cap was reached and the clip will no longer be selected; it and 'failed_permanent' are terminal failures, as 'complete' is a terminal success. 'marked_pending' is written by `tt mark-pending`, not by an attempt: it is retryable and resets the consecutive-failure count, so a mark grants a full retry budget. No in-flight states. NOT enforced as an enum by BigQuery — validation lives in application code."
   },
   {
     "name": "status_message",

@@ -15,7 +15,7 @@
     "name": "status",
     "type": "STRING",
     "mode": "REQUIRED",
-    "description": "Outcome of this attempt: 'complete' | 'complete_skipped' | 'failed_transient' | 'failed_permanent' | 'failed_parked'. 'complete_skipped' means a precondition check failed and no LLM calls were made. 'failed_parked' means the retry cap was reached and the hand start will no longer be selected. Both are terminal, as are 'complete' and 'failed_permanent'; only 'failed_transient' is re-selected. No in-flight states. NOT enforced as an enum by BigQuery — validation lives in application code."
+    "description": "Outcome of this attempt: 'complete' | 'complete_skipped' | 'marked_pending' | 'failed_transient' | 'failed_permanent' | 'failed_parked'. 'complete_skipped' means a precondition check failed and no LLM calls were made. 'failed_parked' means the retry cap was reached and the hand start will no longer be selected. Both are terminal, as are 'complete' and 'failed_permanent'; 'failed_transient' and 'marked_pending' are re-selected. 'marked_pending' is written by `tt mark-pending`, not by an attempt: it is retryable and resets the consecutive-failure count, so a mark grants a full retry budget. No in-flight states. NOT enforced as an enum by BigQuery — validation lives in application code."
   },
   {
     "name": "status_message",
