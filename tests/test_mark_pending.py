@@ -382,14 +382,16 @@ def test_marks_cover_the_named_stage_and_everything_downstream():
     mocks["tournament_results_processing_attempts"].assert_not_called()
 
 
-def test_marks_are_written_as_failed_transient_with_a_greppable_message():
+def test_marks_are_written_as_marked_pending_with_a_greppable_message():
+    """`marked_pending`, not `failed_transient`: outside the `failed%` family so
+    the consecutive-failure counter resets rather than spending a retry slot."""
     _, _, mocks = _run(
         "hand_starts",
         entities=[("vid001_001_001", "complete", 1)],
         mark_ids={"hand_starts": ["vid001_001_001_001"]},
     )
     rows = mocks["hand_setup_processing_attempts"].call_args.args[0]
-    assert [r.status for r in rows] == ["failed_transient"]
+    assert [r.status for r in rows] == ["marked_pending"]
     assert rows[0].status_message == "mark-pending: rebuilding hand_starts"
     assert rows[0].hand_setup_id == "vid001_001_001"
     assert rows[0].attempt_id

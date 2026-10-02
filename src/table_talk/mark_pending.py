@@ -85,21 +85,31 @@ STAGES: tuple[str, ...] = tuple(DOWNSTREAM)
 # belongs to the phase producing `hand_starts`.
 _SPEC = {spec.output_table: spec for spec in PHASES}
 
-# The only retryable status every phase shares. `blocked_upstream` exists only in
-# Phase 2 and means something specific; do not reuse it.
+# A mark's own status, retryable in every phase. It is deliberately outside the
+# `failed%` family, which is the whole mechanism: the consecutive-failure counter
+# keys on that prefix, so a mark becomes the latest non-failure and the count
+# resets to zero. An entity is therefore eligible with its full retry budget
+# whatever state it was in, and marking twice costs nothing.
 #
-# Known consequence: `failed_transient` is inside the `failed%` family, so a mark
-# appended after a `complete` leaves the entity at `consecutive_failures = 1` and
-# it gets `max_attempts - 1` real attempts before parking. Pass
-# `--max-attempts 4` on a rebuild run if the full three matter.
-_MARK_STATUS = "failed_transient"
+# `failed_transient` used to be used instead, on the reasoning that it was the
+# one retryable status every phase shared. That made a mark read as a failure:
+# every mark spent a retry slot, marking a parked entity bought one attempt
+# rather than a budget, and a rebuild run needed `--max-attempts` raised to
+# compensate. Pending queries still treat the marks already written that way as
+# resets, by their message.
+#
+# `blocked_upstream` was not reused: it exists only in Phase 2 and means
+# something specific.
+MARK_STATUS = "marked_pending"
 
 # The message every mark carries, before the stage name. Public and defined once
-# because two things now read it: an audit reader, who must not mistake a
-# deliberate reprocess for a rate-limit incident, and Phase 5's pending query,
-# which skips marks when it looks for the previous *real* attempt. If the text and
-# that query's pattern ever diverge, a mark counts as a real attempt and a first
-# genuine failure reads as an identical repeat.
+# because three things now read it: an audit reader, who must not mistake a
+# deliberate reprocess for a rate-limit incident; Phase 5's pending query, which
+# skips marks when it looks for the previous *real* attempt; and every phase's
+# consecutive-failure counter, which recognises by this message the marks written
+# before `MARK_STATUS` existed. If the text and those patterns ever diverge, a
+# mark counts as a real attempt: a first genuine failure reads as an identical
+# repeat, and an old mark spends a retry slot again.
 MARK_MESSAGE_PREFIX = "mark-pending: rebuilding "
 
 # Gemini calls one re-run makes per marked entity. The estimate exists to make
@@ -486,7 +496,7 @@ def execute(
         for entity_id in ids:
             kwargs = {
                 key_column: entity_id,
-                "status": _MARK_STATUS,
+                "status": MARK_STATUS,
                 "status_message": message,
             }
             if has_attempt_id:
