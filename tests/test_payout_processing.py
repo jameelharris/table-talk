@@ -29,7 +29,7 @@ from table_talk.payout_processing import (
     process_pending_videos,
     process_video,
 )
-from table_talk.mark_pending import MARK_MESSAGE_PREFIX
+from table_talk.mark_pending import MARK_MESSAGE_PREFIX, MARK_STATUS
 from table_talk.provenance import hash_files
 from table_talk.videos_downloader import DownloadPermanentError
 
@@ -945,7 +945,7 @@ def _upload_fixture_video(gcs_client, video_id, duration_seconds=1):
     return blob
 
 
-def _write_attempt_row(bq_client, video_id, status):
+def _write_attempt_row(bq_client, video_id, status, status_message=None):
     from table_talk._generated.tournament_results_processing_attempts_row import (
         TournamentResultsProcessingAttemptsRow,
     )
@@ -958,7 +958,9 @@ def _write_attempt_row(bq_client, video_id, status):
             attempt_id=uuid.uuid4().hex,
             video_id=video_id,
             status=status,
-            status_message=f"integration seed: {status}",
+            status_message=(
+                f"integration seed: {status}" if status_message is None else status_message
+            ),
         ),
         project=_INTEGRATION_PROJECT,
         dataset=_INTEGRATION_DATASET,
@@ -1171,6 +1173,57 @@ def test_pending_query_selection_semantics(
             assert pending[0].video_id == video_id
             assert pending[0].duration_seconds == 3000
             assert pending[0].consecutive_failures == expect_failures
+    finally:
+        _cleanup(bq_client, video_id)
+
+
+# A mark must leave the entity eligible with a clean retry budget whatever
+# preceded it, and marking twice must cost nothing. Written through
+# mark_pending's own status and message, so a rename of either moves these
+# tests with it rather than leaving them asserting a stale literal.
+_PENDING_MARK = (MARK_STATUS, f"{MARK_MESSAGE_PREFIX}tournament_results")
+# A mark written before `marked_pending` existed: a `failed_transient` row
+# carrying the mark message. Over a thousand are in the corpus, and the counter
+# has to recognise them by message or they keep spending a retry slot.
+_PENDING_OLD_MARK = ("failed_transient", f"{MARK_MESSAGE_PREFIX}tournament_results")
+
+_MARK_BUDGET_HISTORIES = [
+    pytest.param(
+        ["failed_transient", "failed_transient", "failed_transient", "failed_parked",
+         _PENDING_MARK],
+        0, id="parked_then_mark",
+    ),
+    pytest.param([_PENDING_MARK, _PENDING_MARK], 0, id="marked_twice"),
+    pytest.param([_PENDING_MARK, "failed_transient"], 1, id="mark_then_one_real_failure"),
+    pytest.param(
+        ["failed_transient", "failed_transient", _PENDING_OLD_MARK], 0, id="historical_mark"
+    ),
+    pytest.param(["complete", _PENDING_MARK], 0, id="success_then_mark"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("history,expected_failures", _MARK_BUDGET_HISTORIES)
+def test_pending_query_gives_a_marked_video_a_clean_retry_budget(history, expected_failures):
+    from google.cloud import bigquery
+
+    bq_client = bigquery.Client(project=_INTEGRATION_PROJECT)
+    video_id = _seed_video(bq_client)
+
+    try:
+        for entry in history:
+            status, message = entry if isinstance(entry, tuple) else (entry, None)
+            _write_attempt_row(bq_client, video_id, status, message)
+
+        pending = _find_pending_videos(
+            _INTEGRATION_PROJECT,
+            _INTEGRATION_DATASET,
+            only_video_ids=[video_id],
+            client=bq_client,
+        )
+
+        assert len(pending) == 1, f"Expected the marked video to be selected, got {pending}"
+        assert pending[0].consecutive_failures == expected_failures
     finally:
         _cleanup(bq_client, video_id)
 

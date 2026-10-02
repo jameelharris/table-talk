@@ -35,7 +35,7 @@ from table_talk.hand_action_processing import (
     process_hand_start,
     process_pending_hand_starts,
 )
-from table_talk.mark_pending import MARK_MESSAGE_PREFIX
+from table_talk.mark_pending import MARK_MESSAGE_PREFIX, MARK_STATUS
 from table_talk.provenance import hash_files
 from table_talk.reference_images import STREET_REFERENCE_ORDER, reference_image_filename
 from table_talk.videos_downloader import DownloadPermanentError
@@ -1771,8 +1771,10 @@ def test_find_pending_hand_starts_skips_a_mark_when_finding_the_previous_attempt
         assert len(results) == 1
         # The mark is the latest row, and the gate failure is still what counts.
         assert results[0].previous_status_message == gate
-        # It does still cost a retry slot, which is unchanged behaviour.
-        assert results[0].consecutive_failures == 2
+        # And it costs no retry slot: an old-style mark is recognised by its
+        # message and resets the count, so the gate failure before it is no
+        # longer counted either.
+        assert results[0].consecutive_failures == 0
     finally:
         _cleanup_hand_start(bq_client, ids)
 
@@ -1836,6 +1838,59 @@ def test_find_pending_hand_starts_latest_parked_not_selected():
             client=bq_client,
         )
         assert results == []
+    finally:
+        _cleanup_hand_start(bq_client, ids)
+
+
+# A mark must leave the entity eligible with a clean retry budget whatever
+# preceded it, and marking twice must cost nothing. Written through
+# mark_pending's own status and message, so a rename of either moves these
+# tests with it rather than leaving them asserting a stale literal.
+_PENDING_MARK = (MARK_STATUS, f"{MARK_MESSAGE_PREFIX}hand_actions")
+# A mark written before `marked_pending` existed: a `failed_transient` row
+# carrying the mark message. Over a thousand are in the corpus, and the counter
+# has to recognise them by message or they keep spending a retry slot.
+_PENDING_OLD_MARK = ("failed_transient", f"{MARK_MESSAGE_PREFIX}hand_actions")
+
+_MARK_BUDGET_HISTORIES = [
+    pytest.param(
+        ["failed_transient", "failed_transient", "failed_transient", "failed_parked",
+         _PENDING_MARK],
+        0, id="parked_then_mark",
+    ),
+    pytest.param([_PENDING_MARK, _PENDING_MARK], 0, id="marked_twice"),
+    pytest.param([_PENDING_MARK, "failed_transient"], 1, id="mark_then_one_real_failure"),
+    pytest.param(
+        ["failed_transient", "failed_transient", _PENDING_OLD_MARK], 0, id="historical_mark"
+    ),
+    pytest.param(["complete", _PENDING_MARK], 0, id="success_then_mark"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("history,expected_failures", _MARK_BUDGET_HISTORIES)
+def test_find_pending_hand_starts_gives_a_marked_hand_a_clean_retry_budget(
+    history, expected_failures
+):
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_INTEGRATION_PROJECT)
+    ids = _seed_hand_start(bq_client, uid_tag="p5q")
+
+    try:
+        for entry in history:
+            status, message = entry if isinstance(entry, tuple) else (entry, None)
+            _write_hand_start_attempt(bq_client, ids.hand_start_id, status, message)
+
+        results = _find_pending_hand_starts(
+            _INTEGRATION_PROJECT,
+            _INTEGRATION_DATASET,
+            only_hand_start_ids=[ids.hand_start_id],
+            client=bq_client,
+        )
+
+        assert len(results) == 1, f"Expected the marked hand to be selected, got {results}"
+        assert results[0].consecutive_failures == expected_failures
     finally:
         _cleanup_hand_start(bq_client, ids)
 

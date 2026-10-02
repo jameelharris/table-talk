@@ -20,7 +20,7 @@ from table_talk.clip_materialization import (
 from table_talk.clip_materialization_attempts_writer import (
     write_clip_materialization_attempt_row,
 )
-from table_talk.mark_pending import MARK_MESSAGE_PREFIX
+from table_talk.mark_pending import MARK_MESSAGE_PREFIX, MARK_STATUS
 from table_talk.videos_writer import VideosRow, write_video_row
 
 PROJECT = "test-project"
@@ -599,13 +599,15 @@ def _seed_video(video_id, duration, *, project, dataset, client):
     )
 
 
-def _seed_attempt(video_id, status, *, project, dataset, client):
+def _seed_attempt(video_id, status, *, project, dataset, client, status_message=None):
     write_clip_materialization_attempt_row(
         ClipMaterializationAttemptsRow(
             attempt_id=uuid.uuid4().hex,
             video_id=video_id,
             status=status,
-            status_message=f"integration seed: {status}",
+            status_message=(
+                f"integration seed: {status}" if status_message is None else status_message
+            ),
         ),
         project=project,
         dataset=dataset,
@@ -744,6 +746,56 @@ def test_blocked_upstream_does_not_advance_the_retry_cap():
 
         _seed_attempt(video_id, "failed_transient", project=project, dataset=dataset, client=client)
         assert _failures() == 1
+    finally:
+        _cleanup(client, project, dataset, [video_id])
+
+
+# A mark must leave the entity eligible with a clean retry budget whatever
+# preceded it, and marking twice must cost nothing. Written through
+# mark_pending's own status and message, so a rename of either moves these
+# tests with it rather than leaving them asserting a stale literal.
+_PENDING_MARK = (MARK_STATUS, f"{MARK_MESSAGE_PREFIX}clip_manifest")
+# A mark written before `marked_pending` existed: a `failed_transient` row
+# carrying the mark message. Over a thousand are in the corpus, and the counter
+# has to recognise them by message or they keep spending a retry slot.
+_PENDING_OLD_MARK = ("failed_transient", f"{MARK_MESSAGE_PREFIX}clip_manifest")
+
+_MARK_BUDGET_HISTORIES = [
+    pytest.param(
+        ["failed_transient", "failed_transient", "failed_transient", "failed_parked",
+         _PENDING_MARK],
+        0, id="parked_then_mark",
+    ),
+    pytest.param([_PENDING_MARK, _PENDING_MARK], 0, id="marked_twice"),
+    pytest.param([_PENDING_MARK, "failed_transient"], 1, id="mark_then_one_real_failure"),
+    pytest.param(
+        ["failed_transient", "failed_transient", _PENDING_OLD_MARK], 0, id="historical_mark"
+    ),
+    pytest.param(["complete", _PENDING_MARK], 0, id="success_then_mark"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("history,expected_failures", _MARK_BUDGET_HISTORIES)
+def test_pending_query_gives_a_marked_video_a_clean_retry_budget(history, expected_failures):
+    project = "table-talk-497020"
+    dataset = "table_talk_dev"
+    video_id = f"test_{uuid.uuid4().hex[:8]}"
+    client = bigquery.Client(project=project)
+
+    try:
+        _seed_video(video_id, 300, project=project, dataset=dataset, client=client)
+        for entry in history:
+            status, message = entry if isinstance(entry, tuple) else (entry, None)
+            _seed_attempt(
+                video_id, status, project=project, dataset=dataset, client=client,
+                status_message=message,
+            )
+
+        pending = _find_pending_videos(project, dataset, [video_id], client=client)
+
+        assert len(pending) == 1, f"Expected the marked video to be selected, got {pending}"
+        assert pending[0].consecutive_failures == expected_failures
     finally:
         _cleanup(client, project, dataset, [video_id])
 

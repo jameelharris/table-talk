@@ -15,7 +15,7 @@ from table_talk.gemini_caller import (
     GeminiPermanentError,
     GeminiTransientError,
 )
-from table_talk.mark_pending import MARK_MESSAGE_PREFIX
+from table_talk.mark_pending import MARK_MESSAGE_PREFIX, MARK_STATUS
 from table_talk.hand_start_processing import (
     PendingHandSetup,
     _find_pending_hand_setups,
@@ -1526,7 +1526,7 @@ def _seed_hand_setup_for_pending_query(bq_client):
     return video_id, hand_setup_id
 
 
-def _write_pending_query_attempt(bq_client, hand_setup_id, status):
+def _write_pending_query_attempt(bq_client, hand_setup_id, status, status_message=None):
     from table_talk._generated.hand_setup_processing_attempts_row import (
         HandSetupProcessingAttemptsRow,
     )
@@ -1539,7 +1539,7 @@ def _write_pending_query_attempt(bq_client, hand_setup_id, status):
             attempt_id=uuid.uuid4().hex,
             hand_setup_id=hand_setup_id,
             status=status,
-            status_message=status,
+            status_message=status if status_message is None else status_message,
         ),
         project=_PENDING_QUERY_PROJECT,
         dataset=_PENDING_QUERY_DATASET,
@@ -1697,6 +1697,57 @@ def test_find_pending_hand_setups_latest_parked_not_selected():
             only_hand_setup_ids=[hand_setup_id], client=bq_client,
         )
         assert results == [], f"Expected parked entity to be excluded, got {results}"
+    finally:
+        _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id)
+
+
+# A mark must leave the entity eligible with a clean retry budget whatever
+# preceded it, and marking twice must cost nothing. Written through
+# mark_pending's own status and message, so a rename of either moves these
+# tests with it rather than leaving them asserting a stale literal.
+_PENDING_MARK = (MARK_STATUS, f"{MARK_MESSAGE_PREFIX}hand_starts")
+# A mark written before `marked_pending` existed: a `failed_transient` row
+# carrying the mark message. Over a thousand are in the corpus, and the counter
+# has to recognise them by message or they keep spending a retry slot.
+_PENDING_OLD_MARK = ("failed_transient", f"{MARK_MESSAGE_PREFIX}hand_starts")
+
+_MARK_BUDGET_HISTORIES = [
+    pytest.param(
+        ["failed_transient", "failed_transient", "failed_transient", "failed_parked",
+         _PENDING_MARK],
+        0, id="parked_then_mark",
+    ),
+    pytest.param([_PENDING_MARK, _PENDING_MARK], 0, id="marked_twice"),
+    pytest.param([_PENDING_MARK, "failed_transient"], 1, id="mark_then_one_real_failure"),
+    pytest.param(
+        ["failed_transient", "failed_transient", _PENDING_OLD_MARK], 0, id="historical_mark"
+    ),
+    pytest.param(["complete", _PENDING_MARK], 0, id="success_then_mark"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("history,expected_failures", _MARK_BUDGET_HISTORIES)
+def test_find_pending_hand_setups_gives_a_marked_setup_a_clean_retry_budget(
+    history, expected_failures
+):
+    from google.cloud import bigquery as bq
+
+    bq_client = bq.Client(project=_PENDING_QUERY_PROJECT)
+    video_id, hand_setup_id = _seed_hand_setup_for_pending_query(bq_client)
+
+    try:
+        for entry in history:
+            status, message = entry if isinstance(entry, tuple) else (entry, None)
+            _write_pending_query_attempt(bq_client, hand_setup_id, status, message)
+
+        results = _find_pending_hand_setups(
+            _PENDING_QUERY_PROJECT, _PENDING_QUERY_DATASET,
+            only_hand_setup_ids=[hand_setup_id], client=bq_client,
+        )
+
+        assert len(results) == 1, f"Expected the marked setup to be selected, got {results}"
+        assert results[0].consecutive_failures == expected_failures
     finally:
         _cleanup_pending_query_fixture(bq_client, video_id, hand_setup_id)
 
