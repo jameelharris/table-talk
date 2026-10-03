@@ -71,7 +71,7 @@ def build_provenance(
     `models` is keyed by call mode ("clip", "frame") rather than holding one
     value, because every phase but payout extraction makes both kinds of call and
     they can be served by different models — that split is the whole point of
-    TT_CLIP_MODEL and TT_FRAME_MODEL being separate.
+    the per-phase clip models and TT_FRAME_MODEL being separate.
 
     `media_resolution` is keyed the same way and for the same reason, and it is
     **required rather than defaulted**. Resolution is a request parameter that

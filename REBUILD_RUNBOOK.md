@@ -111,10 +111,10 @@ tt process-clips --project $PROJECT --dataset $DATASET \
   --video-id <VIDEO>
 ```
 
-Default models. **Do not set `TT_CLIP_MODEL` here** — the Pro requirement is
-Phase 5's clip calls only, and the variable is shared, so exporting it would
-move Phase 3's detection onto Pro at roughly 3x the token cost for no measured
-benefit.
+Default models, and nothing to set. Phase 3's detection runs on
+`TT_HAND_SETUP_CLIP_MODEL`, which defaults to Flash in code and is the only
+phase that variable touches — the shared `TT_CLIP_MODEL` that used to make this
+a warning is removed, and setting it now fails the command outright.
 
 **Check:** row count is in the expected range and no clip failed. Counts moving
 is expected — detection is not deterministic.
@@ -173,7 +173,7 @@ longer exists. See H5 in ARCHITECTURE.
 ## Step 5 — Phase 5, hand actions
 
 ```
-TT_CLIP_MODEL=gemini-2.5-pro tt process-hand-starts \
+tt process-hand-starts \
   --project $PROJECT --dataset $DATASET \
   --videos-bucket $VIDEOS --hand-actions-bucket $ACTIONS \
   --video-id <VIDEO>
@@ -182,10 +182,14 @@ TT_CLIP_MODEL=gemini-2.5-pro tt process-hand-starts \
 Step E's community-card read also runs at `MEDIA_RESOLUTION_ULTRA_HIGH` now. No
 board misread was ever reproduced, so this one is prophylactic.
 
-**`TT_CLIP_MODEL` is written inline on this command, never exported.** It is
-read once at import, so its scope is whichever command carries it. Exported for
-the session it would silently move Phase 3's detection and Phase 4's step A onto
-Pro as well.
+**No model variable on this command any more.** Phase 5's clip calls default
+to `gemini-3.1-pro-preview` in code, on `TT_HAND_ACTION_CLIP_MODEL`, which no
+other phase reads. The old `TT_CLIP_MODEL=gemini-2.5-pro` prefix is gone twice
+over: 2.5 Pro retires on Agent Platform by 16–20 October, and the variable it
+was set through is removed. If you have it exported from an earlier session,
+every `tt` command will now fail with a message naming the per-phase
+replacements — unset it. See ARCHITECTURE, "Phase 5's clip model is
+`gemini-3.1-pro-preview`."
 
 The default `--max-attempts 3` is right everywhere above: a mark is written as
 `marked_pending`, which resets the consecutive-failure count, so every marked

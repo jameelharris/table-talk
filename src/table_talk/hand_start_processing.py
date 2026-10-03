@@ -29,7 +29,7 @@ from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
 from .gemini_caller import (
     CLIP_MEDIA_RESOLUTION,
-    CLIP_MODEL,
+    HAND_START_CLIP_MODEL,
     FRAME_MODEL,
     FRAME_RESOLUTION_ULTRA_HIGH,
     GeminiPermanentError,
@@ -526,6 +526,7 @@ async def process_hand_setup(
             hs.hand_setup_time_seconds,
             hs.hand_setup_time_seconds + hs.available_seconds,
             project_id,
+            model=HAND_START_CLIP_MODEL,
             user_text="Identify the first voluntary chip commitment and second action in this video window.",
             entity_id=hs.hand_setup_id,
         )
@@ -571,7 +572,7 @@ async def process_hand_setup(
             # carries Phase 3's own provenance block unchanged, so a hand_starts
             # row records both layers without this phase assembling anything.
             "provenance": build_provenance(
-                models={"clip": CLIP_MODEL, "frame": FRAME_MODEL},
+                models={"clip": HAND_START_CLIP_MODEL, "frame": FRAME_MODEL},
                 # The frame call is step C, which overrides the caller's default
                 # per part. Recorded because resolution changes what a read
                 # returns and is invisible in the model id and the prompt hash.

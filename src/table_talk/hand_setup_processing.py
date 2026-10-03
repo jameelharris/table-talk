@@ -23,7 +23,7 @@ from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
 from .gemini_caller import (
     CLIP_MEDIA_RESOLUTION,
-    CLIP_MODEL,
+    HAND_SETUP_CLIP_MODEL,
     FRAME_MEDIA_RESOLUTION,
     FRAME_MODEL,
     GeminiPermanentError,
@@ -238,6 +238,7 @@ async def process_clip(
             clip.clip_start_time,
             clip.clip_end_time,
             project_id,
+            model=HAND_SETUP_CLIP_MODEL,
             user_text="Identify all new hand setups in this video.",
             entity_id=clip.clip_id,
         )
@@ -310,7 +311,7 @@ async def process_clip(
                     "pot_size_bb": inner.get("pot_size_bb"),
                     "players": players,
                     "provenance": build_provenance(
-                        models={"clip": CLIP_MODEL, "frame": FRAME_MODEL},
+                        models={"clip": HAND_SETUP_CLIP_MODEL, "frame": FRAME_MODEL},
                         # Unchanged by the card-read work — this phase's frame
                         # call keeps the caller's default. Recorded anyway so the
                         # block has one shape across phases and a future change

@@ -218,6 +218,40 @@ def test_process_clip_happy_path():
     assert rows_arg[0].hand_setup_state["total_seat_count"] == 6
 
 
+def test_detection_clip_call_uses_the_hand_setup_clip_model():
+    """Phase 3 stays on Flash, and says so at the call site.
+
+    The clip model is per phase now, so the model a call uses is visible where
+    the call is made rather than inferred from a shared constant.
+    """
+    from table_talk.gemini_caller import HAND_SETUP_CLIP_MODEL
+
+    with (
+        patch("table_talk.hand_setup_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_ONE_SETUP) as clip,
+        patch("table_talk.hand_setup_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch("table_talk.hand_setup_processing.call_gemini_for_frame", return_value=_PLAYER_INFO),
+        patch("table_talk.hand_setup_processing.upload_frame"),
+        patch("table_talk.hand_setup_processing.write_hand_setups"),
+        patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row"),
+        patch(
+            "table_talk.hand_setup_processing.HAND_SETUP_CLIP_MODEL",
+            "sentinel-hand-setup-model",
+        ),
+    ):
+        _run(process_clip(
+            _CLIP, "/tmp/video.mp4", "proj", "ds",
+            "hand-setups-bucket", "videos-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
+        ))
+
+    # The sentinel is what makes this discriminating. All three Flash defaults
+    # coincide, so asserting the literal would pass if this call site read
+    # FRAME_MODEL or another phase's constant instead.
+    assert clip.call_args.kwargs["model"] == "sentinel-hand-setup-model"
+    assert HAND_SETUP_CLIP_MODEL == "gemini-3.8-flash"
+
+
 def test_gemini_calls_are_tagged_with_the_entity_they_are_for():
     """The clip detection names the clip; each frame read names its hand setup.
 
@@ -663,10 +697,10 @@ def test_provenance_lists_the_bounty_addendum_only_on_a_progressive_video():
 def test_provenance_records_both_call_modes():
     """Phase 3 makes a clip call (detection) and a frame call (player info), and
     the two can be served by different models."""
-    from table_talk.gemini_caller import CLIP_MODEL, FRAME_MODEL
+    from table_talk.gemini_caller import FRAME_MODEL, HAND_SETUP_CLIP_MODEL
 
     provenance = _provenance_only("none")
-    assert provenance["models"] == {"clip": CLIP_MODEL, "frame": FRAME_MODEL}
+    assert provenance["models"] == {"clip": HAND_SETUP_CLIP_MODEL, "frame": FRAME_MODEL}
     key = "prompts/identify_hand.md"
     assert provenance["prompts"][key] == _P3_HASHES[key]
 

@@ -13,6 +13,8 @@ from google.genai import types
 
 from table_talk.gemini_caller import (
     _RETRY_MAX_ATTEMPTS,
+    HAND_ACTION_CLIP_MODEL,
+    HAND_SETUP_CLIP_MODEL,
     FRAME_RESOLUTION_ULTRA_HIGH,
     INPUT_TOKEN_LIMIT_CODE,
     GeminiPermanentError,
@@ -85,6 +87,7 @@ def test_clip_request_structure():
             end_offset_seconds=50,
             project_id=PROJECT,
             location="us-central1",
+            model=HAND_SETUP_CLIP_MODEL,
             user_text=USER_TEXT,
         )
 
@@ -234,6 +237,7 @@ def test_clip_user_text_override():
             start_offset_seconds=10,
             end_offset_seconds=50,
             project_id=PROJECT,
+            model=HAND_SETUP_CLIP_MODEL,
             user_text="Identify the first voluntary chip commitment and second action in this video window.",
         )
 
@@ -272,6 +276,7 @@ def test_clip_without_reference_images_is_unchanged_two_parts():
             start_offset_seconds=10,
             end_offset_seconds=50,
             project_id=PROJECT,
+            model=HAND_SETUP_CLIP_MODEL,
             user_text=USER_TEXT,
         )
 
@@ -297,6 +302,7 @@ def test_clip_with_reference_images_labels_each_blob_and_keeps_text_last():
             start_offset_seconds=10,
             end_offset_seconds=50,
             project_id=PROJECT,
+            model=HAND_SETUP_CLIP_MODEL,
             user_text=USER_TEXT,
             reference_images=images,
         )
@@ -349,6 +355,7 @@ def test_clip_empty_reference_images_list_is_two_parts():
             start_offset_seconds=10,
             end_offset_seconds=50,
             project_id=PROJECT,
+            model=HAND_SETUP_CLIP_MODEL,
             user_text=USER_TEXT,
             reference_images=[],
         )
@@ -366,6 +373,7 @@ def test_clip_user_text_required():
             start_offset_seconds=10,
             end_offset_seconds=50,
             project_id=PROJECT,
+            model=HAND_SETUP_CLIP_MODEL,
         )
 
 
@@ -378,6 +386,7 @@ def test_frame_user_text_required():
 
 
 def _call_clip(mock_client_inst, **kwargs):
+    kwargs.setdefault("model", HAND_SETUP_CLIP_MODEL)
     with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
         return call_gemini_for_clip(
             prompt=PROMPT,
@@ -609,8 +618,14 @@ def _load_fresh_module():
 
 
 def _unset_model_env(monkeypatch):
-    monkeypatch.delenv("TT_CLIP_MODEL", raising=False)
-    monkeypatch.delenv("TT_FRAME_MODEL", raising=False)
+    for name in (
+        "TT_CLIP_MODEL",
+        "TT_HAND_SETUP_CLIP_MODEL",
+        "TT_HAND_START_CLIP_MODEL",
+        "TT_HAND_ACTION_CLIP_MODEL",
+        "TT_FRAME_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _call_frame_on(module, mock_client_inst):
@@ -631,28 +646,75 @@ def _call_clip_on(module, mock_client_inst):
             start_offset_seconds=10,
             end_offset_seconds=50,
             project_id=PROJECT,
+            model=module.HAND_SETUP_CLIP_MODEL,
             user_text=USER_TEXT,
         )
 
 
 def test_model_defaults(monkeypatch):
-    # Both call modes default to the same model today. That is deliberate — the
-    # split is a mechanism for reversing the clip default, not a claim that the
-    # two values differ — so this test cannot tell the constants apart on its
-    # own: it would pass if one caller read the other's constant. The two
-    # env-var isolation tests below are what carry that guarantee.
+    """Every model a phase uses is a default in code, not an operator step.
+
+    Phase 5's value is the one that matters here. It used to be supplied by
+    hand, so forgetting it ran Phase 5 on Flash and produced hands that look
+    complete and end a street early. This assertion is what makes the correct
+    model the thing that happens when nobody does anything.
+
+    The three Flash defaults coincide, so this test cannot tell *those* apart
+    on its own — it would pass if one caller read another's constant. The
+    isolation tests below carry that guarantee.
+    """
     _unset_model_env(monkeypatch)
     module = _load_fresh_module()
 
-    assert module.CLIP_MODEL == "gemini-3.8-flash"
+    assert module.HAND_SETUP_CLIP_MODEL == "gemini-3.8-flash"
+    assert module.HAND_START_CLIP_MODEL == "gemini-3.8-flash"
+    assert module.HAND_ACTION_CLIP_MODEL == "gemini-3.1-pro-preview"
     assert module.FRAME_MODEL == "gemini-3.8-flash"
+
+
+def test_phase_five_default_is_not_flash(monkeypatch):
+    # Stated separately and negatively, because the defect being prevented is
+    # Phase 5 silently running on Flash. A future edit that collapsed the clip
+    # constants back together would still satisfy the equality above if it
+    # happened to pick the Pro value; this fails unless they actually differ.
+    _unset_model_env(monkeypatch)
+    module = _load_fresh_module()
+
+    assert module.HAND_ACTION_CLIP_MODEL != module.HAND_SETUP_CLIP_MODEL
+    assert module.HAND_ACTION_CLIP_MODEL != module.HAND_START_CLIP_MODEL
+    assert module.HAND_ACTION_CLIP_MODEL != module.FRAME_MODEL
+
+
+@pytest.mark.parametrize(
+    "env_var,constant",
+    [
+        ("TT_HAND_SETUP_CLIP_MODEL", "HAND_SETUP_CLIP_MODEL"),
+        ("TT_HAND_START_CLIP_MODEL", "HAND_START_CLIP_MODEL"),
+        ("TT_HAND_ACTION_CLIP_MODEL", "HAND_ACTION_CLIP_MODEL"),
+    ],
+)
+def test_each_phase_clip_model_has_its_own_override(monkeypatch, env_var, constant):
+    # Each phase is overridable on its own. A deployed job sets whichever it
+    # needs in its Terraform job definition; the code stays the source of
+    # defaults.
+    _unset_model_env(monkeypatch)
+    monkeypatch.setenv(env_var, "model-under-test")
+    module = _load_fresh_module()
+
+    assert getattr(module, constant) == "model-under-test"
+    # And only that one moved.
+    others = {"HAND_SETUP_CLIP_MODEL", "HAND_START_CLIP_MODEL", "HAND_ACTION_CLIP_MODEL"}
+    others.discard(constant)
+    for name in others:
+        assert getattr(module, name) != "model-under-test"
+    assert module.FRAME_MODEL != "model-under-test"
 
 
 def test_clip_env_var_sets_request_model_and_usage_log(monkeypatch, capsys):
     # The usage line is the only record of which model produced a corpus, so
     # it has to follow the same source as the request itself.
     _unset_model_env(monkeypatch)
-    monkeypatch.setenv("TT_CLIP_MODEL", "clip-model-under-test")
+    monkeypatch.setenv("TT_HAND_SETUP_CLIP_MODEL", "clip-model-under-test")
     module = _load_fresh_module()
 
     mock_client_inst = _patched_client(_make_response('{"ok": true}'))
@@ -685,7 +747,7 @@ def test_clip_env_var_does_not_affect_frame_calls(monkeypatch, capsys):
     # "gemini-3.7-flash" against a "gemini-3.8-flash" default is a one-character
     # difference a reader can fail to see.
     _unset_model_env(monkeypatch)
-    monkeypatch.setenv("TT_CLIP_MODEL", "clip-model-under-test")
+    monkeypatch.setenv("TT_HAND_SETUP_CLIP_MODEL", "clip-model-under-test")
     module = _load_fresh_module()
 
     mock_client_inst = _patched_client(_make_response('{"ok": true}'))
@@ -713,7 +775,7 @@ def test_usage_log_reports_the_model_that_actually_ran(monkeypatch, capsys):
     # The provenance guarantee: with two constants, _log_usage can no longer
     # read one and be right. One call of each mode, both lines checked.
     _unset_model_env(monkeypatch)
-    monkeypatch.setenv("TT_CLIP_MODEL", "clip-model-under-test")
+    monkeypatch.setenv("TT_HAND_SETUP_CLIP_MODEL", "clip-model-under-test")
     monkeypatch.setenv("TT_FRAME_MODEL", "frame-model-under-test")
     module = _load_fresh_module()
 
@@ -732,8 +794,35 @@ def test_tt_gemini_model_is_retired(monkeypatch):
     monkeypatch.setenv("TT_GEMINI_MODEL", "retired-model-under-test")
     module = _load_fresh_module()
 
-    assert module.CLIP_MODEL == "gemini-3.8-flash"
+    assert module.HAND_SETUP_CLIP_MODEL == "gemini-3.8-flash"
+    assert module.HAND_ACTION_CLIP_MODEL == "gemini-3.1-pro-preview"
     assert module.FRAME_MODEL == "gemini-3.8-flash"
+
+
+def test_tt_clip_model_is_removed_and_fails_loudly(monkeypatch):
+    """Setting the removed variable raises at import, naming its replacements.
+
+    A warning would not do. TT_CLIP_MODEL was written inline on documented
+    commands, so it lives in runbooks and shell history, and the whole reason
+    it is going away is that a quietly-wrong model produces data that looks
+    right. A variable that silently stopped working would be that same failure
+    in new clothes.
+    """
+    _unset_model_env(monkeypatch)
+    monkeypatch.setenv("TT_CLIP_MODEL", "gemini-2.5-pro")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _load_fresh_module()
+
+    message = str(excinfo.value)
+    assert "TT_CLIP_MODEL" in message
+    # The message has to be actionable: it names every replacement.
+    for replacement in (
+        "TT_HAND_SETUP_CLIP_MODEL",
+        "TT_HAND_START_CLIP_MODEL",
+        "TT_HAND_ACTION_CLIP_MODEL",
+    ):
+        assert replacement in message
 
 
 # --- happy path tests ---

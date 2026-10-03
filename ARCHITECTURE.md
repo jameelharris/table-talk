@@ -382,7 +382,7 @@ Picks up pending clips from `clip_manifest`, downloads the source video to a per
 - `videos_downloader.py` — GCS-to-local download (done once per video, reused across clips); raises `DownloadPermanentError` on GCS 404
 - `frame_extractor.py` — ffmpeg subprocess wrapper; sharpness/saturation filters match the notebook's image-quality settings; accepts `float | int` timestamps
 - `frame_uploader.py` — GCS frame upload
-- `gemini_caller.py` — Vertex AI Gemini caller (clip-mode video + frame-mode image), with truncated exponential backoff retry on HTTP 429: 5 attempts, full jitter, delays capped at 60s. The retry and the transient/permanent split key on the **status code** across both exception families the stack raises — `google.genai.errors.APIError` and `google.api_core.exceptions` — never on the exception class; see "The 429 backoff that never fired." `user_text` is required on both callers so no phase can silently inherit another's user turn. The model is set per call mode, each read once at import: `TT_CLIP_MODEL` (default `gemini-3.8-flash`) for `call_gemini_for_clip`, `TT_FRAME_MODEL` (default `gemini-3.8-flash`) for `call_gemini_for_frame` — see "Model selection is per call mode." Neither caller takes a model argument; the `gemini_usage` line is passed the model that ran rather than reading a constant.
+- `gemini_caller.py` — Vertex AI Gemini caller (clip-mode video + frame-mode image), with truncated exponential backoff retry on HTTP 429: 5 attempts, full jitter, delays capped at 60s. The retry and the transient/permanent split key on the **status code** across both exception families the stack raises — `google.genai.errors.APIError` and `google.api_core.exceptions` — never on the exception class; see "The 429 backoff that never fired." `user_text` is required on both callers so no phase can silently inherit another's user turn. The clip model is set **per phase** and the frame model per call mode, each read once at import: `TT_HAND_SETUP_CLIP_MODEL` and `TT_HAND_START_CLIP_MODEL` (both default `gemini-3.8-flash`), `TT_HAND_ACTION_CLIP_MODEL` (default `gemini-3.1-pro-preview`), and `TT_FRAME_MODEL` (default `gemini-3.8-flash`) — see "Model selection is per phase for clip calls." `call_gemini_for_clip` takes `model` as a **required** keyword-only argument so each orchestrator passes its own constant; `call_gemini_for_frame` still reads `FRAME_MODEL` directly. The `gemini_usage` line is passed the model that ran rather than reading a constant. The shared `TT_CLIP_MODEL` is removed and setting it raises at import.
 - `hand_setups_writer.py` — `hand_setups` table writes (batched DML with replace semantics keyed on `clip_id`; JSON column passed as `dict` directly to `ScalarQueryParameter(type="JSON")` — single-encoded)
 - `seat_enrichment.py` — deterministic `SEAT_NUMBER_MAP` (BB=1, SB=2, BTN=3, CO=4, HJ=5, LJ=6, UTG+2=7, UTG+1=8, UTG=9); `add_seat_numbers` injects + sorts players; `normalize_heads_up` rewrites SB→BTN when `total_seat_count == 2`
 - `clip_processing_attempts_writer.py` — `clip_processing_attempts` state table writes
@@ -873,11 +873,10 @@ Named by street rather than index, so the path is self-describing. Up to three p
 ### CLI
 
 ```
-TT_CLIP_MODEL=gemini-2.5-pro \
-  tt process-hand-starts --project P --dataset D --videos-bucket VB --hand-actions-bucket AB [--video-id ID] [--hand-start-id ID] [--max-concurrent 4] [--max-attempts 3]
+tt process-hand-starts --project P --dataset D --videos-bucket VB --hand-actions-bucket AB [--video-id ID] [--hand-start-id ID] [--max-concurrent 4] [--max-attempts 3]
 ```
 
-**`TT_CLIP_MODEL=gemini-2.5-pro` is required, not optional.** On the Flash default, step E's scan misses real streets and the hand is silently truncated a street early — a record that looks complete. The rate is 15% across two videos, and the contested share of it corrupts aggregates rather than thinning them. See "Model selection is per call mode." The variable is read once per process, so setting it here moves Phase 5's clip calls and nothing else.
+**No model variable.** Phase 5's clip calls default to `gemini-3.1-pro-preview` in code. This command used to carry `TT_CLIP_MODEL=gemini-2.5-pro` and the prefix was load-bearing: on the Flash default, step E's scan misses real streets and the hand is silently truncated a street early — a record that looks complete, at a 15% rate across two videos. Making the right model the default is what removes that trap, rather than documenting it harder. See "Phase 5's clip model is `gemini-3.1-pro-preview`."
 
 ### D and E run sequentially
 
@@ -1393,7 +1392,7 @@ A hand is **truncated** when its latest attempt carries `D reported <street> but
 
 **Correct the earlier claim that the truncations were inert.** That was true of the six on `MPBLfM4mwfE`, which are all runouts, and it is not the general case: `YzKyFMQ1avU` contributes seven contested truncations at a 10% rate. The inertness was a property of one video's sample, and it was read as a property of the failure mode.
 
-**What the marker can and cannot tell you.** It names only the *first* street D reported that E could not find. So it bounds neither how many streets were lost nor whether any were — it fires identically when E missed a real street (a decision lost) and when D over-reported a street that never existed (nothing lost, E correct). The rate above is therefore an **upper bound on data loss, not a measurement of it**, and a marked hand needs adjudicating before it counts as corrupted. This is why the seven contested cases split five-and-two on investigation rather than all being recoveries; see "Model selection is per call mode."
+**What the marker can and cannot tell you.** It names only the *first* street D reported that E could not find. So it bounds neither how many streets were lost nor whether any were — it fires identically when E missed a real street (a decision lost) and when D over-reported a street that never existed (nothing lost, E correct). The rate above is therefore an **upper bound on data loss, not a measurement of it**, and a marked hand needs adjudicating before it counts as corrupted. This is why the seven contested cases split five-and-two on investigation rather than all being recoveries; see "Model selection is per phase for clip calls."
 
 The population is at least queryable, which is what makes any of this measurable — but "detectable" was doing more work in the earlier framing than it can bear. A detectable wrong row is still a wrong row until someone looks at it, and nothing looks at these automatically.
 
@@ -1422,13 +1421,19 @@ It also sharpened the lever under "Zero-action street extraction — lever taken
 
 **Every derived dollar figure in this document predates these measurements** and is stale in both directions: rates are lower than the Pro-only numbers assumed, token counts per call are lower, but there are more scan calls per hand than was assumed. The errors do not cancel and the sign of the total is not obvious. Figures affected: the ~$0.053 per hand and ~$3.20 per video under "What the corpus run established," the ~$1,060 20K-hand projection and the ~$300 saving under "Zero-action street extraction — lever taken," and the ≈$26 PKO-corpus figure under "Per-seat bounty capture." Treat each as an order-of-magnitude placeholder until recomputed against the table above.
 
-### Model selection is per call mode
+### Model selection is per phase for clip calls
 
-`gemini_caller` holds two model constants, not one: `TT_CLIP_MODEL` (default `gemini-3.8-flash`) serves `call_gemini_for_clip`, `TT_FRAME_MODEL` (default `gemini-3.8-flash`) serves `call_gemini_for_frame`. Both are read once at import, so a model cannot change mid-run and leave the corpus with no record of which row came from which. `TT_GEMINI_MODEL`, which set one model for the whole process, is retired rather than kept as a fallback — two mechanisms for one setting is how a run ends up with nobody sure which won.
+`gemini_caller` holds four model constants. Three are clip models, one per phase that makes clip-mode calls: `TT_HAND_SETUP_CLIP_MODEL` (Phase 3 detection, default `gemini-3.8-flash`), `TT_HAND_START_CLIP_MODEL` (Phase 4 step A, default `gemini-3.8-flash`), `TT_HAND_ACTION_CLIP_MODEL` (Phase 5 step D and the step E scans, default `gemini-3.1-pro-preview`). The fourth is `TT_FRAME_MODEL` (default `gemini-3.8-flash`), which serves `call_gemini_for_frame` for every phase, because there is one frame model and no phase disagrees about it. All are read once at import, so a model cannot change mid-run and leave the corpus with no record of which row came from which. `TT_GEMINI_MODEL`, which set one model for the whole process, is retired rather than kept as a fallback — two mechanisms for one setting is how a run ends up with nobody sure which won. `TT_CLIP_MODEL` is retired the same way and for a sharper reason; see below.
+
+**Each phase's model is a default in code, so nothing has to be set for a phase to run on the model it should run on.** That is the property the previous arrangement lacked, and the section below is largely the record of how it lacked it.
 
 The names are deliberately vendor-neutral. The values are Gemini ids today, but nothing in the callers' contract requires that to stay true, and a variable named for a vendor would be wrong the first time it isn't.
 
-**The split is by call mode, not by phase, and neither caller takes a model argument.** Both are stateless primitives that do not know which phase invoked them; a parameter would have to be plumbed through five orchestrators for no current benefit. Per-phase or per-step selection is a further step the evidence does not reach.
+**This used to read "the split is by call mode, not by phase, and neither caller takes a model argument."** The reasoning was that both callers are stateless primitives that do not know which phase invoked them, so a parameter would have to be plumbed through the orchestrators "for no current benefit," and that per-phase selection was a step the evidence did not reach.
+
+**Amended: the benefit arrived, and the condition that paragraph rested on is what changed.** Phase 5 needs a different clip model from Phases 3 and 4 *permanently*, which a single process-wide constant cannot express — so `call_gemini_for_clip` now takes `model` as a required keyword-only argument and each orchestrator passes its own constant. Three call sites gained one argument each. The primitive is no less ignorant of its caller for being told which model to use; what it no longer does is guess. `call_gemini_for_frame` is unchanged, because the frame model has no per-phase split to express.
+
+Required rather than defaulted, for the reason `user_text` is required: a default would be correct for one caller and silently wrong for the others. That is not hypothetical here — it is precisely the failure the shared `TT_CLIP_MODEL` produced.
 
 **What the evidence is.** A full-corpus comparison of `gemini-2.5-pro` against `gemini-3.8-flash` over `MPBLfM4mwfE`, adjudicated against the broadcast wherever the two disagreed.
 
@@ -1445,7 +1450,9 @@ The names are deliberately vendor-neutral. The values are Gemini ids today, but 
 
 Detectability is worth less than that argument assumed, for two reasons now recorded under "The truncation rate, and why hand shape decides what it costs." The marker names only the first unfound street, so it does not say how much was lost or whether anything was. And nothing queries it automatically — a detectable defect that no check looks for reaches an aggregate exactly as a silent one does. Detectability makes the population *measurable*, which is how the 15% figure exists at all; it does not make the rows correct.
 
-**The split is retained so this is reversible, and the reversal has now been exercised.** `TT_CLIP_MODEL=gemini-2.5-pro` moves clip calls back without touching frame reads, and that reversibility is why two constants survive a change that makes their defaults identical — collapsing them would trade a one-variable rollback for nothing. The revisit condition — a truncation rate measured across broadcasts rather than six cases on one video — has been met, and the answer is below: Phase 5 is to be run on Pro. The constants are no longer a hypothetical rollback lever; one of them now carries a standing operational setting.
+**The split was retained so this would be reversible, and the reversal was exercised.** `TT_CLIP_MODEL=gemini-2.5-pro` moved clip calls back without touching frame reads. The revisit condition — a truncation rate measured across broadcasts rather than six cases on one video — was met, and the answer was that Phase 5 should run on Pro.
+
+**Amended: that mechanism is removed, because reversibility was the wrong thing to optimise for.** A rollback lever is only worth having if the default is right and the lever is the exception. Here the default was *wrong for Phase 5* and the lever was mandatory, which inverts the economics: the thing you must remember to do every time should be the default, and the exception should be the thing you type. Per-phase constants make each phase's correct model the default and leave each one overridable on its own.
 
 **Pro recovers the contested truncations.** The seven `YzKyFMQ1avU` contested cases were re-run with `TT_CLIP_MODEL=gemini-2.5-pro`. **Five recovered the missing street**, verified against the stored frames. The other two turned out never to have had a river — both hands ended on the turn with a fold to a bet, so Flash's *step D* had over-reported a street its own step E correctly could not find. Pro wins on both failure modes: it finds the real streets Flash's scan misses, and it does not invent the ones Flash's D claims.
 
@@ -1461,13 +1468,15 @@ Note that the marker cannot distinguish those two outcomes in advance — it nam
 
 What remains is the scan itself. This is the case that moves Flash's scan weakness from "unlucky on six windows" to a property of the model on this task, which is the inference the single-video evidence above explicitly could not support.
 
-**The operational consequence: Phase 5 must be run with `TT_CLIP_MODEL=gemini-2.5-pro`.** Recorded here as an operator step *with its reason*, because someone running the documented default gets silently worse data — the failure is a hand that looks complete, not an error. It belongs in the Cloud Run job definition when orchestration lands; until then it is an invocation discipline, and nothing enforces it.
+**That operational consequence is gone, and this is the paragraph that justified removing it.** It used to read: "Phase 5 must be run with `TT_CLIP_MODEL=gemini-2.5-pro` … someone running the documented default gets silently worse data — the failure is a hand that looks complete, not an error … until then it is an invocation discipline, and nothing enforces it." An invocation discipline that nothing enforces, guarding a failure mode that produces plausible-looking rows, is a defect with a documentation-shaped patch over it. The model a phase needs is now a property of the phase.
 
-**How the scope is actually enforced, and it is not by the code.** `TT_CLIP_MODEL` is read once at import, so it applies to every clip-mode call in that process — it is scoped by *which command carries it*. On `tt process-hand-starts` it moves Phase 5's step D and step E scans only. On `tt process-hand-setups` it would also move Phase 4's step A; on `tt process-clips`, Phase 3's detection. The narrow scope is a property of the invocation, not a guarantee the primitive provides.
+**How the scope used to be enforced, and it was not by the code.** `TT_CLIP_MODEL` was read once at import, so it applied to every clip-mode call in the process — scoped by *which command carried it*. On `tt process-hand-starts` it moved Phase 5's step D and step E scans only; on `tt process-hand-setups` it would also have moved Phase 4's step A, and on `tt process-clips`, Phase 3's detection. The narrow scope was a property of the invocation, never a guarantee the primitive provided. **It is a guarantee now**: each phase reads its own constant, and no variable reaches a phase it was not named for.
+
+**`TT_CLIP_MODEL` is removed, not deprecated, and setting it raises at import.** Both of its jobs are gone — it was how Phase 5 got Pro, now a default in code, and it was the one-variable rollback, now three independent variables — so keeping it as a fallback would be a second mechanism for one setting, exactly what `TT_GEMINI_MODEL`'s retirement exists to prevent. It would also change meaning without saying so: the variable used to move *every* clip call, and alongside per-phase constants it could only move whichever phases still fell back to it, giving an operator who set it a partial, undocumented mixture. A raise rather than a warning because the variable was written inline on documented commands, so it lives in runbooks and shell history, and a warning in a long run's stderr is what nobody sees. The message names all three replacements.
 
 **The scope is deliberately narrow.** Pro on Phase 5's clip calls only — not on Phase 3's detection or Phase 4's step A. Those are also scans, but they are different tasks, and both have independent checks that came back clean: detection variance is visible by comparing runs, and step A was said to be cross-checked against step D on every hand. **That second claim was false when written** — nothing compared them until P5-8 was built; see "Step D's action sequence is now validated against the `fva` block." It is true now, which happens to rescue the conclusion, but the argument rested on it before it was. Applying Pro generically would extend a result from one scan type to three on an assumption, at roughly 3x the token cost of the two phases that make the most calls.
 
-**What is not measured: whether step D specifically needs Pro.** If it does not, a narrower split saves roughly $360 across the projected corpus — but it requires threading a model parameter through a primitive that is deliberately ignorant of its caller, against the argument two paragraphs up. The comparison is already available in existing exports: the split run put Pro on all clip calls, the current corpus is all-Flash, and both post-date the prompt changes. So this wants a query, not new calls. On the follow-up list.
+**What is still not measured: whether step D specifically needs the Pro-class model.** If it does not, a per-step split saves roughly $360 across the projected corpus. The objection that used to stand against it — threading a model parameter through a primitive ignorant of its caller — no longer applies, since `call_gemini_for_clip` now takes `model` and a fourth constant would cost one more line. What is left is the measurement, and it is still available as a query rather than new calls: the split run put Pro on all clip calls, the earlier corpus is all-Flash, and both post-date the prompt changes. On the follow-up list, now cheaper to act on than to keep deferring.
 
 **The corpus is now a Flash/Pro mixture, and the provenance is not recoverable.** Seven `YzKyFMQ1avU` hands were produced on Pro; the rest of both videos is Flash. Per "Cost instrumentation," the model that served a call is recorded only on the `gemini_usage` stderr line, which is not persisted — so no query can tell you which model produced a given row. Any comparison across the corpus that assumes a single model is wrong for those seven hands, and there is no way to exclude them from the tables alone.
 
@@ -1481,6 +1490,82 @@ The two-video truncation rate and the `_003_001_001` investigation above are a s
 
 - **t=584 is prompt ambiguity, not a model difference — and it was first recorded as the latter.** Flash read the SB's preflop re-raise as 4.55 and its flop shove as 6.55, against 7 and 4.55 in both stored Pro runs, so it went down as a Flash amount-read error. Re-running Pro against the *old* prompt produced Flash's answer, 4.55/6.55. Neither model is reliably on one side: both pairs are internally consistent against the SB's 11.1 displayed stack — Flash's sums to it exactly, Pro's reconciles under the inclusive blind convention — so no arithmetic check separates them, and the reading moves run to run. The broadcast confirms 7. This belongs to "`bet_amount` includes a posted blind" rather than to this comparison. The general lesson is worth more than the case: **a disagreement between two models can be a disagreement with an ambiguous prompt, read twice.** Attributing one to a model without re-running the other on the same prompt text will sometimes name the wrong cause.
 - **t=2529 is a fourth Pro seat swap.** The Pro rebuild puts the hand's 10.1 stack on SB where the broadcast, Pro run 1 and Flash all say BTN. Same class as the two seat attributions counted above — but it was found by three-way comparison across runs, not by the Pro-vs-Flash disagreement set, which is a concrete instance of the blind spot the caveat above describes.
+
+### Phase 5's clip model is `gemini-3.1-pro-preview`
+
+`TT_HAND_ACTION_CLIP_MODEL` defaults to `gemini-3.1-pro-preview`, serving step D
+and the step E scans. It replaces `gemini-2.5-pro`, which was supplied by hand on
+the command line.
+
+**The forcing function was retirement, not preference.** `gemini-2.5-pro` is
+scheduled to retire on Agent Platform by **16–20 October 2026**. The evidence
+that Phase 5's clip calls need a Pro-class model is unchanged and is recorded
+above — a 15% Flash truncation rate across two videos, five of seven contested
+cases recovered, and one case with every alternative eliminated — so the
+question was never whether to leave Pro but which Pro to land on. Falling back
+to the Flash default was not an option: it is the failure that evidence
+describes.
+
+**The comparison that cleared it.** A six-hand run against the 2.5 Pro
+baseline:
+
+- **Reads identical.** Every hand's extracted action sequence and board matched
+  the 2.5 Pro output. Six hands is a small sample and is stated as one — it
+  establishes no regression on the cases tested, not equivalence in general.
+- **Audio windowed on every call.** None of the six was billed the whole file's
+  audio. On 2.5 Pro that charge appeared intermittently, roughly half the time,
+  and was the single largest line in a clip call's bill. Six consecutive
+  windowed calls is suggestive rather than settled, for the reason the
+  intermittency section gives: the behaviour varies per backend and `global`
+  chooses the backend.
+- **Frames cost 66 tokens each, not 258.** The default media resolution for
+  video is lower on this model — a 3.9x reduction on the term that scales with
+  window length, and clip calls are the pipeline's highest-volume call type.
+
+Taken together the direction is strongly favourable: a 201 s step D that was
+billed 185,983 tokens with whole-file audio should land near 24,000 with
+windowed audio and 66-token frames. That figure is an estimate built from the
+two measurements above and not a reading — the audio rate on this model has not
+been measured, only its windowing.
+
+**A likely side effect, recorded as a prediction.** At 66 tokens/frame and
+windowed audio, no window the pipeline permits comes close to 65,536, so the
+`input_token_limit` rejections should stop entirely. The retry, the fixed
+message code and the park-as-revisit-trigger all stay as they are — a prediction
+is not a reason to remove a working guard, and the limit was never a function of
+our inputs in the first place. See "The 65,536-token input limit is enforced
+inconsistently."
+
+**It is a preview model, and that carries two standing caveats.**
+
+- **Availability.** Phase 5 calls it at `location="global"`, which is
+  `call_gemini_for_clip`'s default and which no Phase 5 call site overrides. The
+  regional endpoints have not been exercised for it here, so `global` should be
+  treated as the supported path until something says otherwise — which also
+  means Phase 5 inherits the per-backend variability `global` brings, including
+  the audio intermittency above.
+- **What to watch for.** A GA release of 3.1 Pro, or a replacement model, is the
+  trigger to revisit `TT_HAND_ACTION_CLIP_MODEL`'s default. Preview models can
+  change behaviour under a fixed id, which provenance cannot detect: a row
+  records the model *name*, so two rows reading `gemini-3.1-pro-preview` may not
+  have been produced by the same thing. That is a real gap and it is the cost of
+  running a preview model deliberately; the mitigation is that the reads were
+  compared against a baseline once and can be again.
+
+**The corpus now spans three clip models.** Flash before the rebuild,
+`gemini-2.5-pro` during it, `gemini-3.1-pro-preview` after. Provenance records
+which served each row, so the arms are separable — that is what it is for — but
+any cross-corpus comparison has to filter on it rather than assume one model.
+
+**Overrides belong in Terraform when orchestration lands.** The code is the
+source of defaults; a deployed Cloud Run job that needs a different model sets
+`TT_HAND_ACTION_CLIP_MODEL` (or either of the other two) in its job definition,
+alongside the project and bucket variables it already carries. That keeps the
+deployed configuration reviewable in the same place as the rest of the
+infrastructure, per "Infrastructure is Terraform-managed," and keeps the
+defaults in code where a developer running a phase by hand gets the right model
+without reading a runbook. What must not come back is a single variable that
+several phases read.
 
 ### Provenance
 
@@ -1510,8 +1595,8 @@ existing JSON state column:
 
 - `models` is keyed by **call mode**, not a single value. Every phase but payout
   extraction makes both kinds of call and they can be served by different models;
-  that split is the whole reason `TT_CLIP_MODEL` and `TT_FRAME_MODEL` are
-  separate constants.
+  that split is the whole reason the per-phase clip models and `TT_FRAME_MODEL`
+  are separate constants.
 - `prompts` lists only the files that contributed to **this row**. Phase 3 lists
   the bounty addendum on progressive videos only; Phase 5 lists step E's prompts
   and reference images only when step E ran. Listing a file a row never saw would
@@ -2436,7 +2521,7 @@ Not blocking any current phase, but accumulated as the project has grown.
 
 ### Experiments
 
-- **Does step D specifically need Pro?** Supersedes "Revisit the clip-mode model default after the first multi-video ingest," which is answered: the rate is 15% across two videos, Pro recovers the contested truncations, and Phase 5 now runs on Pro. The open question is narrower. Phase 5 makes one step-D call and two to three step-E scans per hand; if only the scans need Pro, a per-step split saves roughly **$360** across the projected corpus. Against that, it means threading a model parameter through a primitive deliberately ignorant of its caller — see "Model selection is per call mode" on why that is resisted. **The comparison needs a query, not new calls:** the split run put Pro on all clip calls, the current corpus is all-Flash, and both post-date the prompt changes, so the arms already exist in stored exports.
+- **Does step D specifically need the Pro-class model?** Supersedes "Revisit the clip-mode model default after the first multi-video ingest," which is answered: the rate is 15% across two videos, Pro recovers the contested truncations, and Phase 5's clip calls now default to `gemini-3.1-pro-preview`. The open question is narrower. Phase 5 makes one step-D call and two to three step-E scans per hand; if only the scans need it, a per-step split saves roughly **$360** across the projected corpus. The structural objection is gone — `call_gemini_for_clip` takes `model` now, so a fourth constant is one line — so this is purely a measurement. **The comparison needs a query, not new calls:** the split run put Pro on all clip calls, the earlier corpus is all-Flash, and both post-date the prompt changes, so the arms already exist in stored exports.
 - **Per-row model provenance — closed.** Every row a Gemini-calling phase writes now records the model per call mode and the version of every prompt file and reference image that produced it. The item read that the model was emitted only on the unpersisted `gemini_usage` line, so no query could attribute a row to a model — load-bearing once seven `YzKyFMQ1avU` hands were produced on Pro and the rest of the corpus on Flash. The two options it weighed, a `model` column across five tables or a note in `status_message`, were both passed over for a `provenance` key inside the existing JSON columns: no schema change, and it carries prompt versions as well as the model. See "Provenance". **The rows produced before this landed remain unattributable**, which the rebuild resolves by replacing them.
 - **Suit reference images — closed, rejected.** Four per-suit crops were added to `references/` as candidates and measured: they made misreads *worse* (6 of 160 against a baseline 4) and cost ~1,160 input tokens per call. The four PNGs remain on disk, unused by any phase, pending a decision to delete them. Do not re-propose them without reading "Suit misreads are a resolution problem" first.
 - **A combined single reference image was designed and never needed.** Stitching the four crops into one labelled strip would have cut their token cost by about three-quarters, but it only mattered if a reference-bearing arm won, and none did.

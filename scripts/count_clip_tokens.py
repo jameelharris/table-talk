@@ -46,7 +46,7 @@ from google.genai import types
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from table_talk.gemini_caller import CLIP_MODEL  # noqa: E402
+from table_talk.gemini_caller import HAND_ACTION_CLIP_MODEL  # noqa: E402
 from table_talk.prompt_context import (  # noqa: E402
     build_action_context,
     build_fva_context,
@@ -153,7 +153,7 @@ def reference_parts(reference_images):
 
 def count(client: genai.Client, system_instruction: str, parts: list) -> int:
     response = client.models.count_tokens(
-        model=CLIP_MODEL,
+        model=HAND_ACTION_CLIP_MODEL,
         contents=types.Content(role="user", parts=parts),
         config=types.CountTokensConfig(system_instruction=system_instruction),
     )
@@ -181,7 +181,7 @@ def main() -> int:
         )
 
     client = genai.Client(vertexai=True, project=args.project, location=LOCATION)
-    print(f"model={CLIP_MODEL} location={LOCATION}\n")
+    print(f"model={HAND_ACTION_CLIP_MODEL} location={LOCATION}\n")
 
     for row in rows:
         video_gcs_uri = f"gs://{args.videos_bucket}/{row.video_id}.mp4"

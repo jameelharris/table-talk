@@ -58,17 +58,20 @@ adding a third copy. The measurement is only worth anything if both halves
 describe the request Phase 5 actually makes.
 
 Usage:
-    TT_CLIP_MODEL=gemini-2.5-pro uv run python scripts/diagnose_clip_token_gap.py \
+    uv run python scripts/diagnose_clip_token_gap.py \
         --project table-talk-497020 \
         --dataset table_talk_dev \
         --videos-bucket table-talk-497020-videos-dev \
         --location us-east1
+
+Runs on whatever HAND_ACTION_CLIP_MODEL is -- Phase 5's own clip model, so this
+measures the model Phase 5 actually uses without being told. Set
+TT_HAND_ACTION_CLIP_MODEL to measure a different one.
 """
 
 import argparse
 import contextlib
 import io
-import os
 import sys
 from pathlib import Path
 
@@ -82,7 +85,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from count_clip_tokens import video_part  # noqa: E402
 
 from table_talk.gemini_caller import (  # noqa: E402
-    CLIP_MODEL,
+    HAND_ACTION_CLIP_MODEL,
     GeminiPermanentError,
     GeminiTransientError,
     call_gemini_for_clip,
@@ -211,6 +214,7 @@ def billed_prompt_tokens(
                 end,
                 project_id,
                 location,
+                model=HAND_ACTION_CLIP_MODEL,
                 user_text=STEP_D_USER_TEXT,
                 label="diagnose_clip_token_gap",
                 entity_id=entity_id,
@@ -245,15 +249,6 @@ def main() -> int:
     parser.add_argument("--location", default=DEFAULT_LOCATION)
     args = parser.parse_args()
 
-    # The measurement is model-specific and the call is billed, and the module
-    # default is Flash -- so an unset env var would quietly measure the wrong
-    # model and spend real money doing it. Refusing is cheaper than the rerun.
-    if "TT_CLIP_MODEL" not in os.environ:
-        raise SystemExit(
-            "set TT_CLIP_MODEL explicitly (the run under investigation was "
-            f"gemini-2.5-pro; this module would otherwise default to {CLIP_MODEL})"
-        )
-
     actions_prompt = (PROMPTS_DIR / "extract_player_actions.md").read_text()
 
     bq = bigquery.Client(project=args.project)
@@ -275,7 +270,7 @@ def main() -> int:
         )
     )
 
-    print(f"model={CLIP_MODEL} location={args.location}")
+    print(f"model={HAND_ACTION_CLIP_MODEL} location={args.location}")
     print(
         f"{row.hand_start_id}  t={start}  window={window}s [{start} -> {end}]  "
         f"video duration={row.duration_seconds}s\n"
@@ -285,7 +280,7 @@ def main() -> int:
 
     def count(parts: list) -> int:
         return client.models.count_tokens(
-            model=CLIP_MODEL,
+            model=HAND_ACTION_CLIP_MODEL,
             contents=types.Content(role="user", parts=parts),
             config=types.CountTokensConfig(system_instruction=filled_prompt),
         ).total_tokens
@@ -374,7 +369,7 @@ def main() -> int:
         # with `grep -o 'AUDIO_BILLING=.*' | sort | uniq -c`. Carries model as
         # well as location, because both are things a run series varies.
         print(
-            f"AUDIO_BILLING={verdict} model={CLIP_MODEL} location={args.location} "
+            f"AUDIO_BILLING={verdict} model={HAND_ACTION_CLIP_MODEL} location={args.location} "
             f"audio={audio} billed={billed}"
         )
     return 0

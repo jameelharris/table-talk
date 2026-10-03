@@ -37,8 +37,8 @@ from .card_normalization import normalize_cards
 from .frame_extractor import extract_frame
 from .frame_uploader import upload_frame
 from .gemini_caller import (
+    HAND_ACTION_CLIP_MODEL,
     CLIP_MEDIA_RESOLUTION,
-    CLIP_MODEL,
     FRAME_MODEL,
     FRAME_RESOLUTION_ULTRA_HIGH,
     GeminiPermanentError,
@@ -824,6 +824,7 @@ async def _scan_for_street(
             scan_start,
             window_end,
             project_id,
+            model=HAND_ACTION_CLIP_MODEL,
             user_text=f"Scan this clip and find when the {street_name} cards appear.",
             reference_images=reference_images,
             # Retries carry their own label so their cost is greppable apart
@@ -1025,6 +1026,7 @@ async def process_hand_start(
             hs.hand_setup_time_seconds,
             window_end,
             project_id,
+            model=HAND_ACTION_CLIP_MODEL,
             user_text="Extract the complete voluntary action sequence from this video clip.",
             label="step_d_player_actions",
             entity_id=hs.hand_start_id,
@@ -1191,7 +1193,7 @@ async def process_hand_start(
             # have. `resolved` is empty in exactly that case.
             step_e_ran = bool(resolved)
             prompt_files = ["prompts/extract_player_actions.md"]
-            models = {"clip": CLIP_MODEL}
+            models = {"clip": HAND_ACTION_CLIP_MODEL}
             media_resolution = {"clip": CLIP_MEDIA_RESOLUTION}
             if step_e_ran:
                 prompt_files += [

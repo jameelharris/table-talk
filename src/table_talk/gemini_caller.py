@@ -25,35 +25,49 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
-# One model per call mode. Both default to the same model today, and that is a
-# cost and throughput decision rather than a finding that one model reads clips
-# better: on Pro, clip-mode calls measured ~30x a frame read's prompt tokens on
-# the pipeline's highest-volume call type, and exhausted the 429 backoff twice
-# on a single video.
+# The clip model is per phase; the frame model is one value for all of them.
 #
-# The quality cost of that default is larger than first recorded. This comment
-# read "roughly 1.5% of hands — but bounded and detectable"; measured across two
-# videos the Flash truncation rate is ~15%, and it is not uniform. Runout streets
-# carry no decisions, so losing one costs cards but no action data. A *contested*
-# truncation yields a hand that looks complete and ends a street early, which
-# corrupts an aggregate rather than thinning it, and the status_message marker
-# names only the first unfound street — so it bounds neither how much was lost
-# nor whether anything was.
+# Each constant has a default in code and its own override. Nothing has to be set
+# for a phase to run on the model it should be running on, which is the property
+# the previous arrangement lacked.
 #
-# Consequence: Phase 5 is run with TT_CLIP_MODEL=gemini-2.5-pro, which recovers
-# these. The default here stays Flash because this constant also serves Phase 3
-# detection and Phase 4 step A, where the evidence does not reach and the token
-# cost is highest. See ARCHITECTURE.md "The truncation rate, and why hand shape
-# decides what it costs" and "Model selection is per call mode."
+# WHY PER PHASE
 #
-# The two constants survive precisely so that trade is reversible: setting
-# TT_CLIP_MODEL alone moves clip calls to Pro without touching frame reads. That
-# is now a standing operational setting, not a hypothetical rollback. Do not
-# collapse them.
+# There used to be one TT_CLIP_MODEL for every clip-mode call in the process,
+# and it failed in both directions. It was shared, so setting it to get Phase 5
+# onto Pro also moved Phase 3's detection and Phase 4's step A if the command
+# happened to carry it — the scope was a property of the invocation, never a
+# guarantee of the code. And Phase 5's correct model was not its default, so
+# forgetting the variable ran Phase 5 on Flash and produced hands that look
+# complete but end a street early. A silent wrong answer, not an error.
+#
+# WHY THESE VALUES
+#
+# Flash for Phase 3's detection and Phase 4's step A. That is a cost and
+# throughput decision rather than a finding that Flash reads clips better: on
+# Pro, clip-mode calls measured ~30x a frame read's prompt tokens on the
+# pipeline's highest-volume call type, and exhausted the 429 backoff twice on a
+# single video. The quality evidence against Flash does not reach these two call
+# sites — they are different tasks with independent checks.
+#
+# gemini-3.1-pro-preview for Phase 5's step D and step E scans, where that
+# evidence does reach: measured across two videos the Flash truncation rate is
+# ~15%, and it is not uniform. Runout streets carry no decisions, so losing one
+# costs cards but no action data. A *contested* truncation yields a hand that
+# looks complete and ends a street early, which corrupts an aggregate rather
+# than thinning it, and the status_message marker names only the first unfound
+# street — so it bounds neither how much was lost nor whether anything was.
+#
+# HAND_ACTION_CLIP_MODEL is a PREVIEW model and is exercised at
+# location="global" only, which is call_gemini_for_clip's default and which no
+# Phase 5 call site overrides. Watch for GA or a replacement. See
+# ARCHITECTURE.md "Phase 5's clip model is gemini-3.1-pro-preview" and "Model
+# selection is per phase for clip calls, per call mode for frames."
 #
 # Read once at import, because a model changing mid-run would leave the corpus
 # with no record of which row came from which. The names are vendor-neutral on
-# purpose.
+# purpose, and each is named for the stage table its phase writes rather than
+# for a phase number, so the primitive stays readable without a phase map.
 #
 # Public, not underscore-private: the provenance block on every stage row records
 # which model served each call mode, and it reads these. Re-deriving them from
@@ -61,8 +75,40 @@ from google.genai import types
 # thing TT_GEMINI_MODEL's retirement exists to prevent — and would silently
 # disagree if the environment were ever mutated after import. Same reasoning as
 # _log_usage taking `model` as a parameter: guessing mislabels every row.
-CLIP_MODEL = os.environ.get("TT_CLIP_MODEL", "gemini-3.8-flash")
+HAND_SETUP_CLIP_MODEL = os.environ.get("TT_HAND_SETUP_CLIP_MODEL", "gemini-3.8-flash")
+HAND_START_CLIP_MODEL = os.environ.get("TT_HAND_START_CLIP_MODEL", "gemini-3.8-flash")
+HAND_ACTION_CLIP_MODEL = os.environ.get(
+    "TT_HAND_ACTION_CLIP_MODEL", "gemini-3.1-pro-preview"
+)
 FRAME_MODEL = os.environ.get("TT_FRAME_MODEL", "gemini-3.8-flash")
+
+# TT_CLIP_MODEL is removed rather than deprecated, and setting it is a hard
+# error.
+#
+# Both of its jobs are gone. It was how Phase 5 got Pro, which is now the
+# default in code, and it was the one-variable rollback for the Flash/Pro trade,
+# which is now three independent variables. Keeping it as a fallback would be a
+# second mechanism for one setting — the thing TT_GEMINI_MODEL's retirement
+# exists to prevent.
+#
+# A fallback would also change meaning without saying so. The variable used to
+# move *every* clip call in the process; alongside per-phase constants it could
+# only move whichever phases still fell back to it, so an operator setting it
+# with the old behaviour in mind would get a partial, undocumented mixture. The
+# failure this whole change exists to remove is silently worse data, and a
+# quietly-ignored variable is the same failure wearing different clothes.
+#
+# Hence a raise and not a warning: it is written inline on documented commands,
+# so it is in runbooks and shell history, and a warning in a long run's stderr
+# is exactly what nobody sees.
+if "TT_CLIP_MODEL" in os.environ:
+    raise RuntimeError(
+        "TT_CLIP_MODEL has been removed. The clip model is per phase now, each "
+        "with a default in code: TT_HAND_SETUP_CLIP_MODEL (Phase 3 detection), "
+        "TT_HAND_START_CLIP_MODEL (Phase 4 step A), TT_HAND_ACTION_CLIP_MODEL "
+        "(Phase 5 step D and step E scans). Phase 5 defaults to "
+        "gemini-3.1-pro-preview and needs no variable set. Unset TT_CLIP_MODEL."
+    )
 
 # Media resolution, named here so call sites never carry a bare string and so
 # the value sent is the value recorded. PartMediaResolutionLevel *warns* rather
@@ -367,11 +413,18 @@ def call_gemini_for_clip(
     project_id: str,
     location: str = "global",
     *,
+    model: str,
     user_text: str,
     reference_images: list[tuple[bytes, str, str]] | None = None,
     label: str | None = None,
     entity_id: str | None = None,
 ) -> dict:
+    # Required, with no default, because the clip model is per phase: each
+    # orchestrator passes its own constant. A default would be correct for one
+    # caller and silently wrong for the others, which is the hazard that made
+    # user_text required too, and it is the hazard the shared TT_CLIP_MODEL
+    # actually realised. The frame caller still reads FRAME_MODEL directly —
+    # there is one frame model and no phase disagrees about it.
     client = genai.Client(vertexai=True, project=project_id, location=location)
 
     video_part = types.Part(
@@ -406,7 +459,7 @@ def call_gemini_for_clip(
     try:
         response = _call_with_retry(
             lambda: client.models.generate_content(
-                model=CLIP_MODEL,
+                model=model,
                 config=types.GenerateContentConfig(system_instruction=prompt),
                 contents=request_contents,
             )
@@ -420,7 +473,7 @@ def call_gemini_for_clip(
     except genai_errors.APIError as exc:
         raise _classify_genai_error(exc) from exc
 
-    _log_usage(response, label, CLIP_MODEL, entity_id)
+    _log_usage(response, label, model, entity_id)
     return _parse_and_validate(response)
 
 

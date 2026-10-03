@@ -1938,6 +1938,28 @@ def test_hand_reaching_the_flop_lists_step_e_prompts_and_references():
     assert set(provenance["models"]) == {"clip", "frame"}
 
 
+def test_both_clip_calls_use_the_hand_action_clip_model_and_it_is_recorded():
+    """Step D and the step E scan run on Phase 5's own clip model by default.
+
+    No environment variable is involved. The model that used to be supplied by
+    hand on the command line is now the default in code, and the same constant
+    the calls use is the one provenance records — so a row cannot claim a model
+    the request did not use.
+    """
+    from table_talk.gemini_caller import HAND_ACTION_CLIP_MODEL
+
+    with _patched(
+        [_d_result(("preflop", "flop")), _scan()],
+        frame_results=[{"new_cards": ["Ah", "Kd", "2c"]}],
+    ) as mocks:
+        _call(_pending())
+
+    models = [c.kwargs["model"] for c in mocks.clip.call_args_list]
+    assert models == [HAND_ACTION_CLIP_MODEL, HAND_ACTION_CLIP_MODEL]
+    assert HAND_ACTION_CLIP_MODEL == "gemini-3.1-pro-preview"
+    assert _provenance_from(mocks)["models"]["clip"] == HAND_ACTION_CLIP_MODEL
+
+
 def test_every_gemini_call_is_tagged_with_the_hand_start_id():
     """Step D, the step E scan and the step E card read all name the hand.
 
