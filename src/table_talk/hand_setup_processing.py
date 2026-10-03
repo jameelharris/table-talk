@@ -239,6 +239,7 @@ async def process_clip(
             clip.clip_end_time,
             project_id,
             user_text="Identify all new hand setups in this video.",
+            entity_id=clip.clip_id,
         )
         hand_setups = clip_result.get("hand_setups", [])
 
@@ -274,6 +275,7 @@ async def process_clip(
                     frame_bytes,
                     project_id,
                     user_text="Extract the setup observations from this frame.",
+                    entity_id=f"{clip.clip_id}_{ordinal:03d}",
                 )
                 return (ordinal, ts, player_info, temp_path)
 

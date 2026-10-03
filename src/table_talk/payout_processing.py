@@ -399,6 +399,7 @@ async def _extract_with_fallback(
             project_id,
             user_text=_USER_TEXT,
             label=f"extract_results_t{timestamp}",
+            entity_id=video.video_id,
         )
         if panel.get("panel_visible") is True:
             return timestamp, panel, frame_path

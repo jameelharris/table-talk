@@ -545,6 +545,13 @@ def test_write_is_keyed_on_video_id():
     assert _written_row(mocks).video_id == "somevid"
 
 
+def test_panel_reads_are_tagged_with_the_video_id():
+    with _patched([_panel()]) as mocks:
+        _call(_pending(video_id="somevid"))
+
+    assert mocks.frame.call_args.kwargs["entity_id"] == "somevid"
+
+
 def test_attempt_row_is_written_after_the_stage_row():
     # Safe only because the stage write has replace semantics: a failure of the
     # attempt write reproduces the same row on retry rather than duplicating it.

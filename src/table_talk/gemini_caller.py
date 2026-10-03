@@ -271,7 +271,31 @@ def _call_with_retry(fn):
             time.sleep(random.uniform(0, cap_delay))
 
 
-def _log_usage(response, label: str | None, model: str) -> None:
+def _modality_counts(usage) -> dict[str, int]:
+    """`prompt_<modality>` -> token count for each input modality reported.
+
+    prompt_token_count is one number over a request mixing text, video and
+    audio, so it cannot say which part of a request grew. The breakdown can: a
+    clip request billed far above its CountTokens estimate is a different
+    problem depending on whether the excess is frames, audio or text. See
+    ARCHITECTURE, "The 65,536-token input limit is enforced inconsistently."
+
+    Emitted under whatever name the API returns, lowercased, rather than an
+    allowlist of the four modalities we expect — an unexpected modality is
+    exactly the thing worth seeing, so it belongs on the line rather than
+    filtered off it.
+    """
+    counts: dict[str, int] = {}
+    for entry in getattr(usage, "prompt_tokens_details", None) or []:
+        modality = getattr(entry, "modality", None)
+        token_count = getattr(entry, "token_count", None)
+        if modality is None or token_count is None:
+            continue
+        counts[f"prompt_{getattr(modality, 'name', modality)}".lower()] = token_count
+    return counts
+
+
+def _log_usage(response, label: str | None, model: str, entity_id: str | None) -> None:
     """Emit one greppable stderr line of token counts for a completed call.
 
     Phase 5 costs up to 7 calls per hand, so per-call token counts are what
@@ -284,16 +308,31 @@ def _log_usage(response, label: str | None, model: str) -> None:
     `model` is passed in rather than read from a module constant: with one
     constant per call mode there is no single right answer here, and guessing
     would mislabel every row's provenance.
+
+    `entity_id` names which entity the call was for. Without it the line says
+    only what kind of call it was, and orchestrators run entities concurrently —
+    so the only way to attribute a count was adjacency in an interleaved stream,
+    which read two step D calls onto the wrong hands and inverted the apparent
+    relationship between window length and cost. Nothing persists these counts,
+    so the line is the whole record.
     """
     usage = getattr(response, "usage_metadata", None)
     if usage is None:
         return
     counts = {
         "prompt_tokens": getattr(usage, "prompt_token_count", None),
+        # Spliced in right after the total it decomposes, so the line reads as
+        # one number and its parts rather than two unrelated groups.
+        **_modality_counts(usage),
+        # Included because prompt_token_count counts cached input too, so a
+        # cache hit is otherwise indistinguishable from a larger request.
+        "cached_tokens": getattr(usage, "cached_content_token_count", None),
         "candidates_tokens": getattr(usage, "candidates_token_count", None),
         "total_tokens": getattr(usage, "total_token_count", None),
     }
     fields = [f"gemini_usage model={model}"]
+    if entity_id is not None:
+        fields.append(f"entity={entity_id}")
     if label is not None:
         fields.append(f"label={label}")
     fields += [f"{k}={v}" for k, v in counts.items() if v is not None]
@@ -331,6 +370,7 @@ def call_gemini_for_clip(
     user_text: str,
     reference_images: list[tuple[bytes, str, str]] | None = None,
     label: str | None = None,
+    entity_id: str | None = None,
 ) -> dict:
     client = genai.Client(vertexai=True, project=project_id, location=location)
 
@@ -380,7 +420,7 @@ def call_gemini_for_clip(
     except genai_errors.APIError as exc:
         raise _classify_genai_error(exc) from exc
 
-    _log_usage(response, label, CLIP_MODEL)
+    _log_usage(response, label, CLIP_MODEL, entity_id)
     return _parse_and_validate(response)
 
 
@@ -395,6 +435,7 @@ def call_gemini_for_frame(
     reference_images: list[tuple[bytes, str, str]] | None = None,
     frame_media_resolution: str | None = None,
     label: str | None = None,
+    entity_id: str | None = None,
 ) -> dict:
     client = genai.Client(vertexai=True, project=project_id, location=location)
 
@@ -461,5 +502,5 @@ def call_gemini_for_frame(
     except genai_errors.APIError as exc:
         raise _classify_genai_error(exc) from exc
 
-    _log_usage(response, label, FRAME_MODEL)
+    _log_usage(response, label, FRAME_MODEL, entity_id)
     return _parse_and_validate(response)

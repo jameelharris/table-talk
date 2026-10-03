@@ -302,6 +302,31 @@ def test_find_pending_hand_setups_builds_pending_hand_setup():
 # ---------------------------------------------------------------------------
 
 
+def test_gemini_calls_are_tagged_with_the_hand_setup_id():
+    """Step A's clip call and both step C frame reads name the hand setup.
+
+    The step C retry reuses the same frame and prompt, so without the tag its
+    cost is indistinguishable from the first read's on the usage line.
+    """
+    with (
+        patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND) as clip,
+        patch("table_talk.hand_start_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch("table_talk.hand_start_processing.call_gemini_for_frame", return_value=_HOLE_CARDS_RESULT) as frame,
+        patch("table_talk.hand_start_processing.upload_frame"),
+        patch("table_talk.hand_start_processing.write_hand_starts"),
+        patch("table_talk.hand_start_processing.write_hand_setup_processing_attempt_row"),
+    ):
+        _run(process_hand_setup(
+            _HS, "/tmp/video.mp4", "proj", "ds",
+            "videos-bucket", "hand-starts-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P4_HASHES,
+        ))
+
+    assert clip.call_args.kwargs["entity_id"] == "clip_001_001"
+    assert {c.kwargs["entity_id"] for c in frame.call_args_list} == {"clip_001_001"}
+
+
 def test_process_hand_setup_happy_path():
     with (
         patch("table_talk.hand_start_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_FOUND),

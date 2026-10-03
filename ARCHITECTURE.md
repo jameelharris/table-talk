@@ -1807,6 +1807,14 @@ Phase 5's step D on `YzKyFMQ1avU_017_003_001` was rejected with `400 INVALID_ARG
 
 **The cost model.** Video runs at a quantized **293–297 tokens/second including audio** — three of the four hands at exactly 293.0 and `_017_003_001` at exactly 297.0, on both its step D and its scan, so the rate varies per request rather than per video. Step D's fixed cost is **5,448–5,605** tokens: `extract_player_actions.md` plus `build_action_context`, whose ~160-token spread across seat counts is the only per-hand variation and is far too small to move a request. A scan's fixed cost is **1,359**, of which the three reference images are **789** — so dropping them saves 1.2% of a long scan, which is why that lever was dismissed.
 
+**Amended: that is what CountTokens counts, not what Vertex bills.** The
+293–297 tokens/second is the *windowed* rate — frames at 258 plus audio at 25
+over the window — and a billed request can instead carry audio for the whole
+video file regardless of the window asked for. The figures above remain correct
+as counts, and correct for predicting the input-limit 400, which is assessed
+against roughly this number. They understate the bill by up to `25 x duration`.
+See "Clip calls are billed the whole video's audio, intermittently."
+
 So **a step D over roughly 203 s exceeds 65,536** and currently succeeds only because the limit is not enforced consistently. Four of 143 hands are over it (p50 36 s, p90 106 s, p99 204 s, max 226 s, and the next longest after the four is 140 s — a clean tail). Zero hands have ever reached the 240 s skip.
 
 **The classification is `failed_transient`, under a fixed message code.** `gemini_caller` matches this 400 on status *and* message and raises `GeminiTransientError` carrying `input_token_limit: input <n> exceeds model limit <m>`. Three things that shape is doing:
@@ -1816,6 +1824,109 @@ So **a step D over roughly 203 s exceeds 65,536** and currently succeeds only be
 - **No `P5-<n>:` prefix**, deliberately. This message repeats byte-identically by construction, so a gate id would let "An identical gate repeat is permanent" promote it to `failed_permanent` and undo the whole change. The code is also not clip-specific, because the classification sits in the shared caller and a frame or payout read reaches it by the same path.
 
 **No frame reduction and no pre-flight counting, for now.** Most long requests are served at full detail, and the fix that would guarantee headroom — `MEDIA_RESOLUTION_LOW` at 66 tokens/frame against 258, or a lower fps — pays in frames on exactly the multiway, multi-street hands that are the most analytically valuable, which is the corpus bias this investigation was opened about arriving by another route. **The revisit trigger is a park:** if Google begins enforcing 65,536 consistently, every hand over ~203 s fails repeatedly and parks under the `input_token_limit:` code, which is a queryable bucket by construction. That is the signal to spend the detail.
+
+### Clip calls are billed the whole video's audio, intermittently
+
+`gemini_usage` reported two step D calls at **157,741** and **185,983** prompt
+tokens where `scripts/count_clip_tokens.py`, run the same day, counted the same
+two requests at **32,251** and **65,147**. The request was ruled out first:
+`call_gemini_for_clip` has not changed since 33f2a18 (2026-09-28), `uv.lock`
+pins `google-genai` at 2.7.0, and both rows' provenance records the same
+`gemini-2.5-pro`, the same `MEDIA_RESOLUTION_UNSPECIFIED` and the same prompt
+blob `5dab0fb0ba7c` the script counted against. The windows were 91 s and 201 s,
+read from the run's own `complete: window=<n>s` messages rather than recomputed.
+
+**The excess is audio, and the mechanism is that `video_metadata`'s
+`start_offset`/`end_offset` bound the frame sampling but not the audio track.**
+Audio bills at **25 tokens/second** in both variants; what differs is the span
+those seconds cover. With the per-modality breakdown now on the usage line
+(below), one `generate_content` on a 20 s window reported
+`prompt_audio=128,675` — exactly `25 x 5,147`, the video's full duration —
+alongside `prompt_video=5,160`, exactly `258 x 20`, the window. A second video
+of a different length reproduced the rate to the token:
+
+| video | duration | window | text | video | audio | billed | counted |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `YzKyFMQ1avU` | 5,147 s | 20 s | 5,508 | 5,160 | 128,675 | **139,343** | 11,368 |
+| `MPBLfM4mwfE` | 3,015 s | 20 s | 5,419 | 5,160 | 75,375 | **85,954** | 11,279 |
+
+`text + 258 x window + 25 x duration`, zero residual on both. It also accounts
+for the two original step D calls exactly: `5,588 + 258x91 + 128,675 = 157,741`
+and `5,450 + 258x201 + 128,675 = 185,983`. Those two audio terms are *derived*
+from the fit rather than measured — the breakdown did not exist when they ran.
+
+**It is intermittent.** A 6-hand run at `--max-concurrent 3` on `YzKyFMQ1avU`
+had three step D calls billed windowed audio — 250, 350 and 425, which are
+`25 x` windows of 10 s, 14 s and 17 s — and three billed the whole file's
+128,675, with nothing differing in the requests. So these are not two code paths
+of ours but two behaviours of the service, and on a short window the difference
+is very nearly the entire bill.
+
+This is the same shape as the input limit above and plausibly the same cause.
+Google's own docs say a request to `global` "may be processed in any Google
+Cloud location around the world", and that you "can't control or know which
+region your ML processing requests are sent to" — so a call can land on a
+backend that windows the audio or one that does not, exactly as it can land on
+one that enforces 65,536 or one that does not.
+
+**The limit and the bill are assessed against different numbers.** The 400 that
+rejected `_017_003_001` reported 65,577 — within 0.7% of CountTokens' 65,147,
+and nowhere near the 185,983 the same window was billed on a later run. So
+window length is the wrong lever to tune against that ceiling and against cost
+at the same time: the headroom column in the table above measures the right
+thing for the limit and the wrong thing for the bill.
+
+**What it costs when it fires.** `duration x 25` tokens on every clip-mode call,
+at Pro input pricing:
+
+| video | audio tokens/call | $/call | share of a 20 s request |
+|---|---:|---:|---:|
+| `YzKyFMQ1avU` | 128,675 | $0.161 | 92% |
+| `MPBLfM4mwfE` | 75,375 | $0.094 | 88% |
+
+Paid by step D, by every step E scan, and by Phase 3's and Phase 4's clip calls
+alike. Over the two-video corpus as it stands — 35 clips, 162 hand setups, 143
+hand starts, assuming a floor of ~3.5 clip calls per Phase 5 hand — that is on
+the order of **$94** of audio against perhaps $8 of the frames and text anyone
+wanted, or about half that at the 3-of-6 incidence observed. The quantity scales
+with video *duration* rather than with how much video is examined, which is the
+wrong axis: a 20 s window on a 90-minute video costs the same audio as a 240 s
+one.
+
+**Per-call token accounting.** The usage line now carries the input breakdown by
+modality and an `entity=` tag on every clip and frame call in all four phases:
+
+```
+gemini_usage model=<m> entity=<id> label=<l> prompt_tokens=N prompt_text=.. \
+  prompt_video=.. prompt_audio=.. cached_tokens=.. candidates_tokens=.. total_tokens=..
+```
+
+Both halves were load-bearing in finding this. `prompt_token_count` is one
+number over a request mixing text, video and audio, so it could not say which
+part had grown; the breakdown named audio on the first call. And without the
+entity tag the only way to attribute a count was adjacency in an interleaved
+stream — orchestrators run entities concurrently — which read the two step D
+calls onto the wrong hands and inverted the apparent relationship between window
+length and cost, briefly implying a 91 s window cost more than a 201 s one.
+Nothing persists these counts, so the stderr line is the whole record.
+
+**What is not decided here.** Two things, both open:
+
+- **Whether any single backend is consistent.** `scripts/diagnose_clip_token_gap.py`
+  takes `--location` for this, and prints `AUDIO_BILLING=windowed|whole_file`
+  per run so a series can be tallied. If a region windows the audio on every
+  call, pinning Phase 5's clip calls to it is the fix — and `us-east1` is the
+  region to prefer on a tie, because the videos bucket and the dataset are
+  already there. Five runs per location distinguishes "consistent" from the
+  observed coin-flip at about p=0.03, which is suggestive and not proof; it
+  cannot separate 100% from 90%.
+- **Whether the audio track can be excluded from a clip request at all.** None
+  of these prompts asks about sound, so if it can be dropped it is a ~90% input
+  cost reduction on short-window calls that changes nothing about what the model
+  sees. Not yet investigated.
+
+Until one of those lands, the honest statement of clip-call cost is that it is
+bimodal and the mode is not ours to choose.
 
 ### Operational hardening
 

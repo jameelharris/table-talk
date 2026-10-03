@@ -799,6 +799,7 @@ async def _scan_for_street(
     window_end: int,
     project_id: str,
     reference_images: list[tuple[bytes, str, str]] | None,
+    entity_id: str,
 ) -> dict:
     """Scan for one street's reveal, asking again if the answer contradicts D.
 
@@ -828,6 +829,7 @@ async def _scan_for_street(
             # Retries carry their own label so their cost is greppable apart
             # from first-attempt scans.
             label=f"step_e_scan_{street_name}" + ("_retry" if attempt else ""),
+            entity_id=entity_id,
         )
         if scan_result.get("found"):
             return scan_result
@@ -840,6 +842,7 @@ async def _read_street_cards(
     prior_cards: list[str],
     project_id: str,
     street_name: str,
+    entity_id: str,
 ) -> list[str]:
     """Read one street's new community cards, retrying an unusable read.
 
@@ -865,6 +868,7 @@ async def _read_street_cards(
             user_text="Identify the new community cards visible in this frame.",
             frame_media_resolution=FRAME_RESOLUTION_ULTRA_HIGH,
             label=f"step_e_read_{street_name}",
+            entity_id=entity_id,
         )
         new_cards = normalize_cards(result.get("new_cards") or [])
         # Count and null check first, then the board-duplicate check: both are
@@ -931,6 +935,7 @@ async def _run_step_e(
             window_end,
             project_id,
             reference_images,
+            hs.hand_start_id,
         )
         if not scan_result.get("found"):
             return resolved, street_name
@@ -959,7 +964,8 @@ async def _run_step_e(
         # street's read believing there were fewer prior cards than there were
         # and broke the 0/3/4 -> 3/1/1 count rule.
         new_cards = await _read_street_cards(
-            frame_prompt, frame_bytes, prior_cards, project_id, street_name
+            frame_prompt, frame_bytes, prior_cards, project_id, street_name,
+            hs.hand_start_id,
         )
 
         prior_cards = prior_cards + new_cards
@@ -1021,6 +1027,7 @@ async def process_hand_start(
             project_id,
             user_text="Extract the complete voluntary action sequence from this video clip.",
             label="step_d_player_actions",
+            entity_id=hs.hand_start_id,
         )
 
         winning_positions = [

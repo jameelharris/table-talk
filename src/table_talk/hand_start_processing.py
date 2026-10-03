@@ -527,6 +527,7 @@ async def process_hand_setup(
             hs.hand_setup_time_seconds + hs.available_seconds,
             project_id,
             user_text="Identify the first voluntary chip commitment and second action in this video window.",
+            entity_id=hs.hand_setup_id,
         )
 
         if not clip_result.get("found"):
@@ -653,6 +654,7 @@ async def process_hand_setup(
                     project_id,
                     user_text="Extract hole cards for all eligible players from this frame.",
                     frame_media_resolution=FRAME_RESOLUTION_ULTRA_HIGH,
+                    entity_id=hs.hand_setup_id,
                 )
                 return fva_frame_local_path, filled_hole_cards_prompt, frame_bytes, hole_cards_result
 
@@ -689,6 +691,7 @@ async def process_hand_setup(
                     project_id,
                     user_text="Extract hole cards for all eligible players from this frame.",
                     frame_media_resolution=FRAME_RESOLUTION_ULTRA_HIGH,
+                    entity_id=hs.hand_setup_id,
                 )
                 retry_by_label = {
                     p.get("seat_position_label"): p for p in retry_hole_cards_result.get("players", [])

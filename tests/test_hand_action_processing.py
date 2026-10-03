@@ -1938,6 +1938,26 @@ def test_hand_reaching_the_flop_lists_step_e_prompts_and_references():
     assert set(provenance["models"]) == {"clip", "frame"}
 
 
+def test_every_gemini_call_is_tagged_with_the_hand_start_id():
+    """Step D, the step E scan and the step E card read all name the hand.
+
+    Nothing persists per-call token counts, and hands run concurrently, so the
+    stderr usage line is the only record of what a call cost and the entity tag
+    is the only thing tying it to a hand. An untagged or mistagged call is
+    silently attributed to whichever hand happened to finish next to it.
+    """
+    with _patched(
+        [_d_result(("preflop", "flop")), _scan()],
+        frame_results=[{"new_cards": ["Ah", "Kd", "2c"]}],
+    ) as mocks:
+        _call(_pending(hand_start_id="clip_009_002_001"))
+
+    clip_entities = [c.kwargs.get("entity_id") for c in mocks.clip.call_args_list]
+    frame_entities = [c.kwargs.get("entity_id") for c in mocks.frame.call_args_list]
+    assert clip_entities == ["clip_009_002_001", "clip_009_002_001"]
+    assert frame_entities == ["clip_009_002_001"]
+
+
 def test_provenance_records_media_resolution_per_call_mode():
     """Step E's frame read is ULTRA_HIGH; the scans are clip-mode and unset.
 

@@ -218,6 +218,32 @@ def test_process_clip_happy_path():
     assert rows_arg[0].hand_setup_state["total_seat_count"] == 6
 
 
+def test_gemini_calls_are_tagged_with_the_entity_they_are_for():
+    """The clip detection names the clip; each frame read names its hand setup.
+
+    Phase 3 fans the frame reads out concurrently over one clip, so clip_id
+    alone would not separate them on the usage line.
+    """
+    with (
+        patch("table_talk.hand_setup_processing.call_gemini_for_clip", return_value=_CLIP_RESULT_ONE_SETUP) as mock_call_clip,
+        patch("table_talk.hand_setup_processing.extract_frame", side_effect=_fake_extract_frame),
+        patch("table_talk.hand_setup_processing.call_gemini_for_frame", return_value=_PLAYER_INFO) as mock_call_frame,
+        patch("table_talk.hand_setup_processing.upload_frame"),
+        patch("table_talk.hand_setup_processing.write_hand_setups"),
+        patch("table_talk.hand_setup_processing.write_clip_processing_attempt_row"),
+    ):
+        _run(process_clip(
+            _CLIP, "/tmp/video.mp4", "proj", "ds",
+            "hand-setups-bucket", "videos-bucket",
+            "identify prompt", "extract prompt",
+            prompt_hashes=_P3_HASHES,
+        ))
+
+    assert mock_call_clip.call_args.kwargs["entity_id"] == "dQw4w9WgXcQ_001"
+    # The same id the row is written under, so the line joins to the table.
+    assert mock_call_frame.call_args.kwargs["entity_id"] == "dQw4w9WgXcQ_001_001"
+
+
 # ---------------------------------------------------------------------------
 # process_clip — empty hand_setups case
 # ---------------------------------------------------------------------------

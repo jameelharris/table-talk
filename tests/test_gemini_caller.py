@@ -32,11 +32,24 @@ FRAME_BYTES = b"\xff\xd8\xff" + b"\x00" * 20  # fake bytes — mocked, not parse
 USER_TEXT = "Do the thing."
 
 
-def _usage(prompt=1200, candidates=340, total=1540):
+def _usage(prompt=1200, candidates=340, total=1540, cached=None, modalities=None):
     usage = MagicMock()
     usage.prompt_token_count = prompt
     usage.candidates_token_count = candidates
     usage.total_token_count = total
+    # Both explicitly None by default, for the reason _make_response gives below:
+    # left to auto-create, cached_content_token_count prints a mock repr on every
+    # line and prompt_tokens_details iterates as empty, which would make the
+    # breakdown untestable while looking like it worked.
+    usage.cached_content_token_count = cached
+    usage.prompt_tokens_details = (
+        None
+        if modalities is None
+        else [
+            types.ModalityTokenCount(modality=modality, token_count=count)
+            for modality, count in modalities.items()
+        ]
+    )
     return usage
 
 
@@ -442,6 +455,126 @@ def test_partial_usage_metadata_logs_only_present_counts(capsys):
     assert "prompt_tokens=900" in line
     assert "candidates_tokens" not in line
     assert "total_tokens" not in line
+
+
+def test_usage_line_includes_entity_id(capsys):
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    _call_clip(mock_client_inst, label="step_d", entity_id="VID_017_003_001")
+
+    line = capsys.readouterr().err.strip()
+    assert "entity=VID_017_003_001" in line
+    assert "label=step_d" in line
+
+
+def test_usage_line_omits_entity_when_not_given(capsys):
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    _call_clip(mock_client_inst, label="step_d")
+
+    line = capsys.readouterr().err.strip()
+    assert "entity=" not in line
+
+
+def test_usage_line_breaks_input_down_by_modality(capsys):
+    # The whole point of the breakdown: say which part of a request grew. A
+    # clip call's input is text + video + audio, and prompt_tokens alone cannot
+    # distinguish a longer window from an unexpected fixed addition.
+    response = _make_response('{"ok": true}')
+    response.usage_metadata = _usage(
+        prompt=65147, modalities={"TEXT": 5450, "VIDEO": 51858, "AUDIO": 7839},
+    )
+    mock_client_inst = _patched_client(response)
+
+    _call_clip(mock_client_inst, label="step_d", entity_id="VID_017_003_001")
+
+    line = capsys.readouterr().err.strip()
+    assert "prompt_tokens=65147" in line
+    assert "prompt_text=5450" in line
+    assert "prompt_video=51858" in line
+    assert "prompt_audio=7839" in line
+
+
+def test_breakdown_immediately_follows_the_total_it_decomposes(capsys):
+    response = _make_response('{"ok": true}')
+    response.usage_metadata = _usage(prompt=1200, modalities={"TEXT": 200, "IMAGE": 1000})
+    mock_client_inst = _patched_client(response)
+
+    _call_clip(mock_client_inst)
+
+    fields = capsys.readouterr().err.strip().split()
+    assert fields.index("prompt_tokens=1200") + 1 == fields.index("prompt_text=200")
+    assert fields.index("prompt_text=200") + 1 == fields.index("prompt_image=1000")
+    assert fields.index("prompt_image=1000") < fields.index("candidates_tokens=340")
+
+
+def test_usage_line_omits_breakdown_when_the_api_reports_none(capsys):
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    _call_clip(mock_client_inst)
+
+    line = capsys.readouterr().err.strip()
+    assert "prompt_tokens=1200" in line
+    assert "prompt_text" not in line
+    assert "prompt_video" not in line
+
+
+def test_unexpected_modality_still_appears_on_the_line(capsys):
+    # Emitted under whatever name the API returns rather than an allowlist of
+    # the four we expect — a modality we did not anticipate is exactly the thing
+    # worth seeing.
+    response = _make_response('{"ok": true}')
+    response.usage_metadata = _usage(modalities={"DOCUMENT": 77})
+    mock_client_inst = _patched_client(response)
+
+    _call_clip(mock_client_inst)
+
+    assert "prompt_document=77" in capsys.readouterr().err
+
+
+def test_modality_entry_missing_a_count_is_skipped(capsys):
+    response = _make_response('{"ok": true}')
+    response.usage_metadata = _usage(modalities={"TEXT": 200})
+    response.usage_metadata.prompt_tokens_details.append(
+        types.ModalityTokenCount(modality="VIDEO", token_count=None)
+    )
+    mock_client_inst = _patched_client(response)
+
+    _call_clip(mock_client_inst)
+
+    line = capsys.readouterr().err.strip()
+    assert "prompt_text=200" in line
+    assert "prompt_video" not in line
+
+
+def test_cached_tokens_logged_when_present_and_omitted_when_not(capsys):
+    # prompt_token_count counts cached input too, so without this field a cache
+    # hit is indistinguishable from a larger request.
+    response = _make_response('{"ok": true}')
+    response.usage_metadata = _usage(cached=4096)
+    _call_clip(_patched_client(response))
+    assert "cached_tokens=4096" in capsys.readouterr().err
+
+    _call_clip(_patched_client(_make_response('{"ok": true}')))
+    assert "cached_tokens" not in capsys.readouterr().err
+
+
+def test_entity_id_logged_for_frame_calls(capsys):
+    mock_client_inst = _patched_client(_make_response('{"ok": true}'))
+
+    with patch("table_talk.gemini_caller.genai.Client", return_value=mock_client_inst):
+        call_gemini_for_frame(
+            prompt=PROMPT,
+            frame_bytes=FRAME_BYTES,
+            project_id=PROJECT,
+            user_text=USER_TEXT,
+            label="step_e_read_flop",
+            entity_id="VID_017_003_001",
+        )
+
+    line = capsys.readouterr().err.strip()
+    assert "entity=VID_017_003_001" in line
+    assert "label=step_e_read_flop" in line
 
 
 def test_usage_logged_before_parse_failure(capsys):
