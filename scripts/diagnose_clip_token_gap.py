@@ -339,6 +339,11 @@ def main() -> int:
     # 25 * seconds to the token, on both videos and in both variants, so a
     # third answer is a new finding and should be reported as one rather than
     # rounded into whichever of these it sits nearer.
+    #
+    # The rate is a gemini-2.5-pro measurement, so another model billing audio
+    # at its own rate reads as "unrecognised" even when it windows correctly.
+    # Hence the two quotients: whichever span the audio was measured over gives
+    # a clean tokens/second, and that identifies the behaviour at any rate.
     audio = breakdown.get("prompt_audio")
     video = breakdown.get("prompt_video")
     if audio is not None:
@@ -350,6 +355,12 @@ def main() -> int:
             f"{AUDIO_TOKENS_PER_SECOND:g}x{window}s; whole file {whole_file:,} = "
             f"{AUDIO_TOKENS_PER_SECOND:g}x{row.duration_seconds}s)"
         )
+        print(
+            f"  audio / window   {window:>5}s = {audio / window:>10.2f} tok/s\n"
+            f"  audio / duration {row.duration_seconds:>5}s = "
+            f"{audio / row.duration_seconds:>10.2f} tok/s"
+            "   <- the clean one names the span billed"
+        )
     if video is not None:
         # Frames have been windowed on every call measured. If this ever stops
         # agreeing, the offsets are being ignored wholesale and not just for
@@ -360,8 +371,12 @@ def main() -> int:
         )
     if audio is not None:
         # Last line and machine-readable on purpose: a series of runs is tallied
-        # with `grep -c AUDIO_BILLING=windowed`.
-        print(f"AUDIO_BILLING={verdict} location={args.location} billed={billed}")
+        # with `grep -o 'AUDIO_BILLING=.*' | sort | uniq -c`. Carries model as
+        # well as location, because both are things a run series varies.
+        print(
+            f"AUDIO_BILLING={verdict} model={CLIP_MODEL} location={args.location} "
+            f"audio={audio} billed={billed}"
+        )
     return 0
 
 
